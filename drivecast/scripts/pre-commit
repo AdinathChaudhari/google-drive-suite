@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# drivecast pre-commit guard: refuse to commit secrets or personal data.
+# Install with: scripts/install-hooks.sh
+set -euo pipefail
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+fail=0
+note() { echo "🚫 pre-commit: $1" >&2; fail=1; }
+
+# 1) Block secret-ish filenames from being committed at all.
+while IFS= read -r f; do
+  case "$f" in
+    secrets/secrets.example.json) : ;;                       # the allowed example
+    secrets/*|*client_secret*|*oauth*|*credential*|config.json|*.env)
+      note "refusing to commit '$f' (looks like a secret/credential file)";;
+  esac
+done <<< "$staged"
+
+# 2) Scan staged CONTENT for secret VALUES (not mere mentions of the words, so
+#    docs and .gitignore patterns don't trip it). Each pattern needs a real value.
+patterns='(client_secret["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_-]{10,}|GOCSPX-[A-Za-z0-9_-]{10,}|refresh_token["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_./-]{20,}|ya29\.[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|tmdb_api_key["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][0-9a-f]{16,}|(opensubtitles_api_key|remote_token)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,})'
+if git diff --cached -U0 | grep -E "^\+" | grep -Eq "$patterns"; then
+  note "staged changes contain something that looks like a secret VALUE (key/token). Review the diff."
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "" >&2
+  echo "Commit blocked. Keep secrets in secrets/ (gitignored) or env vars." >&2
+  echo "If this is a false positive, commit with: git commit --no-verify" >&2
+  exit 1
+fi
+exit 0
