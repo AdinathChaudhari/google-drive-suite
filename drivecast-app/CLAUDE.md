@@ -1,0 +1,51 @@
+## Drivecast ecosystem (shared)
+
+One of three sibling repos that make up **Drivecast**, a self-hosted media system:
+- **drivecast/** — Python/FastAPI media server + vanilla-JS web UI. Scans Google Drive, classifies content into "sections" (tabs), serves streams/playlists. Tests: `venv/bin/python -m pytest drivecast/ -q`.
+- **drivecast-app/** — Kotlin/Jetpack Compose **Fire TV** client; server-driven UI.
+- **drive-offload/** — Python uploader/renamer + storage tooling that gets media onto Drive. (Sections/tabs do NOT live here.)
+
+Environment:
+- App build: no JDK on PATH — `JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home`; Android SDK at `/opt/homebrew/share/android-commandlinetools`.
+- Fire TV Stick: `adb connect <fire-tv-ip>:5555`. VLC (`org.videolan.vlc`) is the default playback target since app v0.3.0 (stick rejects HEVC 10-bit in stock ExoPlayer).
+- Server auth: `?token=` query param on every remote request.
+
+# Drivecast app (Fire TV client)
+
+Server-driven Android TV / Fire TV client for the drivecast server. Pairs to a server URL + token, renders a tabbed tile grid from the server's sections, and hands playback off to VLC. Current version 0.5.0 — the premium-UI overhaul (`feat/premium-ui`, PR #4) (`applicationId com.drivecast.tv`).
+
+## Stack
+- Kotlin + Jetpack Compose: `androidx.tv:tv-material:1.0.1` + plain foundation 1.7 `Lazy*` lists (tv-foundation was deleted in 0.5.0 — do not reintroduce it), single-Activity Navigation-Compose, core-splashscreen, profileinstaller (+ a `:baselineprofile` Macrobenchmark module, generator not yet run — needs a rooted/API-33+ device).
+- Retrofit + kotlinx.serialization, OkHttp (token interceptor), Coil (RGB_565, slot-sized decodes, capped caches), DataStore, media3/ExoPlayer (still linked; VLC is default).
+- Gradle KTS, `namespace/applicationId com.drivecast.tv`, compileSdk 34 / minSdk 25, source/target Java **17** (Gradle itself runs on the JDK 21 from the shared block).
+- **HARD constraint**: compose BOM stays 2024.09.x (Compose 1.7) and compileSdk stays 34 — Compose 1.8 needs compileSdk 35 and breaks tv-material 1.0.1 and the `focusRestorer` signature (wrapped in `ui/common/FocusKit.kt` for exactly that reason).
+
+## Building & installing
+```
+export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
+./gradlew :app:assembleRelease     # -> app/build/outputs/apk/release/app-release.apk (R8-minified; what goes on the Stick)
+./gradlew :app:assembleDebug       # -> app/build/outputs/apk/debug/app-debug.apk (dev builds)
+adb connect <fire-tv-ip>:5555
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+## Layout & key screens
+Package `com.drivecast.tv` under `app/src/main/java/...`:
+- `MainActivity.kt` — entry point; installs the branded SplashScreen, resolves the start destination before first frame; NavHost with routes `setup`, `home`, `detail/{titleId}`, `player/{titleId}/{fileId}/{startOver}` and app-wide fade-through transitions. `DrivecastApp.kt` builds the DI `AppContainer` (+ `onTrimMemory` → Coil cache clear).
+- `ui/setup/SetupScreen.kt` — pair to server URL + token (validated against `GET api/remote`); `data/Discovery.kt` does `api/ping`.
+- `ui/home/HomeScreen.kt` + `HomeViewModel.kt` — tabbed tile grids, one tab per server section; cache-first (instant re-entry, skeleton only on cold start), dwell-debounced ambient backdrop.
+- `ui/detail/DetailScreen.kt` + `DetailViewModel.kt` — full-bleed scrimmed hero; `ShowSeasons` / `EpisodeRow` for series, movie featurettes/extras; dwell-debounced season pills.
+- `ui/common/` — `FocusKit.kt` (`tvFocusRestorer(onRestoreFailed)`, pivot `BringIntoViewSpec`), `Skeleton.kt` (`Modifier.shimmer()`), `StatusView.kt` (error/empty/offline), `PosterCard.kt` (signature focus treatment: 1.10 scale + white border + glow), `BlurTransformation.kt` (decode-time stack blur — `Modifier.blur()` no-ops below API 31, so backdrops blur on the bitmap once, cached); `ui/theme/MotionTokens.kt` is the shared easing/duration vocabulary — reuse it, don't hardcode animation specs.
+- **Focus lanes**: every `tvFocusRestorer` call MUST pass an `onRestoreFailed` fallback (a `FocusRequester` on the lane's first item) — a fallback-less restorer silently swallows D-pad presses when its remembered child left composition. Follow the existing pattern in HomeScreen/DetailScreen when adding new rows.
+- `ui/player/PlayerScreen.kt` — hands off to VLC via `ACTION_VIEW` + `setPackage(VLC_PACKAGE)`; also has ExoPlayer path + `PlaybackQueue`.
+- `ui/awake/KeepAwakeHost.kt` — global "Are you still watching?" overlay (server `api/awake/*`).
+- `api/DrivecastApi.kt` (endpoints) + `api/Models.kt` (DTOs); `di/AppContainer.kt` wires the `Json`.
+
+## Conventions & gotchas
+- **Server-driven tabs**: `HomeScreen` builds its tab set from `GET api/sections` (`DrivecastApi.sections()`), in server order. The main tab bar is a horizontally-scrollable `LazyRow` (the section list is unbounded); it uses `tvFocusEnterFallback` (NOT `tvFocusRestorer` — a `focusRestorer` over a recycling lane restores by a stale layout-node hash after a scroll round-trip and swallows the D-pad press). The category-chip bar is a plain `Row` on purpose (capped at 4 chips by `visibleChips`, so scrolling would be dead weight and re-introduces the recycling focus bug). The grid's `tvFocusEnterFallback` lands DOWN-from-tabs focus on the topmost visible lane (Continue → chips → firstTile) only when the grid is at scroll-top, else `firstTile` — so DOWN mirrors the UP row order without yanking a scrolled grid to the top.
+- **Tolerant DTOs**: the shared `Json` in `di/AppContainer.kt` sets `ignoreUnknownKeys = true` + `coerceInputValues = true`, so server can add fields without breaking the app. Keep DTO fields nullable/defaulted.
+- **`"entertainment"` coupling**: `HomeScreen.kt` hardcodes `ENTERTAINMENT = "entertainment"` — that section is always shown and is the only tab with the category filter. Renaming the section server-side silently breaks this.
+- **Hardcoded fallbacks in `DetailScreen.kt`**: literal "Season N" / "Episode" labels when the server omits names.
+- **SeededShuffle parity**: `ui/player/SeededShuffle.kt` (SplitMix64) mirrors the server shuffle bit-for-bit and is in the main tree since the tabs-follow merge — keep it byte-identical to the server's implementation.
+- **Release builds are R8-minified and debug-signed** (sideload-only app; keeps upgrade-installs working). kotlinx-serialization/Retrofit keep rules live in `proguard-rules.pro` — new `@Serializable` DTOs outside `com.drivecast.tv.**` need a rule.
