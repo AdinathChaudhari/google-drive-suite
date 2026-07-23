@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# stream-dl: download a direct URL straight to an rclone remote with (almost)
+# zero local disk usage. rclone streams the URL into cloud storage.
+#
+# Usage: stream-dl <url> [remote:path]
+#        stream-dl <url> --drive "<Shared Drive Name>"
+#   If no destination is given, the first remote + remote_subdir from
+#   config.json (next to this script) is used.
+#   --drive resolves (and creates if needed) a Shared Drive by name via todrive.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    echo "Usage: stream-dl <url> [remote:path]" >&2
+    echo "       stream-dl <url> --drive \"<Shared Drive Name>\"" >&2
+    exit 2
+}
+
+URL=""
+DEST=""
+DRIVE=""
+
+# --drive may appear before or after the url; walk the args.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --drive)
+            [ $# -ge 2 ] || usage
+            DRIVE="$2"
+            shift 2
+            ;;
+        *)
+            if [ -z "$URL" ]; then
+                URL="$1"
+            elif [ -z "$DEST" ]; then
+                DEST="$1"
+            else
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$URL" ] || usage
+
+if [ -n "$DRIVE" ] && [ -n "$DEST" ]; then
+    echo "Error: give either --drive or an explicit remote:path, not both." >&2
+    exit 2
+fi
+
+if [ -n "$DRIVE" ]; then
+    DEST="$("$SCRIPT_DIR/todrive" resolve --create "$DRIVE")" || {
+        echo "Error: could not resolve shared drive \"$DRIVE\"." >&2
+        exit 1
+    }
+elif [ -z "$DEST" ]; then
+    CONFIG="$SCRIPT_DIR/config.json"
+    if [ ! -f "$CONFIG" ]; then
+        echo "Error: no destination given and $CONFIG not found." >&2
+        exit 1
+    fi
+    DEST="$(python3 - "$CONFIG" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+remotes = cfg.get("remotes") or []
+if not remotes:
+    sys.stderr.write("Error: no remotes configured in config.json\n")
+    sys.exit(1)
+remote = remotes[0]
+subdir = (cfg.get("remote_subdir") or "").strip("/")
+print(remote + subdir + "/" if subdir else remote)
+PY
+)"
+fi
+
+echo "Streaming $URL -> $DEST"
+if rclone copyurl "$URL" "$DEST" --auto-filename -P --drive-chunk-size 128M; then
+    echo "Done. Destination: $DEST"
+else
+    echo "Error: stream-dl failed for $URL" >&2
+    exit 1
+fi

@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""yt-video: download ONE YouTube video and upload it as a plain file to a
+named Shared Drive.
+
+The single-video sibling to yt-show. Where yt-show turns a whole playlist into
+a Drivecast TV show (SxxEyy episodes under '<Show> Season N/', with per-show
+incremental state), yt-video does the simplest possible thing: grab one video
+and drop it on the drive as '<Title>.ext' at the drive ROOT (or under an
+optional --folder). No show/season/episode machinery, no yt_shows.json state.
+
+--movie mode treats the download as a film: it cleans the messy YouTube title
+into a 'Name (Year)' filename (via clean_movie_title, composing renamer's
+helpers) and, on a TTY, lets you confirm or retype it. That clean name is all
+Drivecast needs -- its server files anything without SxxEyy markers as a movie
+and resolves the POSTER itself (a TMDB match on name+year, falling back to
+Google Drive's auto-generated video thumbnail), so yt-video never downloads or
+uploads an image.
+
+It deliberately does NOT duplicate the heavy lifting: the yt-dlp download leg
+(with resume + staging), the rclone upload leg, the drive picker, the live
+per-drive capacity readout, and the rich live dashboard are all imported from
+the yt-show module next to this script and reused as-is. The only yt-show
+change this relies on is upload_file treating an empty folder as "drive root".
+
+YouTube-focused, like yt-show: the download leg reconstructs a
+youtube.com/watch?v=<id> URL from the probed video id, so pass a YouTube URL
+(a plain watch URL, a youtu.be short link, or a watch URL that also carries a
+&list= playlist -- noplaylist pins it to the single video).
+
+Resume: a complete staged file from an interrupted run is reused directly
+(same staged_complete_path check yt-show uses), so a kill mid-upload costs one
+re-upload, never a re-download.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+import renamer
+
+
+def _load_ytshow():
+    """Import the hyphenated 'yt-show' script as a module so we can reuse its
+    download/upload/UI/drive-picker helpers instead of duplicating them."""
+    path = os.path.join(SCRIPT_DIR, "yt-show")
+    # 'yt-show' has no .py extension, so spec_from_file_location finds no
+    # loader on its own -- hand it a SourceFileLoader explicitly.
+    loader = importlib.machinery.SourceFileLoader("yt_show_mod", path)
+    spec = importlib.util.spec_from_loader("yt_show_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+ytshow = _load_ytshow()
+
+
+# ===========================================================================
+# Movie-title cleaning (--movie). renamer.py is TV-only (every emitter is
+# locked to the SxxEyy contract), so we DON'T route through it -- instead we
+# compose its low-level, well-tested helpers into a movie cleaner and emit the
+# 'Name (Year)' shape Drivecast's server parses. The cleaner is best-effort;
+# the interactive confirm in main() is the real safety net for a title it
+# can't perfectly guess (which is exactly why the user asked to be able to
+# type the movie name).
+#
+# No poster/thumbnail is downloaded here on purpose: Drivecast's server
+# already resolves the image itself -- a TMDB poster from the parsed
+# name+year (drivecast/tmdb.py enrich()), falling back to Google Drive's
+# auto-generated video thumbnail (drivecast/drive_api.py fetch_thumbnail) when
+# TMDB has none. A clean 'Name (Year).ext' at the drive root is all it needs.
+# ===========================================================================
+
+# Junk lead-ins ("Watch Full Movie XYZ", "Full HD Movie XYZ") -- leading only.
+_MOVIE_LEADIN_RE = re.compile(
+    r"^\s*(?:"
+    r"watch\s+(?:the\s+)?(?:full\s+)?(?:hd\s+)?(?:movie|film)(?:\s+online)?|"
+    r"full\s+(?:hd\s+)?(?:movie|film)(?:\s+online)?|"
+    r"watch\s+online|watch"
+    r")\b[\s:|._-]*", re.IGNORECASE)
+# Trailing "... Full Movie" tail. Requires the word "full" so a real title
+# like "Scary Movie" is never truncated.
+_MOVIE_TAIL_RE = re.compile(
+    r"[\s:|._-]*\bfull\s+(?:hd\s+)?(?:movie|film)\b.*$", re.IGNORECASE)
+# Standalone quality words renamer._NOISE_RE doesn't cover (it truncates from
+# '1080p'/'bluray'/etc onward, but leaves a bare 'HD'/'HQ'/'CAM' that sits
+# BEFORE the first noise token). Movie-specific, so removing them globally is
+# safe enough and the confirm prompt catches any rare real-title collision.
+_MOVIE_QUALITY_RE = re.compile(
+    r"\b(?:full\s*hd|ultra\s*hd|hd|hq|sd|cam|hdcam|ts|dvdscr)\b", re.IGNORECASE)
+
+
+def clean_movie_title(raw):
+    """Best-effort '(clean name, year_or_None)' from a messy YouTube title.
+    Composes renamer's helpers: strip junk lead-in/tail phrases, grab the year
+    BEFORE cutting the release-noise tail (the year usually precedes it), drop
+    quality/codec noise (_NOISE_RE), then reuse _clean_show for site/bracket/
+    acronym/case cleanup (which also strips the year out of the name)."""
+    s = (raw or "").strip()
+    s = _MOVIE_LEADIN_RE.sub("", s)
+    s = _MOVIE_TAIL_RE.sub("", s)
+    year = renamer._extract_year(s)
+    s = renamer._NOISE_RE.sub("", s)
+    s = _MOVIE_QUALITY_RE.sub(" ", s)
+    name, _y = renamer._clean_show(s)
+    return (name or "").strip(), year
+
+
+def format_movie_name(name, year):
+    """'Name (Year)' when a year is known, else just 'Name'. This is the shape
+    Drivecast's naming.extract_year + TMDB lookup expect."""
+    return "%s (%d)" % (name, year) if year else name
+
+
+def probe_video(url):
+    """Return (video_id, title) for a single YouTube video. noplaylist pins a
+    watch?v=...&list=... URL to just the video; if a bare playlist URL slips
+    through, take its first entry."""
+    try:
+        import yt_dlp
+    except ImportError:
+        sys.exit("yt-video needs yt-dlp:  pip install yt-dlp  (or use " +
+                 sys.executable + ")")
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "noplaylist": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info.get("entries"):
+        entries = [e for e in info["entries"] if e]
+        if not entries:
+            sys.exit("no playable video at that URL")
+        info = entries[0]
+    vid = info.get("id")
+    title = info.get("title") or vid or "video"
+    if not vid:
+        sys.exit("could not resolve a video id from that URL")
+    return vid, title
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="yt-video",
+        description="Download one YouTube video and upload it as a plain file "
+                    "to a Shared Drive (single-video sibling to yt-show).")
+    ap.add_argument("url", help="YouTube video URL")
+    ap.add_argument("--drive", default=None,
+                    help="Shared Drive name (required unless --pick)")
+    ap.add_argument("--pick", action="store_true",
+                    help="interactively choose/create the drive; overrides --drive")
+    ap.add_argument("--folder", default="",
+                    help="subfolder on the drive to upload into "
+                         "(default: the drive root)")
+    ap.add_argument("--name", default=None,
+                    help="override the output filename verbatim (default: the "
+                         "video title, or the cleaned movie name under --movie); "
+                         "the extension is added automatically")
+    ap.add_argument("--movie", action="store_true",
+                    help="treat this as a movie: clean the title to "
+                         "'Name (Year)' so Drivecast files it as a movie and "
+                         "auto-resolves its poster (TMDB, then the Drive "
+                         "thumbnail). Prompts you to confirm/edit the name "
+                         "unless --name or --yes is given.")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="accept the cleaned movie name without prompting")
+    ap.add_argument("--height", type=int, default=0,
+                    help="max video height (0 = best available, the default; "
+                         "e.g. 1080 to cap at 1080p)")
+    ap.add_argument("--connections", type=int, default=1,
+                    help="per-video download connections. 1 (default) = yt-dlp "
+                         "native (fastest un-throttled); >1 = aria2c multi-"
+                         "connection (try 16 if a download is stuck slow).")
+    ap.add_argument("--stage", default=os.path.expanduser(
+                        "~/Downloads/yt-video-stage"),
+                    help="local staging directory")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print what would happen and exit")
+    ap.add_argument("--plain", action="store_true",
+                    help="force plain-text progress (no rich live dashboard)")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    # Resolve the drive NAME first (picker is interactive; do it before any
+    # Live region opens, exactly like yt-show).
+    if args.pick:
+        drive = ytshow.pick_drive()
+    elif args.drive:
+        drive = args.drive
+    else:
+        sys.exit("pass --drive <SharedDriveName> or --pick")
+
+    vid, title = probe_video(args.url)
+
+    # Resolve the output filename. --name wins verbatim; --movie cleans the
+    # title into 'Name (Year)' and (on a TTY, unless --yes) lets the user
+    # confirm or retype it; otherwise the raw title is used as-is. Any prompt
+    # happens HERE, before the Live dashboard opens (same rule as --pick).
+    if args.name:
+        name_base = args.name
+    elif args.movie:
+        guess = format_movie_name(*clean_movie_title(title))
+        if sys.stdin.isatty() and not args.yes:
+            print("raw title: %s" % title)
+            typed = input("movie title [%s]> " % guess).strip()
+            name_base = typed or guess or title
+        else:
+            name_base = guess or title
+        print("Drivecast resolves the poster automatically (TMDB by name+year, "
+              "then the Google-Drive thumbnail) — no image upload needed.")
+    else:
+        name_base = title
+
+    print("video=%r  drive=%r  folder=%r" %
+          (name_base, drive, args.folder or "(root)"))
+
+    # Live drive headroom (best-effort; same source as yt-show).
+    usage = ytshow.fetch_drive_usage()
+    sline = ytshow.drive_storage_line(drive, usage)
+    if sline:
+        print(sline)
+        u = usage.get(drive)
+        if u and u["free"] is not None and u["free"] < 5 * 1000 ** 3:  # < 5 GB
+            print("  ! low headroom — this video may not fit; try another drive.")
+    elif usage:
+        print("drive %r: new or empty (no usage reported yet)" % drive)
+
+    if args.dry_run:
+        print("would upload %r to drive %r %s" %
+              (renamer._sanitize(name_base + ".mp4"), drive,
+               ("folder %r" % args.folder) if args.folder else "(root)"))
+        return 0
+
+    os.makedirs(args.stage, exist_ok=True)
+    if shutil.which("rclone") is None:
+        sys.exit("yt-video needs rclone on PATH for uploads (brew install rclone)")
+    connstr = ytshow.resolve_connstr(drive)   # fail fast before downloading
+
+    out_stem = os.path.join(args.stage, renamer._sanitize(name_base))
+    label = (name_base[:60]) if name_base else vid
+
+    ui = ytshow.UI(ytshow.USE_RICH and sys.stdout.isatty() and not args.plain)
+    if not ui.use_rich:
+        print("pip install rich for the live dashboard", file=sys.stderr)
+    ui.set_header(title, drive)
+    u = usage.get(drive) if usage else None
+    if u and u["free"] is not None:
+        ui.set_capacity(u["free"], u["cap"], u["pct"])
+    else:
+        ui.set_capacity(None, None, None)
+
+    rc = 1
+    with ui.live():
+        # Resume: a complete-but-not-yet-uploaded staged file (killed mid-
+        # upload on a prior run) is reused directly — no re-download. Matched
+        # by stem+vid, the same guard yt-show uses.
+        got = ytshow.staged_complete_path(
+            ytshow.staged_download_stem(out_stem, vid))
+        if got:
+            ui.note("reusing staged file for %r" % title)
+        else:
+            ui.dl_start(label, None)
+            got = ytshow.download_one(
+                vid, out_stem, args.height, args.connections,
+                on_progress=lambda st, dn, tot, sp: ui.dl_advance(dn, tot, sp))
+            ui.dl_finish()
+
+        if got:
+            ext = os.path.splitext(got)[1]
+            dest_name = renamer._sanitize(name_base + ext)
+            try:
+                total = os.path.getsize(got)
+            except OSError:
+                total = 0
+            ui.up_start(label, total)
+            rc = ytshow.upload_file(got, connstr, args.folder, dest_name,
+                                    on_progress=ui.up_advance)
+            ui.up_finish()
+            if rc != 0:
+                ui.note("  ! upload failed (rc=%d); left local %s" % (rc, got))
+        else:
+            ui.note("  ! download failed")
+
+    # tidy the stage dir if it's now empty
+    try:
+        os.rmdir(args.stage)
+    except OSError:
+        pass
+
+    if got and rc == 0:
+        print("uploaded %r to %r" % (dest_name, drive))
+        print("refresh the %r drive in Drivecast to see it" % drive)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

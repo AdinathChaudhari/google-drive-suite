@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+"""todrive: address Google Shared Drives by name (create on demand) and push
+local files/dirs into them via rclone.
+
+Unlike offloader.py's pre-configured remotes, this uses ONE rclone remote
+(default "gdrive:") and reaches any shared drive dynamically by its ID using
+rclone connection-string syntax: gdrive,team_drive=<ID>:
+
+Stdlib only. See README.md for setup.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+import urllib.parse
+import urllib.request
+import urllib.error
+from collections import deque
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DEFAULT_CONFIG = {
+    "base_remote": "gdrive:",
+    "rclone_flags": ["--drive-chunk-size", "64M", "--transfers", "4",
+                     "--retries", "3", "--low-level-retries", "10"],
+}
+
+# Google's hard per-shared-drive cap: 100 GB DECIMAL (not GiB), fixed by
+# Google, not user-configurable -> a module constant, not a config key.
+SHARED_DRIVE_CAP_BYTES = 100 * 1000**3
+
+# rclone stderr substrings that mean "this drive is full" -> mint/advance to
+# an overflow drive. Ported from offloader.py:35 but deliberately NARROWER:
+# no userRateLimitExceeded/insufficient here, because a marker match in this
+# file mints a brand-new shared drive, and a transient rate-limit blip must
+# never do that (it should just retry the same drive).
+QUOTA_MARKERS = ("storageQuotaExceeded", "quotaExceeded",
+                 "teamDriveFileLimitExceeded", "storage quota")
+
+# Overflow drives are named "<root> overflow", "<root> overflow 2", ...
+OVERFLOW_SUFFIX = " overflow"
+
+# Safety bound on how many links of an overflow chain we'll walk/mint before
+# giving up (a normal upload failure at that point, not an infinite loop).
+OVERFLOW_CHAIN_MAX = 20
+
+# Page size for the files.list scan behind drive_usage().
+FILES_PAGE_SIZE = 1000
+
+
+def _usage_zero():
+    """A fresh per-drive usage record (a dict literal can't be shared)."""
+    return {"bytes": 0, "objects": 0, "trash_bytes": 0, "trash_objects": 0}
+
+# Google's corpora=allDrives files.list intermittently returns HTTP 5xx on
+# deep pagination for large accounts. Retry a transient 5xx this many times
+# per page before giving up on the fast path and falling back to per-drive.
+USAGE_SCAN_RETRIES = 2
+
+def _find_rclone():
+    """Locate the rclone binary robustly.
+
+    When this script is invoked by a GUI/launchd app (e.g. the menu-bar
+    offloader), PATH is minimal and omits Homebrew, so a bare "rclone" isn't
+    found. Prefer PATH, then fall back to the usual install locations.
+    """
+    found = shutil.which("rclone")
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/rclone", "/usr/local/bin/rclone",
+                 "/opt/local/bin/rclone"):
+        if os.path.exists(cand):
+            return cand
+    return "rclone"  # last resort; will surface a clear "not found" error
+
+
+RCLONE = _find_rclone()
+
+DRIVES_API = "https://www.googleapis.com/drive/v3/drives"
+
+
+def err(msg):
+    print(msg, file=sys.stderr)
+
+
+def human_size(n):
+    # DECIMAL units (1000-based), matching Google's decimal GB accounting for
+    # the 100 GB shared-drive cap -- so a drive's displayed size, its %CAP,
+    # and the "cap 100 GB" label all agree (a binary GiB helper would render a
+    # full drive as a confusing "93.1 GiB ... 100%"). Used only for storage
+    # displays; todrive stays standalone (offloader.py keeps its own binary one).
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return "%.1f %s" % (n, unit)
+        n /= 1000.0
+
+
+def load_config():
+    """Merge the first existing, parseable config.json over DEFAULT_CONFIG.
+
+    Candidates are tried in order and the first that both exists and parses
+    wins (first-found, no multi-file layering):
+      1. an explicit TODRIVE_CONFIG override (the menu-bar app sets this to
+         its own config path so parent and child provably read one file),
+      2. config.json next to this script (the run-from-source layout, kept
+         unchanged: present here, it always wins over the fallback),
+      3. ~/Library/Application Support/drive-offload/config.json.
+    The fallback is what lets the frozen bundle work: py2app ships this file
+    read-only in Contents/Resources with no config.json beside it, so #2 is
+    absent there. Resolution is path/override based, NOT sys.frozen based --
+    py2app runs this as a plain script under Contents/MacOS/python, which
+    never sets sys.frozen.
+
+    A malformed or unreadable candidate warns to stderr and falls through to
+    the next; no candidate at all -> DEFAULT_CONFIG unchanged. Only
+    base_remote and rclone_flags are consumed, so the extra keys in the
+    shared offloader config (watch_dirs, remotes, ...) are ignored by update.
+    """
+    merged = dict(DEFAULT_CONFIG)
+    candidates = []
+    override = os.environ.get("TODRIVE_CONFIG")
+    if override:
+        candidates.append(override)
+    candidates.append(os.path.join(SCRIPT_DIR, "config.json"))
+    candidates.append(os.path.expanduser(
+        "~/Library/Application Support/drive-offload/config.json"))
+    for path in candidates:
+        try:
+            # encoding is pinned to UTF-8 (JSON is UTF-8 by spec): the frozen
+            # .app runs under the C locale, where a bare open() decodes as
+            # ASCII and a valid config with any non-ASCII value (e.g. a
+            # watch_dirs path) raises UnicodeDecodeError -> the candidate is
+            # skipped and base_remote silently reverts to the DEFAULT_CONFIG
+            # 'gdrive:', reintroducing the empty-drive-picker bug.
+            with open(path, encoding="utf-8") as f:
+                merged.update(json.load(f))
+        except FileNotFoundError:
+            continue  # candidate simply absent -> try the next
+        except (OSError, ValueError) as e:
+            err("Warning: ignoring unreadable config %s: %s" % (path, e))
+            continue
+        break
+    return merged
+
+
+def remote_name(cfg):
+    """The base remote without its trailing ':' (for config-dump lookup)."""
+    return cfg["base_remote"].rstrip(":")
+
+
+def get_drives(cfg):
+    """Return the list of shared drives as [{"id":..., "name":...}, ...].
+    Also refreshes/persists the rclone token as a side effect."""
+    # --- test hook: skip rclone entirely when TODRIVE_TEST_FAKE_DRIVES is set
+    # to a JSON array of drives (mirrors TODRIVE_TEST_FAKE_CREATE/EXISTS) ---
+    fake = os.environ.get("TODRIVE_TEST_FAKE_DRIVES")
+    if fake is not None:
+        return json.loads(fake)
+    # --------------------------------------------------------------------
+    try:
+        out = subprocess.check_output(
+            [RCLONE, "backend", "drives", cfg["base_remote"]],
+            text=True, encoding="utf-8", errors="replace",
+            stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        err("Error: rclone not found on PATH.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        err("Error: 'rclone backend drives %s' failed:\n%s" %
+            (cfg["base_remote"], (e.stderr or "").strip()))
+        err("Have you configured the '%s' remote? See README." %
+            remote_name(cfg))
+        sys.exit(1)
+    try:
+        return json.loads(out)
+    except ValueError:
+        err("Error: could not parse shared-drive list from rclone.")
+        sys.exit(1)
+
+
+def get_token(cfg):
+    """Read a fresh access_token from `rclone config dump`. Call get_drives
+    first so rclone has refreshed/persisted the token."""
+    name = remote_name(cfg)
+    try:
+        out = subprocess.check_output([RCLONE, "config", "dump"], text=True,
+                                      encoding="utf-8", errors="replace",
+                                      stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        err("Error: rclone not found on PATH.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        err("Error: 'rclone config dump' failed:\n%s" % (e.stderr or "").strip())
+        sys.exit(1)
+    try:
+        dump = json.loads(out)
+    except ValueError:
+        err("Error: could not parse 'rclone config dump' output.")
+        sys.exit(1)
+    remote = dump.get(name)
+    if not remote:
+        err("Error: rclone remote '%s' not found. Run rclone config first, "
+            "see README." % name)
+        sys.exit(1)
+    # The "token" value is itself a JSON string that must be parsed again.
+    tok_raw = remote.get("token")
+    if not tok_raw:
+        err("Error: remote '%s' has no OAuth token. Run rclone config first, "
+            "see README." % name)
+        sys.exit(1)
+    try:
+        tok = json.loads(tok_raw)
+    except ValueError:
+        err("Error: could not parse the OAuth token for remote '%s'." % name)
+        sys.exit(1)
+    access = tok.get("access_token")
+    if not access:
+        err("Error: no access_token for remote '%s'. Run rclone config first, "
+            "see README." % name)
+        sys.exit(1)
+    return access
+
+
+def create_drive(name, token):
+    """Create a shared drive via the Drive API and return {"id":..., "name":...}."""
+    # --- test hook: skip the network entirely when TODRIVE_TEST_FAKE_CREATE=1 ---
+    if os.environ.get("TODRIVE_TEST_FAKE_CREATE") == "1":
+        return {"id": "NEW999", "name": name}
+    # --------------------------------------------------------------------------
+    url = "%s?requestId=%s" % (DRIVES_API, uuid.uuid4())
+    body = json.dumps({"name": name}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Authorization", "Bearer %s" % token)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")
+        except Exception:
+            pass
+        if e.code == 403:
+            err("Error: Drive API refused to create shared drive '%s' (HTTP 403)."
+                % name)
+            err("Your Google Workspace admin may not allow creating shared "
+                "drives via the API. Create it manually in the Drive web UI "
+                "(New > Shared drive), then re-run this command.")
+        else:
+            err("Error: Drive API returned HTTP %s creating '%s':\n%s" %
+                (e.code, name, detail))
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        err("Error: could not reach the Drive API: %s" % e.reason)
+        sys.exit(1)
+
+
+def find_by_name(drives, name):
+    """Return the list of drives whose name matches exactly."""
+    return [d for d in drives if d.get("name") == name]
+
+
+FILES_API = "https://www.googleapis.com/drive/v3/files"
+
+
+def find_uploaded(cfg, name):
+    """Search every drive the account can reach for an exact-name match.
+
+    One files.list call with corpora=allDrives covers all shared drives (and
+    My Drive) — much cheaper than an rclone listing per drive. Returns
+    [{"id":..., "name":..., "drive": <shared-drive name or "My Drive">}, ...].
+    """
+    # --- test hook: skip the network when TODRIVE_TEST_FAKE_EXISTS is set to
+    # a JSON array of matches (mirrors TODRIVE_TEST_FAKE_CREATE) ---
+    fake = os.environ.get("TODRIVE_TEST_FAKE_EXISTS")
+    if fake is not None:
+        return json.loads(fake)
+    # ------------------------------------------------------------------
+    drives = get_drives(cfg)
+    token = get_token(cfg)
+    id2name = {d.get("id"): d.get("name") for d in drives}
+    # Escape for the Drive query language: backslash first, then quotes.
+    escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+    params = urllib.parse.urlencode({
+        "q": "name = '%s' and trashed = false" % escaped,
+        "corpora": "allDrives",
+        "includeItemsFromAllDrives": "true",
+        "supportsAllDrives": "true",
+        "fields": "files(id,name,driveId)",
+        "pageSize": "25",
+    })
+    req = urllib.request.Request("%s?%s" % (FILES_API, params))
+    req.add_header("Authorization", "Bearer %s" % token)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            files = json.loads(resp.read().decode("utf-8")).get("files", [])
+    except urllib.error.HTTPError as e:
+        err("Error: Drive API returned HTTP %s searching for '%s'." %
+            (e.code, name))
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        err("Error: could not reach the Drive API: %s" % e.reason)
+        sys.exit(1)
+    return [{"id": f.get("id"), "name": f.get("name"),
+             "drive": id2name.get(f.get("driveId"),
+                                  f.get("driveId") or "My Drive")}
+            for f in files]
+
+
+class _UsageScanError(Exception):
+    """A files.list usage scan hit a persistent HTTP error. Carries the
+    status code so the caller can log it or fall back to a per-drive scan."""
+
+    def __init__(self, code):
+        super().__init__("Drive API HTTP %s" % code)
+        self.code = code
+
+
+def drive_usage(cfg, drive_id=None):
+    """Return {driveId: {"bytes", "objects", "trash_bytes", "trash_objects"}}
+    for shared drives.
+
+    "bytes"/"objects" are CONTENT (trashed=false) -- callers that gate on the
+    100 GB cap (pick_destination, the drive-picker fill-%) keep reading
+    content-only "bytes". "trash_bytes"/"trash_objects" are the trashed
+    remainder, which STILL counts against the drive's cap.
+
+    One paged files.list scan, summed in-process by driveId -- much cheaper
+    than an rclone size call per drive. My Drive files (no driveId) are
+    skipped. Every drive from get_drives() gets an entry, zero-filled if it
+    had no files, so empty drives still show up.
+
+    drive_id=None scans every shared drive the account can reach
+    (corpora=allDrives, the find_uploaded idiom); drive_id=<ID> scopes the
+    scan to just that drive (corpora=drive -- the Drive API requires
+    corpora=drive whenever driveId is set)."""
+    # --- test hook: skip the network when TODRIVE_TEST_FAKE_USAGE is set to a
+    # JSON {driveId: {"bytes": int, "objects": int, ...}} object (mirrors
+    # TODRIVE_TEST_FAKE_CREATE/EXISTS). Records may omit trash_bytes/
+    # trash_objects; downstream readers default them to 0. ---
+    fake = os.environ.get("TODRIVE_TEST_FAKE_USAGE")
+    if fake is not None:
+        return json.loads(fake)
+    # ------------------------------------------------------------------
+    drives = get_drives(cfg)
+    token = get_token(cfg)
+
+    def get_page(params):
+        """One files.list GET, retrying a transient 5xx up to
+        USAGE_SCAN_RETRIES times (Google's allDrives listing 500s
+        intermittently). Raises _UsageScanError on a persistent HTTP error so
+        the caller can fall back to a per-drive scan."""
+        last_code = None
+        for _ in range(USAGE_SCAN_RETRIES + 1):
+            req = urllib.request.Request(
+                "%s?%s" % (FILES_API, urllib.parse.urlencode(params)))
+            req.add_header("Authorization", "Bearer %s" % token)
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                last_code = e.code
+                if e.code < 500:
+                    break  # a real client error won't fix itself on retry
+            except urllib.error.URLError as e:
+                err("Error: could not reach the Drive API: %s" % e.reason)
+                sys.exit(1)
+        raise _UsageScanError(last_code)
+
+    def scan(scoped_id):
+        """One full paged files.list scan. scoped_id=None means allDrives;
+        otherwise corpora=drive for just that drive. Returns (usage,
+        incomplete_bool). Raises _UsageScanError on a persistent HTTP error."""
+        usage = {}
+        incomplete = False
+        page_token = None
+        while True:
+            params = {
+                "q": "mimeType != 'application/vnd.google-apps.folder'",
+                "includeItemsFromAllDrives": "true",
+                "supportsAllDrives": "true",
+                # incompleteSearch must be in the mask or the partial-response
+                # filter would silently drop it and the fallback below could
+                # never fire. 'trashed' rides along so each file is bucketed
+                # into content vs. trash below (the "trashed = false" clause is
+                # dropped from q so trashed files are returned too).
+                "fields": "nextPageToken,incompleteSearch,"
+                          "files(driveId,size,trashed)",
+                "pageSize": str(FILES_PAGE_SIZE),
+            }
+            if scoped_id is not None:
+                params["corpora"] = "drive"
+                params["driveId"] = scoped_id
+            else:
+                params["corpora"] = "allDrives"
+            if page_token:
+                params["pageToken"] = page_token
+            data = get_page(params)
+            if data.get("incompleteSearch"):
+                incomplete = True
+            for f in data.get("files", []):
+                did = f.get("driveId")
+                if not did:
+                    continue  # My Drive file, not a shared drive -> skip
+                slot = usage.setdefault(did, _usage_zero())
+                if f.get("trashed"):
+                    slot["trash_bytes"] += int(f.get("size", 0))
+                    slot["trash_objects"] += 1
+                else:
+                    slot["bytes"] += int(f.get("size", 0))
+                    slot["objects"] += 1
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return usage, incomplete
+
+    def scan_per_drive():
+        """Reliable fallback: one corpora=drive scan per shared drive. Slower
+        (a call per drive) but not subject to the allDrives 5xx flakiness."""
+        usage = {}
+        for d in drives:
+            did = d.get("id")
+            if did:
+                sub, _ = scan(did)
+                usage[did] = sub.get(did, _usage_zero())
+        return usage
+
+    if drive_id is not None:
+        # Single-drive pre-flight (pick_destination): corpora=drive, the
+        # reliable path -- no allDrives fallback to attempt.
+        try:
+            usage, _incomplete = scan(drive_id)
+        except _UsageScanError as e:
+            err("Error: Drive API returned HTTP %s listing files for usage."
+                % e.code)
+            sys.exit(1)
+        usage.setdefault(drive_id, _usage_zero())
+        return usage
+
+    # Fleet scan: try the fast single-pass allDrives query, but fall back to
+    # per-drive on a persistent 5xx OR an incompleteSearch (both mean the
+    # allDrives result is unreliable on this account).
+    try:
+        usage, incomplete = scan(None)
+    except _UsageScanError as e:
+        err("allDrives usage scan failed (HTTP %s); falling back to a "
+            "per-drive scan." % e.code)
+        usage, incomplete = None, True
+    if usage is None or incomplete:
+        try:
+            usage = scan_per_drive()
+        except _UsageScanError as e:
+            err("Error: Drive API returned HTTP %s listing files for usage."
+                % e.code)
+            sys.exit(1)
+    for d in drives:
+        did = d.get("id")
+        if did:
+            usage.setdefault(did, _usage_zero())
+    return usage
+
+
+def resolve_id(cfg, name, create):
+    """Return a shared-drive ID for name, creating it if allowed/needed.
+    Logs to stderr. Returns None if not found and create is False."""
+    drives = get_drives(cfg)
+    matches = find_by_name(drives, name)
+    if len(matches) > 1:
+        err("Warning: %d shared drives named '%s'; using the first (%s)." %
+            (len(matches), name, matches[0]["id"]))
+    if matches:
+        return matches[0]["id"]
+    if not create:
+        return None
+    err("Creating shared drive '%s'..." % name)
+    token = get_token(cfg)
+    new = create_drive(name, token)
+    err("Created shared drive '%s' (id %s)." % (new["name"], new["id"]))
+    return new["id"]
+
+
+def connstr(cfg, drive_id):
+    """rclone connection string reaching the given shared drive by ID."""
+    return "%s,team_drive=%s:" % (remote_name(cfg), drive_id)
+
+
+# Matches a trailing " overflow" or " overflow N" suffix, anchored at the end
+# of the string -- a name merely CONTAINING "overflow" mid-string (e.g. a
+# drive literally called "Overflow Test") does not match and is left alone.
+_OVERFLOW_RE = re.compile(r"^(.*?)( overflow(?: (\d+))?)$")
+
+
+def overflow_root(name):
+    """Strip a trailing overflow suffix to recover the chain's root name.
+    "Movies overflow 2" -> "Movies"; "Movies" (no suffix) -> "Movies"."""
+    m = _OVERFLOW_RE.match(name)
+    return m.group(1) if m else name
+
+
+def next_overflow(name):
+    """Return the chain member immediately after name's own position.
+
+    The chain for root R is [R, "R overflow", "R overflow 2", "R overflow 3",
+    ...] -- never "R overflow overflow". Idempotent from any starting link:
+    calling this on "Movies overflow" (not just "Movies") correctly advances
+    to "Movies overflow 2", so uploading straight to a full overflow drive
+    still chains onward instead of looping back to the first link."""
+    m = _OVERFLOW_RE.match(name)
+    if m:
+        root, n = m.group(1), m.group(3)
+        idx = int(n) if n else 1
+    else:
+        root, idx = name, 0
+    nxt = idx + 1
+    return "%s%s" % (root, OVERFLOW_SUFFIX if nxt == 1
+                     else "%s %d" % (OVERFLOW_SUFFIX, nxt))
+
+
+def cmd_list(cfg, args):
+    drives = get_drives(cfg)
+    if getattr(args, "json", False):
+        print(json.dumps(drives))
+        return 0
+    if not drives:
+        print("No shared drives found.")
+        return 0
+    width = max(len(d.get("name", "")) for d in drives)
+    width = max(width, len("NAME"))
+    print("%-*s  %s" % (width, "NAME", "ID"))
+    for d in sorted(drives, key=lambda d: d.get("name", "").lower()):
+        print("%-*s  %s" % (width, d.get("name", ""), d.get("id", "")))
+    print("\n%d shared drive%s." % (len(drives), "" if len(drives) == 1 else "s"))
+    return 0
+
+
+def cmd_du(cfg, args):
+    """Show per-drive storage usage against the 100 GB cap. Read-only (only
+    files.list GETs) and always exits 0 -- a grandfathered drive over the cap
+    is reported, never treated as an error. The --json output additionally
+    carries trash_bytes/trash_objects per drive (the trashed remainder that
+    still counts against the cap); the plain-text table stays content-only."""
+    drives = get_drives(cfg)
+    usage = drive_usage(cfg)
+    rows = []
+    total_bytes = 0
+    for d in drives:
+        did = d.get("id")
+        u = usage.get(did, {"bytes": 0, "objects": 0})
+        b = u.get("bytes", 0)
+        total_bytes += b
+        rows.append({
+            "id": did,
+            "name": d.get("name", ""),
+            "bytes": b,
+            "objects": u.get("objects", 0),
+            # Additive trash accounting (content-only bytes/objects/pct above
+            # are unchanged). get-with-default so fake-hook / pre-trash
+            # payloads without trash_* still work.
+            "trash_bytes": u.get("trash_bytes", 0),
+            "trash_objects": u.get("trash_objects", 0),
+            # pct MAY exceed 100 -- that's the grandfathered case, not clamped.
+            "pct": round(b / SHARED_DRIVE_CAP_BYTES * 100, 1),
+        })
+    rows.sort(key=lambda r: r["name"].lower())
+
+    if getattr(args, "json", False):
+        print(json.dumps({"cap_bytes": SHARED_DRIVE_CAP_BYTES, "drives": rows}))
+        return 0
+    if not rows:
+        print("No shared drives found.")
+        return 0
+
+    used_strs = [human_size(r["bytes"]) for r in rows]
+    pct_strs = ["%.1f%%" % r["pct"] for r in rows]
+    name_w = max(max(len(r["name"]) for r in rows), len("NAME"))
+    used_w = max(max(len(s) for s in used_strs), len("USED"))
+    pct_w = max(max(len(s) for s in pct_strs), len("%CAP"))
+    print("%-*s  %-*s  %*s  %s" %
+          (name_w, "NAME", used_w, "USED", pct_w, "%CAP", "OBJECTS"))
+    for r, used_s, pct_s in zip(rows, used_strs, pct_strs):
+        line = "%-*s  %-*s  %*s  %d" % (
+            name_w, r["name"], used_w, used_s, pct_w, pct_s, r["objects"])
+        if r["pct"] > 100:
+            line += "  (grandfathered)"
+        print(line)
+    print("\n%d shared drive%s · %s total · cap 100 GB/drive" %
+          (len(rows), "" if len(rows) == 1 else "s", human_size(total_bytes)))
+    return 0
+
+
+def cmd_exists(cfg, args):
+    """Report whether something named args.name is already on a drive.
+    Plain mode exits 0 when found, 1 when not (grep-style)."""
+    matches = find_uploaded(cfg, args.name)
+    if getattr(args, "json", False):
+        print(json.dumps({"found": bool(matches), "matches": matches}))
+        return 0
+    if not matches:
+        print("Not found: %s" % args.name)
+        return 1
+    for m in matches:
+        print("%s  (in %s)" % (m["name"], m["drive"]))
+    return 0
+
+
+def cmd_new(cfg, args):
+    drives = get_drives(cfg)
+    existing = find_by_name(drives, args.name)
+    if existing:
+        err("Error: a shared drive named '%s' already exists (id %s)." %
+            (args.name, existing[0]["id"]))
+        return 1
+    token = get_token(cfg)
+    new = create_drive(args.name, token)
+    print("Created shared drive '%s' (id %s)." % (new["name"], new["id"]))
+    return 0
+
+
+def cmd_resolve(cfg, args):
+    drive_id = resolve_id(cfg, args.name, args.create)
+    if drive_id is None:
+        err("Error: no shared drive named '%s' (use --create to create it)." %
+            args.name)
+        return 1
+    print(connstr(cfg, drive_id))
+    return 0
+
+
+INCOMPLETE_SUFFIXES = (".part", ".aria2", ".!qb", ".crdownload", ".download")
+# kept in sync with offload_app.INCOMPLETE_SUFFIXES (todrive stays standalone)
+
+
+def find_incomplete_markers(path, limit=5):
+    """Up to `limit` in-progress-download artifacts at/under path.
+
+    todrive is the last hop before an rclone move deletes local data, so this
+    guard has no engine metadata and deliberately errs toward blocking (the
+    caller offers --allow-partial to override). Checks, case-insensitively:
+      - the top-level name itself, whether path is a file OR a dir (Safari's
+        ".download" is a DIRECTORY bundle whose contents carry no marker
+        suffixes, so a walk-only test would miss it — this mirrors
+        offload_app.payload_ready, which tests os.path.basename(path) first);
+      - every dir/file name under a directory src;
+      - the "<path>.aria2" control-file sibling for BOTH a file src and a
+        directory src (aria2 stores a multi-file torrent's control file as
+        "<dir>.aria2", a sibling of — not inside — the payload dir, so a
+        dir-only walk never sees it)."""
+    def is_marker(n):
+        return n.lower().endswith(INCOMPLETE_SUFFIXES)
+
+    base = path.rstrip(os.sep) or path
+    found = []
+    if is_marker(os.path.basename(base)):
+        found.append(path)
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path):
+            for n in dirs + files:
+                if is_marker(n):
+                    found.append(os.path.join(root, n))
+                    if len(found) >= limit:
+                        return found
+    if os.path.exists(base + ".aria2"):
+        found.append(base + ".aria2")
+    return found[:limit]
+
+
+def local_size(path):
+    """Total bytes at path (recursive for a dir, just getsize for a file).
+    Equivalent of offload_app.tree_size: 0-tolerant on OSError per entry, so
+    one unreadable file doesn't blow up the whole pre-flight size check."""
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def remove_empty_tree(path):
+    """Bottom-up rmdir of path and its subdirs; only truly-empty dirs go
+    (os.rmdir refuses non-empty, which is the safety property). Returns the
+    list of leftovers it could not remove."""
+    if not os.path.isdir(path):
+        return []
+    leftovers = []
+    for root, _dirs, _files in os.walk(path, topdown=False):
+        try:
+            os.rmdir(root)
+        except OSError:
+            leftovers.append(root)
+    return leftovers
+
+
+class DestinationError(Exception):
+    """No usable destination for one src (payload too big, or the overflow
+    chain is exhausted). Raised by pick_destination so cmd_up can fail just
+    that src -- failures += 1; continue -- instead of aborting a whole
+    multi-src `up` batch the way a bare sys.exit would."""
+
+
+def pick_destination(cfg, name, payload_bytes, usage_cache):
+    """Pre-flight the 100 GB cap and return (final_name, drive_id) to upload
+    payload_bytes into -- either the requested drive as-is, or the first
+    link in its overflow chain with room to spare.
+
+    usage_cache is a per-invocation {drive_id: bytes_used} dict the caller
+    (cmd_up) threads across every src in one `up` run: a drive minted here
+    is known-empty (no scan needed) and a successful upload's bytes get
+    folded in by the caller, so a multi-src run never rescans a drive it has
+    already measured. Logs each hop to stderr. Raises DestinationError when
+    there is no drive that can hold this src."""
+    # Checked first, before any resolve/create call: an oversized payload
+    # can't fit ANY shared drive, so nothing gets minted and no rclone gets
+    # spawned for it at all.
+    if payload_bytes > SHARED_DRIVE_CAP_BYTES:
+        raise DestinationError(
+            "%s exceeds the 100 GB shared-drive cap (%s); no shared "
+            "drive can hold it." %
+            (human_size(payload_bytes), human_size(SHARED_DRIVE_CAP_BYTES)))
+
+    candidate = name
+    hops = 0
+    while True:
+        # A name already present in get_drives() is scanned for its real
+        # usage; one resolve_id just minted (or is about to mint) is known
+        # to start at zero, so drive_usage need not be called for it at all.
+        pre_existing = bool(find_by_name(get_drives(cfg), candidate))
+        drive_id = resolve_id(cfg, candidate, create=True)
+        if not pre_existing:
+            usage_cache[drive_id] = 0
+        elif drive_id not in usage_cache:
+            usage = drive_usage(cfg, drive_id=drive_id)
+            usage_cache[drive_id] = usage.get(drive_id, {}).get("bytes", 0)
+
+        used = usage_cache[drive_id]
+        if used + payload_bytes <= SHARED_DRIVE_CAP_BYTES:  # exact fit, no margin
+            return candidate, drive_id
+
+        hops += 1
+        if hops > OVERFLOW_CHAIN_MAX:
+            raise DestinationError(
+                "overflow chain for '%s' exceeded %d links; giving up."
+                % (name, OVERFLOW_CHAIN_MAX))
+        nxt = next_overflow(candidate)
+        err("'%s' is full (%s used, cap %s); routing to '%s'." %
+            (candidate, human_size(used), human_size(SHARED_DRIVE_CAP_BYTES),
+             nxt))
+        candidate = nxt
+
+
+def cmd_up(cfg, args):
+    paths = args.paths
+    if len(paths) < 2:
+        err("Error: need at least one path and a drive name.")
+        return 2
+    name = paths[-1]
+    srcs = paths[:-1]
+
+    missing = [p for p in srcs if not os.path.exists(p)]
+    if missing:
+        for p in missing:
+            err("Error: path does not exist: %s" % p)
+        return 1
+
+    action = "copy" if args.keep else "move"
+    no_overflow = getattr(args, "no_overflow", False)
+
+    # --no-overflow: today's exact one-time resolve, kept byte-identical to
+    # legacy (pre-overflow-routing) behavior -- one fixed destination for
+    # every src, no cap check, no rerouting.
+    if no_overflow:
+        drive_id = resolve_id(cfg, name, create=True)
+        dest = connstr(cfg, drive_id)
+
+    # Per-invocation cache threaded through pick_destination and the
+    # mid-upload reroute below: {drive_id: bytes_used}. Shared across every
+    # src in this one `up` call, so a drive filled by an earlier src is
+    # already known full for a later one, and a scanned drive is never
+    # rescanned.
+    usage_cache = {}
+
+    failures = 0
+    for src in srcs:
+        # Last-hop guard: todrive is the process that DELETES local data (an
+        # rclone move uploads then removes the source), so it must protect
+        # itself against an incomplete download even when invoked by hand --
+        # the 2026-07-06 incident moved a live ".part" file to Drive and
+        # deleted the local copy. Applies to copy too: copying a truncated
+        # .part still pollutes the drive. --allow-partial is the escape hatch.
+        if not getattr(args, "allow_partial", False):
+            markers = find_incomplete_markers(src)
+            if markers:
+                err("Error: %s looks like an incomplete download (found %s); "
+                    "skipping. Re-run with --allow-partial to force." %
+                    (src, ", ".join(markers)))
+                failures += 1
+                continue
+
+        if no_overflow:
+            target_name = name
+        else:
+            payload_bytes = local_size(src)
+            try:
+                target_name, drive_id = pick_destination(
+                    cfg, name, payload_bytes, usage_cache)
+            except DestinationError as e:
+                # No drive can hold this src: fail just it, like every other
+                # per-src error, so the rest of a multi-src batch still runs.
+                err("Error: %s" % e)
+                failures += 1
+                continue
+            dest = connstr(cfg, drive_id)
+            if target_name != name:
+                # stdout, not stderr: this line must survive run_todrive_up's
+                # _PROGRESS_NOISE_RE filter so it reaches combined_output.
+                print("ROUTED: %s -> %s" % (src, target_name))
+
+        # Preserve a directory as a unit under <connstr><dirname>/, matching
+        # offloader.py; a file goes straight to the connection string.
+        is_dir = os.path.isdir(src)
+
+        def target_for(d):
+            if is_dir:
+                return "%s%s/" % (d, os.path.basename(src.rstrip(os.sep)))
+            return d
+
+        def cmd_for(t):
+            c = [RCLONE, action, src, t]
+            c += list(cfg["rclone_flags"])
+            # A dir move leaves the (now-empty) source directory tree behind;
+            # ask rclone to prune it (harmless redundancy — the walk below is
+            # the real guarantee, since rclone leaves the top-level src dir
+            # regardless).
+            if is_dir and action == "move":
+                c += ["--delete-empty-src-dirs"]
+            c += ["-P"]
+            return c
+
+        target = target_for(dest)
+        cmd = cmd_for(target)
+        print("%s %s -> %s" % (action, src, target))
+
+        # rclone's stdout carries the -P progress the app's parser reads, so
+        # it's left inherited; only stderr is captured -- teed live to our
+        # own stderr (nothing hidden from the terminal) while the last ~200
+        # lines are retained to check for a quota marker on failure.
+        hops = 0
+        while True:
+            try:
+                # encoding/errors pinned like every other decode site here:
+                # under the C locale (frozen .app / launchd / cron) text=True
+                # alone decodes as ASCII and crashes on an accented filename.
+                proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True,
+                                        encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                err("Error: rclone not found on PATH.")
+                return 1
+            stderr_tail = deque(maxlen=200)
+            for line in proc.stderr:
+                sys.stderr.write(line)
+                stderr_tail.append(line)
+            rc = proc.wait()
+
+            if rc == 0 or no_overflow:
+                break  # success, or legacy mode never reroutes -> stop here
+
+            err_text = "".join(stderr_tail)
+            if not any(m.lower() in err_text.lower() for m in QUOTA_MARKERS):
+                break  # non-quota failure: today's FAILED path handles it
+
+            hops += 1
+            if hops > OVERFLOW_CHAIN_MAX:
+                break  # chain exhausted: falls through as a normal failure
+
+            # Mid-upload quota hit: this drive is full -- note it (so a later
+            # src skips rescanning it) and retry the SAME src on the next
+            # link. Whatever rclone already moved before failing stays put:
+            # no destructive cleanup, the split payload is accepted.
+            usage_cache[drive_id] = SHARED_DRIVE_CAP_BYTES
+            target_name = next_overflow(target_name)
+            drive_id = resolve_id(cfg, target_name, create=True)
+            dest = connstr(cfg, drive_id)
+            target = target_for(dest)
+            cmd = cmd_for(target)
+            print("ROUTED: %s -> %s" % (src, target_name))
+            print("%s %s -> %s" % (action, src, target))
+
+        if rc == 0:
+            if not no_overflow:
+                usage_cache[drive_id] = (
+                    usage_cache.get(drive_id, 0) + payload_bytes)
+            # After a successful MOVE of a directory, remove the now-empty
+            # source tree rclone left behind. NEVER for copy/--keep (the files
+            # are meant to stay) and never for a file src. os.rmdir only
+            # removes truly-empty dirs, so a stray leftover file is preserved
+            # and just warned about, never silently deleted.
+            if is_dir and action == "move":
+                leftovers = remove_empty_tree(src)
+                if leftovers:
+                    err("Warning: source dir not fully removed (non-empty "
+                        "leftovers): %s" % ", ".join(leftovers))
+            print("OK: %s" % src)
+        else:
+            err("FAILED (rc=%d): %s" % (rc, src))
+            failures += 1
+    return 1 if failures else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Address Google Shared Drives by name and push files to them.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_list = sub.add_parser("list", help="list shared drives")
+    p_list.add_argument("--json", action="store_true",
+                        help="print the raw JSON array of drives")
+
+    p_du = sub.add_parser(
+        "du", help="show per-drive storage usage against the 100 GB cap")
+    p_du.add_argument("--json", action="store_true",
+                      help='print {"cap_bytes": int, "drives": [{"name",'
+                           '"bytes","objects","trash_bytes","trash_objects",'
+                           '"pct"}, ...]}')
+
+    p_ex = sub.add_parser(
+        "exists", help="check whether a file/folder name is already on a drive")
+    p_ex.add_argument("name")
+    p_ex.add_argument("--json", action="store_true",
+                      help='print {"found": bool, "matches": [...]}')
+
+    p_new = sub.add_parser("new", help="create a shared drive by name")
+    p_new.add_argument("name")
+
+    p_res = sub.add_parser(
+        "resolve", help="print the rclone connection string for a drive name")
+    p_res.add_argument("name")
+    p_res.add_argument("--create", action="store_true",
+                       help="create the drive if it does not exist")
+
+    p_up = sub.add_parser(
+        "up", help="upload files/dirs to a shared drive (last arg is the name)")
+    p_up.add_argument("paths", nargs="+",
+                      metavar="path ... drive-name",
+                      help="one or more local paths followed by the drive name")
+    p_up.add_argument("--keep", action="store_true",
+                      help="copy instead of move (keep local files)")
+    p_up.add_argument("--allow-partial", action="store_true",
+                      help="upload even if incomplete-download markers "
+                           "(.part/.aria2/...) are present")
+    p_up.add_argument("--no-overflow", action="store_true",
+                      help="disable 100 GB overflow routing; upload straight "
+                           "to the named drive exactly as before this feature")
+
+    args = parser.parse_args()
+    cfg = load_config()
+
+    handlers = {
+        "list": cmd_list,
+        "du": cmd_du,
+        "exists": cmd_exists,
+        "new": cmd_new,
+        "resolve": cmd_resolve,
+        "up": cmd_up,
+    }
+    sys.exit(handlers[args.command](cfg, args))
+
+
+if __name__ == "__main__":
+    main()
