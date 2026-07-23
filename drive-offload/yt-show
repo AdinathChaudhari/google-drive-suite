@@ -1,0 +1,1298 @@
+#!/usr/bin/env python3
+"""yt-show: turn a YouTube playlist into a Drivecast TV show.
+
+Sibling CLI to stream-dl/todrive: downloads each new playlist video (via
+yt-dlp) and uploads it as `<Show> SxxEyy - <Title>.ext` under
+`<Show> Season N/` on a named Shared Drive, reusing renamer.py's canonical
+naming and todrive's connection-string upload leg rather than duplicating
+either.
+
+Pipelined: while video N+1 downloads, video N uploads. A gap semaphore gives
+backpressure so at most --max-gap (default 3) episodes are downloaded-but-not-
+yet-uploaded at once — downloads pause when uploads fall behind. Per-show
+incremental state (what's already uploaded, season/episode cursor) lives in
+yt_shows.json next to rename_cache.json; episode numbering is per-video-id
+and append-only.
+
+Stdlib only at import time; yt_dlp is imported lazily inside probe_playlist/
+download_one so `yt-show --help` and the unit tests work without it installed.
+
+NOTE: this bypasses todrive's 100 GB overflow routing (we rclone moveto each
+finished file straight into its season folder, since a lone file uploaded via
+`todrive up` would land at the drive ROOT, not inside `<Show> Season N/`). A
+single very large show could exceed one Shared Drive's cap -- an accepted
+limitation of this pipelined path; pick another (or a fresh) drive if needed.
+
+Crash/interruption recovery relies on two invariants the rest of the module
+already has: (1) a committed episode's canonical stem is deterministic from
+its stored season/episode/title, so "what's on disk" can always be compared
+against "what's committed"; (2) yt-dlp only ever produces a final-shaped
+filename on completion (partial writes stay under `.part`/`.ytdl`/`.aria2`,
+merges land via `<stem>.temp.mp4` + `os.rename`), so a surviving final-shaped
+file IS a trustworthy completion marker -- never sized, always name-shape.
+Re-uploading to the same canonical dest is idempotent (`rclone moveto`
+overwrites an existing dest file), so the one crash window we accept --
+rc==0 on upload but killed before `save_state` commits it -- costs one
+redundant re-upload on the next run, never a duplicate on the drive.
+
+Invariant (1) has a hole staged-file reuse must guard against separately:
+the canonical stem is deterministic from season/episode/title, but is NOT
+guaranteed unique to one video id across runs -- clean_source_title collapses
+title-less sources (e.g. plain "Episode N") to no title at all, and an
+interrupted run followed by a resume where the gap gets reassigned (a video
+went private, a playlist reordered) can hand that SAME bare stem to a
+DIFFERENT video than the one whose staged file is sitting there. Matching by
+stem alone would silently reuse the wrong video's bytes under the new one's
+name. So every on-disk staged artifact carries its video id in the leaf
+(`staged_download_stem`) and reuse only ever matches stem+id together; the
+id is stripped back off for the actual drive destination, which stays the
+plain canonical name.
+"""
+import argparse
+import contextlib
+import datetime
+import fcntl
+import glob
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+import renamer
+
+TODRIVE = os.path.join(SCRIPT_DIR, "todrive")
+RCLONE = shutil.which("rclone") or "rclone"
+STATE_PATH = os.path.join(renamer._default_support_dir(), "yt_shows.json")
+
+
+# ===========================================================================
+# Optional rich live dashboard. rich is a soft dependency: the module imports
+# and runs (--help, the unit tests, and a real run in plain-text mode) without
+# it. The globals default to None; _import_rich() populates them and flips
+# USE_RICH. A real run with rich absent (or a non-TTY stdout, or --plain) falls
+# back to the terse plain-text UI below.
+# ===========================================================================
+
+USE_RICH = False
+RichConsole = None
+RichLive = None
+RichProgress = None
+RichPanel = None
+RichGroup = None
+RichText = None
+SpinnerColumn = None
+TextColumn = None
+BarColumn = None
+DownloadColumn = None
+TransferSpeedColumn = None
+TimeRemainingColumn = None
+
+
+def _import_rich():
+    """Populate the rich globals. Raises ImportError if rich is unavailable."""
+    global RichConsole, RichLive, RichProgress, RichPanel, RichGroup, RichText
+    global SpinnerColumn, TextColumn, BarColumn, DownloadColumn
+    global TransferSpeedColumn, TimeRemainingColumn
+
+    from rich.console import Console as _Console
+    from rich.console import Group as _Group
+    from rich.live import Live as _Live
+    from rich.panel import Panel as _Panel
+    from rich.progress import BarColumn as _BarColumn
+    from rich.progress import DownloadColumn as _DownloadColumn
+    from rich.progress import Progress as _Progress
+    from rich.progress import SpinnerColumn as _SpinnerColumn
+    from rich.progress import TextColumn as _TextColumn
+    from rich.progress import TimeRemainingColumn as _TimeRemainingColumn
+    from rich.progress import TransferSpeedColumn as _TransferSpeedColumn
+    from rich.text import Text as _Text
+
+    RichConsole = _Console
+    RichLive = _Live
+    RichProgress = _Progress
+    RichPanel = _Panel
+    RichGroup = _Group
+    RichText = _Text
+    SpinnerColumn = _SpinnerColumn
+    TextColumn = _TextColumn
+    BarColumn = _BarColumn
+    DownloadColumn = _DownloadColumn
+    TransferSpeedColumn = _TransferSpeedColumn
+    TimeRemainingColumn = _TimeRemainingColumn
+
+
+try:
+    _import_rich()
+    USE_RICH = True
+except ImportError:
+    USE_RICH = False
+
+
+# ===========================================================================
+# State (yt_shows.json)
+# ===========================================================================
+
+def load_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("version", 1)
+            data.setdefault("shows", {})
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "shows": {}}
+
+
+def save_state(state):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+def acquire_show_lock(slug):
+    """Take an exclusive, advisory per-show lock so two yt-show runs for the
+    SAME show can't race each other's state writes and staging (concurrent
+    save_state clobbers a commit; both upload the same episode). Returns the
+    open lock file (KEEP IT ALIVE to hold the lock) or None if another live run
+    already holds it. flock is released automatically when this process exits or
+    is killed, so there is no stale lock file to clean up. Different shows use
+    different lock files, so they never block each other."""
+    path = os.path.join(renamer._default_support_dir(), ".yt-show-%s.lock" % slug)
+    fd = open(path, "w")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:               # another run holds it (EWOULDBLOCK / EACCES)
+        fd.close()
+        return None
+    try:
+        fd.write("%d\n" % os.getpid())
+        fd.flush()
+    except OSError:
+        pass
+    return fd
+
+
+# ===========================================================================
+# Probe (lazy yt_dlp)
+# ===========================================================================
+
+def probe_playlist(url):
+    try:
+        import yt_dlp
+    except ImportError:
+        sys.exit("yt-show needs yt-dlp:  pip install yt-dlp  (or use " +
+                 sys.executable + ")")
+    opts = {"extract_flat": "in_playlist", "quiet": True, "no_warnings": True,
+            "skip_download": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    plid = info.get("id") or ""
+    ptitle = info.get("title") or "playlist"
+    items = []   # ordered [(video_id, video_title)]
+    for e in (info.get("entries") or []):
+        if not e:
+            continue
+        vid = e.get("id")
+        vtitle = e.get("title") or ""
+        if not vid or vtitle in ("[Private video]", "[Deleted video]",
+                                 "[Unavailable video]"):
+            continue
+        items.append((vid, vtitle))
+    return plid, ptitle, items
+
+
+# ===========================================================================
+# Assignment (PURE, module-level, unit-tested elsewhere) -- DO NOT change its
+# semantics.
+# ===========================================================================
+
+def assign_new_episodes(show_rec, plid, new_items, mode):
+    """new_items = ordered [video_id] NOT yet in show_rec['episodes'].
+    mode in {'new','same'}. Returns ordered [(video_id, season, episode)] WITHOUT
+    mutating show_rec (planning is pure; commit happens only after a verified upload).
+    Rolls to the next season after episode 100 (drivecast caps at E999)."""
+    episodes = show_rec.get("episodes", {})
+    playlists = show_rec.get("playlists", {})
+    seasons_present = [e["season"] for e in episodes.values()]
+    max_season = max(seasons_present) if seasons_present else 0
+    if plid in playlists:
+        target = playlists[plid]["season"]
+    elif not episodes:
+        target = 1
+    elif mode == "new":
+        target = max_season + 1
+    else:
+        target = max_season if max_season >= 1 else 1
+
+    def next_ep_for(s):
+        used = [e["episode"] for e in episodes.values() if e["season"] == s]
+        return (max(used) + 1) if used else 1
+
+    next_ep = next_ep_for(target)
+    out = []
+    for vid in new_items:
+        # On rollover past E100, advance to the next season that has room,
+        # resuming from its committed cursor so we never reuse a (season,
+        # episode) already held by another playlist (no-dup, requirements A/B).
+        while next_ep > 100:
+            target += 1
+            next_ep = next_ep_for(target)
+        out.append((vid, target, next_ep))
+        next_ep += 1
+    return out
+
+
+# ===========================================================================
+# Drive resolution + interactive picker
+# ===========================================================================
+
+def resolve_connstr(drive):
+    """'todrive resolve --create' prints the rclone connstr (e.g.
+    'gdrive,team_drive=<ID>:')."""
+    r = subprocess.run([sys.executable, TODRIVE, "resolve", "--create", drive],
+                       capture_output=True, text=True)
+    dest = (r.stdout or "").strip()
+    if r.returncode != 0 or not dest:
+        sys.exit("could not resolve/create drive %r: %s" %
+                 (drive, (r.stderr or "").strip()))
+    return dest   # ends with ':'
+
+
+def _human(n):
+    """DECIMAL sizes to match todrive/Drivecast's 100 GB cap accounting."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000.0:
+            return "%.1f %s" % (n, unit)
+        n /= 1000.0
+    return "%.1f PB" % n
+
+
+def parse_drive_usage(data):
+    """Turn a 'todrive du --json' payload into {name: {used,cap,free,pct}}.
+    'used' and 'free' count trash against the cap (trashed files still occupy a
+    Shared Drive), matching storage_monitor.py's FREE/TOTAL columns. Pure."""
+    cap = data.get("cap_bytes") or 0
+    out = {}
+    for d in (data.get("drives") or []):
+        name = d.get("name") or ""
+        if not name:
+            continue
+        used = (d.get("bytes", 0) or 0) + (d.get("trash_bytes", 0) or 0)
+        out[name] = {
+            "used": used, "cap": cap,
+            "free": (max(0, cap - used) if cap else None),
+            "pct": (round(used / cap * 100, 1) if cap else None),
+        }
+    return out
+
+
+def fetch_drive_usage():
+    """Live per-drive usage via 'todrive du --json' (read-only files.list GETs,
+    fresher than the GUI's 5-min cache). Best-effort: returns {} on any error so
+    it never blocks the actual download/upload."""
+    try:
+        r = subprocess.run([sys.executable, TODRIVE, "du", "--json"],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not r.stdout.strip():
+            return {}
+        return parse_drive_usage(json.loads(r.stdout))
+    except Exception:
+        return {}
+
+
+def drive_storage_line(drive, usage=None):
+    """One-line live headroom for a drive, or None if usage is unknown (e.g. a
+    brand-new drive not yet created)."""
+    u = (usage if usage is not None else fetch_drive_usage()).get(drive)
+    if not u or u["free"] is None:
+        return None
+    return "drive %r: %s used · %s free of %s (%.0f%% full)" % (
+        drive, _human(u["used"]), _human(u["free"]), _human(u["cap"]), u["pct"])
+
+
+def pick_drive():
+    """--pick: list Shared Drives, let the user choose one or type a NEW name
+    to create."""
+    names = []
+    r = subprocess.run([sys.executable, TODRIVE, "list", "--json"],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            names = [d.get("name") for d in json.loads(r.stdout) if d.get("name")]
+        except ValueError:
+            names = []
+    if not names:   # fallback: parse the plain table (skip NAME header + summary)
+        r2 = subprocess.run([sys.executable, TODRIVE, "list"],
+                            capture_output=True, text=True)
+        for ln in (r2.stdout or "").splitlines():
+            s = ln.strip()
+            if s and not s.startswith("NAME") and "shared drive" not in s:
+                names.append(s.split("  ")[0].strip())
+    usage = fetch_drive_usage()   # live headroom per drive (best-effort)
+    print("Shared drives:")
+    for i, n in enumerate(names, 1):
+        u = usage.get(n)
+        if u and u["free"] is not None:
+            print("  %d) %-24s %s free · %.0f%% full" %
+                 (i, n, _human(u["free"]), u["pct"]))
+        else:
+            print("  %d) %s" % (i, n))
+    print("  (enter a number, or type a NEW drive name to create it)")
+    choice = input("drive> ").strip()
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        return names[int(choice) - 1]
+    if not choice:
+        sys.exit("no drive selected")
+    return choice
+
+
+# ===========================================================================
+# Live terminal dashboard (rich, with a plain-text fallback)
+# ===========================================================================
+
+# state -> (glyph, rich style). Cyan download / magenta upload mirror the two
+# concurrent progress bars.
+_GLYPH = {
+    "done": ("✔", "green"),        # heavy check
+    "downloading": ("⬇", "cyan"),  # down arrow
+    "uploading": ("⬆", "magenta"), # up arrow
+    "pending": ("○", "dim"),       # hollow circle
+    "failed": ("✖", "red"),        # heavy multiplication x
+}
+_GLYPH_ORDER = ("done", "downloading", "uploading", "pending", "failed")
+_BOARD_FULL_MAX = 40   # collapse the glyph row to counts beyond this many eps
+
+
+def _bar(pct, width=12):
+    """Fixed-width block-char progress bar (used by the capacity line and the
+    plain-text download/upload progress)."""
+    p = 0.0 if pct is None else max(0.0, min(100.0, float(pct)))
+    filled = int(round(width * p / 100.0))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _fmt_speed(speed):
+    """Format a speed for the plain UI. yt-dlp hands us bytes/sec (a number);
+    rclone hands us a ready-made string like '5.0 MiB/s' — pass either."""
+    if not speed:
+        return ""
+    if isinstance(speed, str):
+        return speed
+    return _human(speed) + "/s"
+
+
+class UI:
+    """Owns the single rich Live (or the plain-text fallback) for the whole
+    run. The lock guards the board/counters, which are mutated from BOTH the
+    producer (download, main thread) and the consumer (upload, worker thread)
+    and read by the Live refresh thread in render()."""
+
+    def __init__(self, use_rich):
+        # rich must actually be importable to honour use_rich; otherwise degrade
+        # to plain so a caller passing use_rich=True can't hit a None progress.
+        self.use_rich = bool(use_rich) and RichProgress is not None
+        self.lock = threading.Lock()
+        self.show = ""
+        self.drive = ""
+        self._free = None
+        self._cap = None
+        self._pct = None
+        self.new_total = 0
+        self.already = 0
+        self.grand_total = 0
+        self.episodes = []      # ordered [(season, episode)]
+        self.ep_meta = {}       # (season, episode) -> plan dict
+        self.ep_state = {}      # (season, episode) -> state str
+        self._live = None       # the single RichLive (rich mode only)
+        self.console = None
+        self.dl_progress = None
+        self.up_progress = None
+        self.overall_progress = None
+        self._dl_task = None
+        self._up_task = None
+        self._overall_task = None
+        self._dl_label = ""
+        self._up_label = ""
+        self._plain_dl_last = 0.0
+        self._plain_up_last = 0.0
+        self._noted = set()
+        if self.use_rich:
+            self.console = RichConsole()
+            self.dl_progress = self._make_progress()
+            self.up_progress = self._make_progress()
+            self.overall_progress = RichProgress(
+                TextColumn("[bold]episodes[/bold]"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                console=self.console, transient=False,
+            )
+
+    def _make_progress(self):
+        # Mirrors video-loop-extractor's download columns: spinner + label +
+        # bar + size + transfer speed + ETA, used as a plain renderable inside
+        # the one Live (never started on its own).
+        return RichProgress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+            transient=False,
+        )
+
+    # -- lifecycle -----------------------------------------------------------
+    def start(self):
+        if self.use_rich and RichLive is not None:
+            self._live = RichLive(get_renderable=self.render,
+                                  console=self.console, refresh_per_second=8)
+            self._live.start()
+
+    def stop(self):
+        if self.use_rich and self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+
+    @contextlib.contextmanager
+    def live(self):
+        """`with ui.live(): ...` — the ONE Live for the whole pipeline. Never
+        nested; any input()/prompt must happen before entering this."""
+        self.start()
+        try:
+            yield self
+        finally:
+            self.stop()
+
+    def note(self, text):
+        """Print a one-off note once (deduped). In rich mode it prints above
+        the Live region; otherwise a plain stderr line."""
+        with self.lock:
+            if text in self._noted:
+                return
+            self._noted.add(text)
+        if self.use_rich and self._live is not None:
+            try:
+                self._live.console.print(text)
+                return
+            except Exception:
+                pass
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
+
+    # -- header / capacity / counts -----------------------------------------
+    def set_header(self, show, drive):
+        with self.lock:
+            self.show = show
+            self.drive = drive
+        if not self.use_rich:
+            sys.stderr.write("yt-show · %s → %s\n" % (show, drive))
+            sys.stderr.flush()
+
+    def set_capacity(self, free_bytes, cap_bytes, pct):
+        with self.lock:
+            self._free = free_bytes
+            self._cap = cap_bytes
+            self._pct = pct
+        if not self.use_rich:
+            if free_bytes is None:
+                sys.stderr.write("  capacity unknown\n")
+            else:
+                sys.stderr.write("  %s · %s free · %.0f%% full\n" %
+                                 (self.drive, _human(free_bytes), pct or 0))
+            sys.stderr.flush()
+
+    def set_counts(self, new_total, already, grand_total):
+        with self.lock:
+            self.new_total = new_total
+            self.already = already
+            self.grand_total = grand_total
+        if not self.use_rich:
+            sys.stderr.write("  episodes: %d new, %d already, %d total\n" %
+                             (new_total, already, grand_total))
+            sys.stderr.flush()
+
+    # -- episode board -------------------------------------------------------
+    def register_episodes(self, items):
+        with self.lock:
+            self.episodes = [(it["season"], it["episode"]) for it in items]
+            self.ep_meta = {(it["season"], it["episode"]): it for it in items}
+            self.ep_state = {k: "pending" for k in self.episodes}
+        if self.use_rich and self.overall_progress is not None:
+            self._overall_task = self.overall_progress.add_task(
+                "", total=max(1, len(self.episodes)))
+
+    def update_status(self, key, state):
+        with self.lock:
+            if key in self.ep_state:
+                self.ep_state[key] = state
+            done = sum(1 for s in self.ep_state.values() if s == "done")
+        if self.use_rich and self._overall_task is not None:
+            try:
+                self.overall_progress.update(self._overall_task, completed=done)
+            except Exception:
+                pass
+        elif not self.use_rich and state == "failed":
+            sys.stderr.write("  ✖ S%02dE%02d failed\n" % (key[0], key[1]))
+            sys.stderr.flush()
+
+    def _glyph_row_markup(self):
+        # Caller holds self.lock.
+        states = [self.ep_state.get(k, "pending") for k in self.episodes]
+        if not states:
+            return ""
+        if len(states) <= _BOARD_FULL_MAX:
+            out = []
+            for s in states:
+                g, style = _GLYPH[s]
+                out.append("[%s]%s[/%s]" % (style, g, style))
+            return "".join(out)
+        # Too many to show one glyph each -> collapse to counts.
+        from collections import Counter
+        c = Counter(states)
+        parts = []
+        for st in _GLYPH_ORDER:
+            if c.get(st):
+                g, style = _GLYPH[st]
+                parts.append("[%s]%s[/%s]×%d" % (style, g, style, c[st]))
+        return " ".join(parts)
+
+    # -- download progress ---------------------------------------------------
+    def dl_start(self, label, total_bytes):
+        with self.lock:
+            self._dl_label = label
+        if self.use_rich:
+            self._dl_task = self.dl_progress.add_task(
+                "⬇ %s" % label, total=total_bytes)
+        else:
+            self._plain_dl_last = 0.0
+            sys.stderr.write("  ⬇ %s  0%%\r" % label)
+            sys.stderr.flush()
+
+    def dl_advance(self, done_bytes, total_bytes, speed):
+        if self.use_rich:
+            if self._dl_task is not None:
+                kw = {"completed": done_bytes or 0}
+                if total_bytes:
+                    kw["total"] = total_bytes
+                try:
+                    self.dl_progress.update(self._dl_task, **kw)
+                except Exception:
+                    pass
+        else:
+            now = time.monotonic()
+            if now - self._plain_dl_last < 1.0:
+                return
+            self._plain_dl_last = now
+            pct = int(100 * done_bytes / total_bytes) if total_bytes else 0
+            sys.stderr.write("  ⬇ %s  %d%%  %s\r" %
+                             (self._dl_label, pct, _fmt_speed(speed)))
+            sys.stderr.flush()
+
+    def dl_finish(self):
+        if self.use_rich:
+            if self._dl_task is not None:
+                try:
+                    self.dl_progress.remove_task(self._dl_task)
+                except Exception:
+                    pass
+                self._dl_task = None
+        else:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    # -- upload progress -----------------------------------------------------
+    def up_start(self, label, total_bytes):
+        with self.lock:
+            self._up_label = label
+        if self.use_rich:
+            self._up_task = self.up_progress.add_task(
+                "⬆ %s" % label, total=total_bytes)
+        else:
+            self._plain_up_last = 0.0
+            sys.stderr.write("  ⬆ %s  0%%\r" % label)
+            sys.stderr.flush()
+
+    def up_advance(self, done_bytes, total_bytes, speed):
+        if self.use_rich:
+            if self._up_task is not None:
+                kw = {"completed": done_bytes or 0}
+                if total_bytes:
+                    kw["total"] = total_bytes
+                try:
+                    self.up_progress.update(self._up_task, **kw)
+                except Exception:
+                    pass
+        else:
+            now = time.monotonic()
+            if now - self._plain_up_last < 1.0:
+                return
+            self._plain_up_last = now
+            pct = int(100 * done_bytes / total_bytes) if total_bytes else 0
+            sys.stderr.write("  ⬆ %s  %d%%  %s\r" %
+                             (self._up_label, pct, _fmt_speed(speed)))
+            sys.stderr.flush()
+
+    def up_finish(self):
+        if self.use_rich:
+            if self._up_task is not None:
+                try:
+                    self.up_progress.remove_task(self._up_task)
+                except Exception:
+                    pass
+                self._up_task = None
+        else:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    # -- render (rich only; called by the Live refresh thread) --------------
+    def render(self):
+        with self.lock:
+            title = "yt-show · %s → %s" % (self.show, self.drive)
+            if self._free is None:
+                cap = "capacity unknown"
+            else:
+                cap = "%s · %s free · %.0f%% full" % (
+                    self.drive, _human(self._free), self._pct or 0)
+        items = [RichText(title, style="bold"), RichText(cap, style="dim")]
+        if self.overall_progress is not None and self.overall_progress.task_ids:
+            items.append(self.overall_progress)
+        if self.dl_progress is not None and self.dl_progress.task_ids:
+            items.append(self.dl_progress)
+        if self.up_progress is not None and self.up_progress.task_ids:
+            items.append(self.up_progress)
+        return RichGroup(*items)
+
+
+# ===========================================================================
+# Download (lazy yt_dlp; native concurrent fragments by default, aria2c
+# multi-connection per video when --connections > 1 = Motrix-style)
+# ===========================================================================
+
+_STEM_FRAGMENT_RE = re.compile(r"\.f\d+\.")   # pre-merge stream, e.g. '.f137.'
+_STEM_TEMP_RE = re.compile(r"\.temp\.")       # mid-merge, pre-os.rename
+
+
+def staged_download_stem(out_stem_path, vid):
+    """The ON-DISK stem download_one actually writes to and staged_complete_path
+    reuse-checks against -- the canonical stem plus a ' [<video_id>]' tag.
+
+    The canonical stem alone (season/episode/title) is NOT guaranteed unique
+    to one video across runs (see the module docstring), so every staged
+    artifact is bound to its video id here; the tag is stripped back off
+    before the file ever reaches the drive (upload_worker computes the
+    canonical, untagged dest name separately). One helper, shared by
+    download_one and main()'s reuse check, so the tagging scheme can't drift
+    between writer and reader."""
+    return "%s [%s]" % (out_stem_path, vid)
+
+
+def staged_complete_path(out_stem_path):
+    """Return the path to a COMPLETE staged download for out_stem_path, or
+    None if nothing complete is there. Shared by download_one's success path
+    and main()'s crash-recovery skip -- one classifier, one wrong-file bug to
+    fix.
+
+    Completion is judged ONLY by name shape + marker siblings -- NEVER by
+    size (a slowly-writing file must not be mistaken for complete). The
+    invariant: yt-dlp renames a `.part` to its final name only on completion,
+    and a merge lands via `<stem>.temp.mp4` + `os.rename` -- so a surviving
+    final-shaped candidate (no partial marker, not a pre-merge stream, not a
+    mid-rename temp file) IS complete.
+    """
+    candidates = glob.glob(glob.escape(out_stem_path) + ".*")
+    survivors = []
+    for p in candidates:
+        base = os.path.basename(p)
+        if p.endswith((".part", ".ytdl", ".aria2")):
+            continue
+        if _STEM_FRAGMENT_RE.search(base) or _STEM_TEMP_RE.search(base):
+            continue
+        # aria2c writes the REAL filename with only a '.aria2' sibling (no
+        # '.part'), so check all three control suffixes as siblings too.
+        if any(os.path.exists(p + sfx) for sfx in (".part", ".ytdl", ".aria2")):
+            continue
+        survivors.append(p)
+    if not survivors:
+        return None
+    exact = out_stem_path + ".mp4"   # merge_output_format is hardcoded mp4
+    if exact in survivors:
+        return exact
+    return max(survivors, key=os.path.getmtime)
+
+
+def download_one(vid, out_stem_path, height, connections, on_progress=None):
+    """Download one video to staged_download_stem(out_stem_path, vid) + real
+    ext (NOT out_stem_path directly -- see that helper). Returns the produced
+    file path, or None on failure. connections>1 -> aria2c external
+    downloader (-x/-s N) if aria2c is on PATH, else native concurrent
+    fragments. VIDEOS are downloaded sequentially by the caller; the
+    parallelism is WITHIN each video (YouTube throttles per connection, so
+    multi-connection is the speed win).
+
+    Partial files resume via yt-dlp's own default (continuedl=True as of
+    this writing) -- left unset deliberately, not passed explicitly."""
+    import yt_dlp
+    dl_stem = staged_download_stem(out_stem_path, vid)
+    outtmpl = dl_stem.replace("%", "%%") + ".%(ext)s"
+    if height:
+        fmt = ("bestvideo[height<=%d]+bestaudio/best[height<=%d]/best" %
+               (height, height))
+    else:
+        fmt = "bestvideo+bestaudio/best"
+    opts = {"format": fmt, "outtmpl": outtmpl, "quiet": True, "no_warnings": True,
+            "noplaylist": True, "merge_output_format": "mp4"}
+    if connections and connections > 1 and shutil.which("aria2c"):
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = {
+            "aria2c": ["-x", str(connections), "-s", str(connections), "-k", "1M"]}
+    else:
+        opts["concurrent_fragment_downloads"] = 4
+    if on_progress is not None:
+        # Feed the live dashboard. quiet stays on so yt-dlp itself prints
+        # nothing; the hook fires per stream (video, then audio) so byte totals
+        # reset between streams -- coarse but fine for a progress bar. (The
+        # aria2c branch's hooks are coarser still; accepted.)
+        def _hook(d):
+            tot = (d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+            on_progress(d.get("status"), d.get("downloaded_bytes") or 0, tot,
+                        d.get("speed") or 0)
+        opts["progress_hooks"] = [_hook]
+    url = "https://www.youtube.com/watch?v=" + vid
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        sys.stderr.write("  ! download failed for %s: %s\n" % (vid, exc))
+        # Do NOT delete stem.* here: every artifact under this stem is either
+        # resumable state (.part/.ytdl/.aria2/.fNNN -- kept for continuedl's
+        # default resume) or a complete final file, and a complete final must
+        # never be wiped just because a later metadata fetch failed (e.g. the
+        # source video went private after a fully-successful download).
+        return None
+    return staged_complete_path(dl_stem)
+
+
+# ===========================================================================
+# Upload leg -- per FILE, straight to the drive (mirrors stream-dl's
+# rclone-to-connstr pattern)
+# ===========================================================================
+
+_UP_PCT_RE = re.compile(r"(\d+)%")
+_UP_SPEED_RE = re.compile(r"[\d.]+\s*[KMGT]?i?B/s")
+
+
+def upload_file(filepath, connstr, folder, dest_name, on_progress=None):
+    """rclone moveto <file> <connstr><folder>/<dest_name> -- moves ONE finished
+    file into the season folder on Drive and deletes it locally on success.
+    (We cannot 'todrive up' a lone file: it would land at the drive ROOT, not
+    inside '<Show> Season N/'.) Returns rclone's return code. An empty folder
+    ("") uploads straight to the drive ROOT (yt-video's plain-file path); yt-show
+    itself always passes a real season folder.
+
+    dest_name is the CANONICAL leaf the caller computes (never derived from
+    filepath's own basename): filepath's basename carries a ' [<video_id>]'
+    staging tag (see staged_download_stem) that must never reach the drive.
+
+    With on_progress, run rclone with live stats and stream them to the
+    dashboard; total is the local file size, percent/speed come from rclone's
+    one-line stats (which it refreshes with a carriage return)."""
+    dest = connstr + (folder + "/" if folder else "") + dest_name
+    if on_progress is None:
+        cmd = [RCLONE, "moveto", filepath, dest, "--drive-chunk-size", "128M"]
+        return subprocess.run(cmd).returncode
+
+    total = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+    # -v (not -P): piped, rclone's -P prints only the final line, but -v raises
+    # the log level so the periodic --stats line prints every second (that is
+    # what drives the live upload bar). Verified against rclone's piped output.
+    cmd = [RCLONE, "moveto", filepath, dest, "--drive-chunk-size", "128M",
+           "-v", "--stats=1s", "--stats-one-line"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    buf = ""
+    while True:
+        ch = proc.stdout.read(1)
+        if ch == "":
+            break
+        if ch in ("\r", "\n"):     # rclone refreshes its stats line via \r
+            line, buf = buf.strip(), ""
+            if line:
+                m = _UP_PCT_RE.search(line)
+                if m:
+                    pct = int(m.group(1))
+                    sm = _UP_SPEED_RE.search(line)
+                    on_progress(int(total * pct / 100), total,
+                                sm.group(0) if sm else "")
+        else:
+            buf += ch
+    proc.wait()
+    return proc.returncode
+
+
+# ===========================================================================
+# The pipeline -- producer (download, main thread) + consumer (upload, worker
+# thread). A gap semaphore (--max-gap permits) caps how many episodes are
+# downloaded-but-not-yet-uploaded: the producer acquires a permit before each
+# download and the consumer releases one after each upload, so when max_gap
+# episodes are pending the next download blocks until an upload drains. Overlap:
+# while the producer downloads item N+1, the consumer uploads item N. STATE is
+# written ONLY by the consumer thread (single writer) so no lock is needed; the
+# producer never mutates show_rec. An episode is committed only after rclone rc==0.
+#
+# Re-uploading to the same canonical dest is idempotent (rclone moveto
+# overwrites an existing dest file), so the one accepted crash window --
+# rc==0 on the upload but killed before save_state commits it -- costs one
+# redundant re-download-or-reuse-and-re-upload on the next run, NEVER a
+# duplicate on the drive.
+# ===========================================================================
+
+def reconcile_stage(stage, display, show_rec, plan=None, ui_note=print):
+    """Startup crash-recovery pass over one show's staging area. Pure enough
+    to unit-test with a tmpdir: the only side effects are os.remove and a call
+    to ui_note.
+
+    Two jobs:
+      1. A committed episode's stem is deterministic from its stored
+         season/episode/title (synth_episode + canonical_episode_name). Since
+         state commits only after rclone rc==0 -- and moveto already deleted
+         the local file on that success -- any staged file STILL matching a
+         committed stem is drift residue (e.g. a crash between upload and the
+         end-of-run stage cleanup). Delete it.
+      2. Anything else left in this show's season dirs, matching NEITHER a
+         committed stem NOR a stem from the CURRENT plan (still-pending
+         episodes -- a resumable partial, or a complete file the producer's
+         staged_complete_path check will reuse directly), is unrecognized:
+         print one warning line (count + example) and never delete it -- it
+         could belong to a concurrent run, or another playlist for the same
+         show.
+
+    Each entry is matched by BOTH its bare canonical stem and its vid-tagged
+    staged_download_stem form: real staged artifacts are always written under
+    the tagged form (never the bare one, which is reserved for the eventual
+    drive dest name -- see the module docstring), but the bare form is kept
+    too so any leftover from before staged files were vid-tagged is still
+    recognized. Matching the bare form here is safe (unlike in the producer's
+    reuse check) since reconcile only deletes already-committed residue or
+    warns -- it never reuses file content by name.
+    """
+    episodes = show_rec.get("episodes") or {}
+    committed_stems = {}   # folder -> {stem, stem[vid], ...}
+    for vid, rec in episodes.items():
+        ep = renamer.synth_episode(display, rec["season"], rec["episode"],
+                                   rec.get("title") or "")
+        stem = renamer.canonical_episode_name(display, ep, "")
+        folder = renamer.canonical_folder_name(display, rec["season"])
+        committed_stems.setdefault(folder, set()).update(
+            (stem, staged_download_stem(stem, vid)))
+
+    plan_stems = {}
+    for a in (plan or []):
+        ep = renamer.synth_episode(display, a["season"], a["episode"], a["title"])
+        stem = renamer.canonical_episode_name(display, ep, "")
+        folder = renamer.canonical_folder_name(display, a["season"])
+        plan_stems.setdefault(folder, set()).update(
+            (stem, staged_download_stem(stem, a["vid"])))
+
+    removed = 0
+    for folder, stems in committed_stems.items():
+        for stem in stems:
+            for p in glob.glob(os.path.join(stage, folder, glob.escape(stem)) + ".*"):
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+    if removed:
+        ui_note("reconcile: removed %d stale staged file(s) for "
+                "already-uploaded episodes" % removed)
+
+    leftover = []
+    for folder in sorted(set(committed_stems) | set(plan_stems)):
+        dirpath = os.path.join(stage, folder)
+        if not os.path.isdir(dirpath):
+            continue
+        known = committed_stems.get(folder, set()) | plan_stems.get(folder, set())
+        for name in os.listdir(dirpath):
+            if any(name.startswith(stem + ".") for stem in known):
+                continue
+            leftover.append(os.path.join(folder, name))
+    if leftover:
+        ui_note("reconcile: %d leftover unrecognized file(s) in stage -- not "
+                "touching them (e.g. %r)" % (len(leftover), leftover[0]))
+    return removed
+
+
+def upload_worker(q, connstr, display, plid, show_rec, state, results,
+                  results_lock, ui, gap):
+    while True:
+        job = q.get()
+        try:
+            if job is None:
+                return
+            a, filepath = job
+            key = (a["season"], a["episode"])
+            # Guard the whole job: if this thread died (e.g. rclone missing ->
+            # FileNotFoundError, or save_state -> OSError) the producer would
+            # deadlock forever on the bounded queue. Stay alive, count the
+            # failure, leave the file local for the next run to retry.
+            try:
+                folder = renamer.canonical_folder_name(display, a["season"])
+                # Canonical, UNTAGGED dest name -- filepath's own basename
+                # carries a ' [<video_id>]' staging tag (staged_download_stem)
+                # that must never land on the drive.
+                ep = renamer.synth_episode(display, a["season"], a["episode"],
+                                           a["title"])
+                ext = os.path.splitext(filepath)[1]
+                dest_name = renamer.canonical_episode_name(display, ep, ext)
+                label = "S%02dE%02d %s" % (a["season"], a["episode"], a["title"])
+                ui.update_status(key, "uploading")
+                try:
+                    total = os.path.getsize(filepath)
+                except OSError:
+                    total = 0
+                ui.up_start(label, total)
+                rc = upload_file(filepath, connstr, folder, dest_name,
+                                 on_progress=ui.up_advance)
+                ui.up_finish()
+                if rc == 0:
+                    show_rec["episodes"][a["vid"]] = {
+                        "season": a["season"], "episode": a["episode"], "playlist": plid,
+                        "title": renamer.clean_source_title(a["title"], display),
+                        "uploaded": datetime.date.today().isoformat()}
+                    cur = show_rec["playlists"].get(plid, {}).get("season", 0)
+                    show_rec["playlists"][plid] = {"season": max(cur, a["season"])}
+                    save_state(state)
+                    ui.update_status(key, "done")
+                    with results_lock:
+                        results["uploaded"] += 1
+                else:
+                    ui.update_status(key, "failed")
+                    ui.note("  ! upload failed S%02dE%02d (rc=%d); left local %s"
+                            % (a["season"], a["episode"], rc, filepath))
+                    with results_lock:
+                        results["failed"] += 1
+            except Exception as exc:
+                ui.up_finish()
+                ui.update_status(key, "failed")
+                ui.note("  ! upload worker error S%02dE%02d: %s"
+                        % (a["season"], a["episode"], exc))
+                with results_lock:
+                    results["failed"] += 1
+        finally:
+            q.task_done()
+            # Release the pending-upload slot so the producer can download the
+            # next episode. NOT for the sentinel (it never took a slot).
+            if job is not None:
+                gap.release()
+
+
+# ===========================================================================
+# CLI / main
+# ===========================================================================
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="yt-show",
+        description="Turn a YouTube playlist into a Drivecast TV show "
+                    "(download + upload pipelined).")
+    ap.add_argument("url", help="YouTube playlist URL")
+    ap.add_argument("--show", default=None,
+                    help="display show name (default: cleaned playlist title "
+                         "on a brand-new show)")
+    ap.add_argument("--drive", default=None,
+                    help="Shared Drive name (required on a brand-new show "
+                         "unless --pick or an existing routing hit supplies one)")
+    ap.add_argument("--pick", action="store_true",
+                    help="interactively choose/create the drive; overrides --drive")
+    season_grp = ap.add_mutually_exclusive_group()
+    season_grp.add_argument("--new-season", action="store_true",
+                            help="start a new season for a not-yet-known "
+                                 "playlist added to an existing show")
+    season_grp.add_argument("--same-season", action="store_true",
+                            help="append to the current season for a "
+                                 "not-yet-known playlist (default)")
+    ap.add_argument("--height", type=int, default=0,
+                    help="max video height (0 = best available, the default; "
+                         "e.g. 1080 to cap at 1080p)")
+    ap.add_argument("--connections", type=int, default=1,
+                    help="per-video download connections. 1 (default) = yt-dlp "
+                         "native, which benchmarks fastest when YouTube is not "
+                         "throttling. >1 = aria2c multi-connection, which only "
+                         "helps when a single connection is being throttled to "
+                         "a crawl (try 16 if a download is stuck slow).")
+    ap.add_argument("--max-gap", type=int, default=3,
+                    help="max episodes downloaded-but-not-yet-uploaded before "
+                         "downloading pauses (keeps disk bounded; default 3)")
+    ap.add_argument("--stage", default=os.path.expanduser(
+                        "~/Downloads/yt-show-stage"),
+                    help="local staging directory")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the plan and exit without downloading/uploading")
+    ap.add_argument("--plain", action="store_true",
+                    help="force plain-text progress (no rich live dashboard)")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    state = load_state()
+    shows = state.setdefault("shows", {})
+
+    plid, ptitle, items = probe_playlist(args.url)
+    if not items:
+        print("no playable videos")
+        return 0
+
+    # Resolve target show: if this playlist already belongs to a show, use it
+    # (regardless of --show, which we just note as a mismatch).
+    slug = None
+    for s_slug, s_rec in shows.items():
+        if plid in (s_rec.get("playlists") or {}):
+            slug = s_slug
+            break
+    if slug is None:
+        display = args.show or (renamer._clean_show(ptitle)[0] or ptitle)
+        slug = renamer._slug(display)
+    else:
+        display = shows[slug]["display"]
+        if args.show and renamer._slug(args.show) != slug:
+            print("note: playlist already belongs to show %r (ignoring --show %r)"
+                 % (display, args.show))
+
+    show_rec = shows.get(slug)
+    if show_rec is None:
+        if args.pick:
+            drive = pick_drive()
+        elif args.drive:
+            drive = args.drive
+        else:
+            try:
+                rr = renamer.route(slug, [], renamer.RenameCache(), [])
+            except Exception:
+                rr = None
+            if rr and rr.drive:
+                drive = rr.drive
+                print("note: routed to drive %r via %s" % (drive, rr.source))
+            else:
+                sys.exit("new show %r: pass --drive <SharedDriveName> or --pick"
+                         % display)
+        show_rec = {"display": display, "drive": drive, "episodes": {},
+                   "playlists": {}}
+        shows[slug] = show_rec
+        # Do NOT persist here: --dry-run must not write state, and a real run
+        # persists this record naturally on the first verified upload (the
+        # consumer's save_state writes the whole state, new show included).
+    else:
+        display = show_rec["display"]
+        drive = (pick_drive() if args.pick else args.drive) or show_rec["drive"]
+
+    mode = "new" if args.new_season else "same"
+
+    # New = not already committed AND not a duplicate id within this playlist
+    # (a repeated id would otherwise upload twice, the second commit clobbering
+    # the first and orphaning a duplicate file on the drive).
+    seen = set()
+    new_items = []
+    for (vid, vt) in items:
+        if vid in show_rec["episodes"] or vid in seen:
+            continue
+        seen.add(vid)
+        new_items.append((vid, vt))
+    already = len(items) - len(new_items)
+    titles = dict(new_items)
+    plan = [{"vid": vid, "season": s, "episode": e, "title": titles[vid]}
+            for (vid, s, e) in assign_new_episodes(
+                show_rec, plid, [vid for vid, _ in new_items], mode)]
+
+    print("show=%r  drive=%r  playlist=%s  already=%d  new=%d"
+         % (display, drive, plid, already, len(plan)))
+
+    # Live drive headroom (from 'todrive du --json', fresher than the GUI's
+    # 5-min cache) so the user knows if the playlist will fit before it runs.
+    usage = fetch_drive_usage()
+    sline = drive_storage_line(drive, usage)
+    if sline:
+        print(sline)
+        u = usage.get(drive)
+        if u and u["free"] is not None and u["free"] < 5 * 1000 ** 3:  # < 5 GB
+            print("  ! low headroom — a large playlist may not fit. Drivecast "
+                  "merges '<Show> Season N' across drives, so you can rerun "
+                  "with --pick / --drive on another drive to continue.")
+    elif usage:
+        print("drive %r: new or empty (no usage reported yet)" % drive)
+
+    rp = renamer.plan_from_sequence(
+        [(a["vid"], a["season"], a["episode"], a["title"], ".mp4") for a in plan],
+        display)
+    if rp.rejected:
+        sys.exit("naming contract rejected: " + rp.reason)
+
+    if args.dry_run:
+        for a in plan:
+            folder = renamer.canonical_folder_name(display, a["season"])
+            ep = renamer.synth_episode(display, a["season"], a["episode"], a["title"])
+            leaf = renamer.canonical_episode_name(display, ep, ".mp4")
+            print("S%02dE%02d  %s/%s  -> %s" %
+                 (a["season"], a["episode"], folder, leaf, drive))
+        return 0
+
+    if not plan:
+        print("up to date (%d already on drive)" % already)
+        return 0
+
+    # Per-show exclusive lock: a SECOND yt-show run for the same show would race
+    # this one's per-episode save_state (last writer wins -> a commit vanishes)
+    # and re-upload the same files. Take it only now -- after the dry-run and
+    # up-to-date early exits above, which mutate nothing and so never lock. Held
+    # for the whole pipeline via _show_lock; auto-released when this process
+    # exits or dies (flock), so a crash never leaves a stuck lock.
+    _show_lock = acquire_show_lock(slug)   # noqa: F841 (kept alive to hold lock)
+    if _show_lock is None:
+        sys.exit("another yt-show run for %r is already active -- wait for it to "
+                 "finish (per-show lock)." % display)
+
+    # --- pipeline ------------------------------------------------------
+    os.makedirs(args.stage, exist_ok=True)
+    if shutil.which("rclone") is None:
+        sys.exit("yt-show needs rclone on PATH for uploads "
+                 "(brew install rclone)")
+    connstr = resolve_connstr(drive)   # fail fast before downloading
+
+    # Crash/interruption recovery, part 1: clear out staged residue for
+    # episodes already committed (uploaded), and warn (never delete) about
+    # anything else unrecognized. Must run before ui.live() starts -- it
+    # prints plain lines, and the rich Live region hasn't opened yet.
+    reconcile_stage(args.stage, display, show_rec, plan)
+
+    # Live dashboard: rich when it's installed AND stdout is a real TTY AND the
+    # user didn't force --plain; otherwise the terse plain-text UI. (--pick and
+    # every input() already happened above, before any Live starts.)
+    ui = UI(USE_RICH and sys.stdout.isatty() and not args.plain)
+    if not ui.use_rich:
+        print("pip install rich for the live dashboard", file=sys.stderr)
+    ui.set_header(display, drive)
+    u = usage.get(drive) if usage else None
+    if u and u["free"] is not None:
+        ui.set_capacity(u["free"], u["cap"], u["pct"])
+    else:
+        ui.set_capacity(None, None, None)
+    ui.register_episodes(plan)
+    ui.set_counts(len(plan), already, len(items))
+
+    results = {"uploaded": 0, "failed": 0}
+    results_lock = threading.Lock()
+    q = queue.Queue()   # handoff; the gap semaphore is the real limiter
+    # Backpressure: at most --max-gap episodes may be downloaded-but-not-yet-
+    # uploaded. The producer acquires a permit BEFORE each download and the
+    # uploader releases one after each upload attempt, so when `max_gap`
+    # episodes are pending upload the next download blocks until one drains —
+    # keeping disk bounded to ~max_gap videos.
+    gap = threading.Semaphore(max(1, args.max_gap))
+    worker = threading.Thread(
+        target=upload_worker,
+        args=(q, connstr, display, plid, show_rec, state, results,
+              results_lock, ui, gap),
+        daemon=True)
+    worker.start()
+
+    # SIGTERM (launchd/system shutdown) now takes the identical drain path as
+    # Ctrl-C: raise KeyboardInterrupt in the main thread -> the producer loop's
+    # except catches it -> sentinel + worker.join() below. Unlike Ctrl-C (which
+    # SIGINTs the whole process group, killing an in-flight rclone too),
+    # SIGTERM only hits this process, so the in-flight upload actually
+    # completes during the drain. try/except guards non-main-thread or exotic
+    # platforms where signal.signal() may raise.
+    try:
+        def _term(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, _term)
+    except (ValueError, OSError):
+        pass
+    with ui.live():
+        try:
+            for i, a in enumerate(plan, 1):
+                key = (a["season"], a["episode"])
+                folder = renamer.canonical_folder_name(display, a["season"])
+                ep = renamer.synth_episode(display, a["season"], a["episode"],
+                                           a["title"])
+                stem = renamer.canonical_episode_name(display, ep, "")  # bare stem
+                os.makedirs(os.path.join(args.stage, folder), exist_ok=True)
+                out_stem = os.path.join(args.stage, folder, stem)
+                label = "S%02dE%02d %s" % (a["season"], a["episode"], a["title"])
+                # A reused staged file still occupies a pending-upload slot,
+                # so acquire BEFORE checking staged_complete_path. Matched by
+                # stem+vid (staged_download_stem), never by stem alone -- see
+                # the module docstring for why a bare stem can otherwise
+                # alias a DIFFERENT video across an interrupted run + resume.
+                gap.acquire()   # pause here if max_gap episodes await upload
+                got = staged_complete_path(staged_download_stem(out_stem, a["vid"]))
+                if got:
+                    # Crash-recovery workhorse: a complete-but-uncommitted
+                    # file (killed mid-upload, a failed upload, or killed in
+                    # the rc==0 -> save_state window) re-uploads directly, with
+                    # zero network dependence on the source video still
+                    # existing.
+                    ui.note("  S%02dE%02d %s (reusing staged file)" %
+                           (a["season"], a["episode"], a["title"]))
+                else:
+                    ui.update_status(key, "downloading")
+                    ui.dl_start(label, None)
+                    t0 = time.monotonic()
+                    got = download_one(a["vid"], out_stem, args.height,
+                                       args.connections,
+                                       on_progress=lambda st, dn, tot, sp:
+                                           ui.dl_advance(dn, tot, sp))
+                    ui.dl_finish()
+                    if got:
+                        elapsed = time.monotonic() - t0
+                        try:
+                            size = os.path.getsize(got)
+                        except OSError:
+                            size = 0
+                        if elapsed > 0 and size and size / elapsed / 1e6 < 1.5:
+                            ui.note("slow download — YouTube may be "
+                                    "throttling; try --connections 16")
+                if got:
+                    q.put((a, got))   # slot released by the uploader when done
+                else:
+                    gap.release()     # nothing to upload -> free the slot now
+                    ui.update_status(key, "failed")
+                    with results_lock:
+                        results["failed"] += 1
+        except KeyboardInterrupt:
+            ui.note("interrupted — finishing queued uploads...")
+        finally:
+            q.put(None)             # sentinel
+            worker.join()           # drain: let queued uploads finish + commit
+
+    # tidy empty season dirs left in stage
+    for d in glob.glob(os.path.join(args.stage, "*")):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+    print("uploaded=%d failed=%d" % (results["uploaded"], results["failed"]))
+    print("refresh the %r drive in Drivecast to see the show" % drive)
+    return 1 if results["failed"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

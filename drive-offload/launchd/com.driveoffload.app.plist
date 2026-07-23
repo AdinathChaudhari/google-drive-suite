@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.driveoffload.app</string>
+
+    <!-- Launch the standalone bundled app binary (not the repo script). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/drive-offload.app/Contents/MacOS/drive-offload</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Reference template only — install-app.sh generates the real plist
+         from $HOME at install time. -->
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/Library/Application Support/drive-offload/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/Library/Application Support/drive-offload/launchd.err.log</string>
+</dict>
+</plist>

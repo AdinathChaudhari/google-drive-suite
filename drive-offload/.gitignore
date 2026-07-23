@@ -1,0 +1,33 @@
+# personal config (copy config.example.json to config.json and edit)
+config.json
+# runtime artifacts
+offload.log
+launchd.out.log
+launchd.err.log
+.offload-state.json
+# yt-show per-show state + staging + locks
+yt_shows.json
+yt_shows.json.tmp
+yt-show-stage/
+.yt-show-*.lock
+__pycache__/
+# menu-bar app
+.venv/
+decisions.json
+app_state.json
+app.log
+launchd-app.out.log
+launchd-app.err.log
+# py2app build artifacts
+build/
+dist/
+.eggs/
+.pytest_cache/
+
+# tooling / local-only
+.claude/
+notes/
+rename_cache.json
+
+# macOS clutter
+.DS_Store
