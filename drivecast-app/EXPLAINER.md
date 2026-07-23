@@ -4,7 +4,7 @@ A plain-English explainer for the drivecast Fire TV client.
 
 ## The problem
 
-[drivecast](https://github.com/AdinathChaudhari/drivecast) runs on a Mac and
+[drivecast](../drivecast/README.md) runs on a Mac and
 streams video straight out of Google Shared Drives — a menubar server with a
 web UI. That's great on a laptop or phone, but on a TV it falls short in two
 ways:

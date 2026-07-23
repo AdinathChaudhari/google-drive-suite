@@ -1,20 +1,24 @@
+/* Local var names aliased onto Drivedeck design tokens (drivedeck.css,
+   linked before this sheet) rather than rewritten — see design/drivedeck.css
+   at the suite root. --text-2, --topbar-bg and --scroll-thumb have no direct
+   --dd-* equivalent (drivecast-specific tones) and stay hardcoded per theme. */
 :root {
-  --bg: #0f0f13;
-  --panel: #17171d;
-  --panel-2: #1e1e26;
-  --text: #e8e8ea;
+  --bg: var(--dd-bg);
+  --panel: var(--dd-surface-1);
+  --panel-2: var(--dd-surface-2);
+  --text: var(--dd-text);
   --text-2: #cfcfd6;      /* dimmer body/heading text */
-  --muted: #9a9aa6;
-  --accent: #7aa2ff;
-  --accent-2: #b98cff;
+  --muted: var(--dd-text-dim);
+  --accent: var(--dd-accent);
+  --accent-2: var(--dd-accent-2);
   /* accent stays identical in both themes so it reads well as a button/pill
      background (with dark text); --link is the readable-on-background variant. */
   --link: var(--accent);
-  --border: rgba(255,255,255,0.1);       /* standard chrome borders */
-  --border-soft: rgba(255,255,255,0.06); /* hairline separators */
+  --border: var(--dd-border);
+  --border-soft: var(--dd-border-soft);
   --topbar-bg: rgba(15,15,19,0.82);      /* translucent sticky header */
   --scroll-thumb: #2a2a34;
-  --warn: #ffd479;
+  --warn: var(--dd-warn);
   --card-w: 160px;
   --card-h: 240px; /* 2:3 poster */
 }
@@ -23,18 +27,18 @@
    pills, the dismiss chip, progress bar) stay dark-on-artwork in both themes
    and are intentionally left hardcoded below. */
 :root[data-theme="light"] {
-  --bg: #f4f5f8;
-  --panel: #ffffff;
-  --panel-2: #e9ebf0;
-  --text: #1b1c22;
+  --bg: var(--dd-bg);
+  --panel: var(--dd-surface-1);
+  --panel-2: var(--dd-surface-2);
+  --text: var(--dd-text);
   --text-2: #3a3b44;
-  --muted: #63646f;
-  --link: #3452c9;
-  --border: rgba(0,0,0,0.14);
-  --border-soft: rgba(0,0,0,0.08);
+  --muted: var(--dd-text-dim);
+  --link: var(--dd-accent-strong);
+  --border: var(--dd-border);
+  --border-soft: var(--dd-border-soft);
   --topbar-bg: rgba(244,245,248,0.82);
   --scroll-thumb: #c4c7d0;
-  --warn: #9a6a00;
+  --warn: var(--dd-warn);
 }
 
 /* Each section re-tints the app: the accent pair drives tabs, chips, buttons,

@@ -4,6 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Drive Downloader</title>
+  <!-- Apply the saved theme before first paint to avoid a flash. Default: dark. -->
+  <script>
+    (function () {
+      try {
+        if (localStorage.getItem("theme") === "light") {
+          document.documentElement.setAttribute("data-theme", "light");
+        }
+      } catch (e) { /* private mode / no storage -> default dark */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/drivedeck.css">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>

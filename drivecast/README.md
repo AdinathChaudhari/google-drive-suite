@@ -6,7 +6,7 @@ Shared Drives as a **cached media library** — movie and TV-show tiles with
 pre-fetched posters, seasons and episodes — and plays files in mpv / IINA / VLC / Infuse
 while proxying the bytes on demand. Nothing is ever written to disk.
 
-> 📖 **[Read the case study](CASE-STUDY.md)** — how this was designed, built,
+> 📖 **[Read the case study](../docs/case-studies/drivecast.md)** — how this was designed, built,
 > hardened and shipped, almost entirely through orchestrated AI agents.
 
 **Tabs & behaviors.** You organise the app into **tabs** you create yourself —
@@ -194,7 +194,7 @@ The subtitle is handed to mpv / IINA / VLC as a local file, so it appears
 pre-loaded (toggle it in the player as usual). Autoplay-advanced episodes
 reuse cached subtitles. Remote clients get the same resolution over HTTP:
 `GET /api/subtitles/{file_id}` serves the resolved file (SRT/VTT/ASS) with
-the right MIME type — the [Fire TV app](https://github.com/AdinathChaudhari/drivecast-app)
+the right MIME type — the [Fire TV app](../drivecast-app/README.md)
 attaches it as a subtitle track. Turn the whole feature off with **Settings →
 English subtitles when available**.
 
@@ -251,7 +251,7 @@ real app, with no browser chrome.
 
 ## Watch on your TV (Fire TV / Android TV)
 
-There's a **native TV client** — [drivecast-app](https://github.com/AdinathChaudhari/drivecast-app)
+There's a **native TV client** — [drivecast-app](../drivecast-app/README.md)
 — built for the Amazon Fire TV Stick (and Android TV generally): Kotlin,
 Compose for TV and ExoPlayer, sideloaded as an APK. It talks to the same
 server as every other client, with the same token, and adds what the web
@@ -611,3 +611,7 @@ rebuilds):
   quota during large scans. The real fix is to use **your own** Google OAuth
   client id/secret in the rclone remote (a free Google Cloud project) — that
   gives you your own generous quota. Set that up separately in `rclone config`.
+
+---
+
+Part of the [Google Drive Suite](../README.md).
