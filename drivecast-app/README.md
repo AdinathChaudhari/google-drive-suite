@@ -1,7 +1,7 @@
 # drivecast for Fire TV
 
 A native Android TV / Amazon Fire TV client for a
-[drivecast](https://github.com/AdinathChaudhari/drivecast) media server. It's a pure HTTP client: it browses your server's library, plays video over the
+[drivecast](../drivecast/README.md) media server. It's a pure HTTP client: it browses your server's library, plays video over the
 server's range-aware stream endpoint, tracks watch progress, resumes where you left off,
 and plays a show as a continuous playlist so the next episode is one button away — all
 from your couch with the remote.
@@ -96,8 +96,12 @@ pairing.
 2. Open Downloader and enter the latest release APK's URL:
 
    ```
-   github.com/AdinathChaudhari/drivecast-app/releases/latest/download/drivecast-app.apk
+   github.com/AdinathChaudhari/google-drive-suite/releases/latest/download/drivecast-app.apk
    ```
+
+   (Not published from this monorepo yet — until the first suite release ships,
+   use the debug-APK route in step 4 instead, or grab the last standalone
+   release from the archived `drivecast-app` repo.)
 
 3. Let it download, then choose **Install** when prompted. (This is why "Apps from
    Unknown Sources" must be on.)
@@ -149,3 +153,7 @@ Then:
   server on a trusted network.
 - The access token is sent as a `?token=` query parameter on every request, matching the
   server's remote-access contract.
+
+---
+
+Part of the [Google Drive Suite](../README.md).

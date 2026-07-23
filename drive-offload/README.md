@@ -484,3 +484,7 @@ The watcher (`offloader.py`) is **optional** — it is for an
 is moved to cloud storage without you thinking about it. For deliberate,
 per-show organization, use `todrive` (and `stream-dl --drive`) to sort uploads
 into a named shared drive per show/category.
+
+---
+
+Part of the [Google Drive Suite](../README.md).

@@ -260,7 +260,7 @@ working for files played that way.
 ### On your TV
 
 The same remote surface powers a **native Fire TV / Android TV app**,
-[drivecast-app](https://github.com/AdinathChaudhari/drivecast-app) — a separate
+[drivecast-app](../drivecast-app/README.md) — a separate
 repo, because it's a separate program (Kotlin + ExoPlayer) that just happens to
 speak drivecast's API. It needed almost nothing new from the server, which is
 the point: the JSON API plus the range-aware stream proxy already were a

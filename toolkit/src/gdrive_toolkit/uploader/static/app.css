@@ -1,13 +1,10 @@
+/* Local var names aliased onto Drivedeck design tokens (drivedeck.css,
+   linked before this sheet) rather than rewritten — see design/drivedeck.css
+   at the suite root. Dark/light switching is handled by drivedeck.css. */
 :root {
-  --bg: #0f1116; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
-  --text: #e6e9ef; --dim: #8b93a3; --accent: #4f8cff; --accent2: #2f6bd8;
-  --ok: #3fb950; --err: #f0616d; --radius: 10px;
-}
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f4f6fa; --panel: #ffffff; --panel2: #eef1f6; --line: #dde2ea;
-    --text: #1b1f27; --dim: #667085; --accent: #2f6bd8; --accent2: #1f57bd;
-  }
+  --bg: var(--dd-bg); --panel: var(--dd-surface-1); --panel2: var(--dd-surface-2); --line: var(--dd-border);
+  --text: var(--dd-text); --dim: var(--dd-text-dim); --accent: var(--dd-accent); --accent2: var(--dd-accent-strong);
+  --ok: var(--dd-ok); --err: var(--dd-err); --radius: var(--dd-radius);
 }
 * { box-sizing: border-box; }
 body {
@@ -28,7 +25,7 @@ select {
   border-radius: 8px; padding: 6px 8px; font-size: 13px; min-width: 200px;
 }
 button {
-  background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+  background: var(--accent); color: var(--dd-on-accent); border: 0; border-radius: 8px;
   padding: 8px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
 }
 button:hover:not(:disabled) { background: var(--accent2); }

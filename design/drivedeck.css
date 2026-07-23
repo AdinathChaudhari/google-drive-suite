@@ -1,0 +1,82 @@
+/* drivedeck.css — Drivedeck design tokens, canonical source.
+   Vendored copies live in:
+     toolkit/src/gdrive_toolkit/downloader/static/drivedeck.css
+     toolkit/src/gdrive_toolkit/uploader/static/drivedeck.css
+     drivecast/drivecast/static/drivedeck.css
+   Edit only here, then run scripts/sync-css.sh to re-copy.
+
+   Adoption model: apps don't rewrite their own stylesheets against these
+   names. Each app keeps its own local :root variable names and markup, and
+   aliases its local vars onto these --dd-* tokens — see the header comment
+   in each app's own app.css / style.css. */
+
+:root {
+  color-scheme: dark light;
+  /* surfaces */
+  --dd-bg: #0f1014;
+  --dd-surface-1: #17181d;         /* panels, top bar */
+  --dd-surface-2: #1e2026;         /* inputs, hover rows, track fills */
+  --dd-border: rgba(255,255,255,.10);
+  --dd-border-soft: rgba(255,255,255,.06);
+  /* text */
+  --dd-text: #e8e9ee;
+  --dd-text-dim: #9aa0ae;
+  /* brand */
+  --dd-accent: #7aa2ff;
+  --dd-accent-strong: #5b8bff;     /* hover / active */
+  --dd-accent-2: #b98cff;          /* gradient partner: logo, banners */
+  --dd-on-accent: #0b0c10;         /* text ON accent */
+  /* status */
+  --dd-ok: #3fb950;
+  --dd-warn: #ffd479;
+  --dd-err: #f0616d;
+  /* shape */
+  --dd-radius-s: 6px;
+  --dd-radius: 10px;
+  --dd-radius-pill: 999px;
+  /* rhythm (spacing scale) */
+  --dd-s1: 4px;
+  --dd-s2: 8px;
+  --dd-s3: 12px;
+  --dd-s4: 16px;
+  --dd-s5: 24px;
+  --dd-s6: 32px;
+  /* type */
+  --dd-font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --dd-fs-xs: 11px;
+  --dd-fs-s: 12px;
+  --dd-fs-body: 14px;
+  --dd-fs-h2: 16px;
+  --dd-fs-title: 18px;
+}
+
+/* Explicit dark/light switch (data-theme attribute), settable from JS +
+   persisted in localStorage — see the pre-paint snippet in each app's
+   index.html. Takes priority over the OS-level media query below. */
+[data-theme="light"] {
+  --dd-bg: #f4f5f8;
+  --dd-surface-1: #ffffff;
+  --dd-surface-2: #e9ebf0;
+  --dd-border: rgba(0,0,0,.14);
+  --dd-border-soft: rgba(0,0,0,.08);
+  --dd-text: #1b1c22;
+  --dd-text-dim: #63646f;
+  --dd-accent-strong: #3452c9;
+  --dd-warn: #9a6a00;
+}
+
+/* OS-level fallback for apps with no explicit data-theme attribute set
+   (e.g. the toolkit's web UIs, which follow the system theme by default). */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --dd-bg: #f4f5f8;
+    --dd-surface-1: #ffffff;
+    --dd-surface-2: #e9ebf0;
+    --dd-border: rgba(0,0,0,.14);
+    --dd-border-soft: rgba(0,0,0,.08);
+    --dd-text: #1b1c22;
+    --dd-text-dim: #63646f;
+    --dd-accent-strong: #3452c9;
+    --dd-warn: #9a6a00;
+  }
+}

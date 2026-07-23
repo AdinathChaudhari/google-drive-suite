@@ -71,7 +71,7 @@ remote configured (`rclone config`) — this toolkit drives your existing
 remote, it doesn't set one up for you.
 
 ```sh
-pip install 'google-shared-drive-toolkit[all]'
+pip install '.[all]'   # from this toolkit/ dir — not yet published to PyPI
 
 gdrive-setup       # pick which configured rclone remote to use (one-time)
 gdrive-download    # opens http://127.0.0.1:8747/ in your browser
@@ -199,25 +199,26 @@ This toolkit is the control plane; these siblings are what it controls.
 
 **Streaming** (paired — server + Fire TV client):
 
-- [**drivecast**](https://github.com/AdinathChaudhari/drivecast) — turns a
+- [**drivecast**](../drivecast/README.md) — turns a
   Shared Drive into a cached media library (movies/TV, courses, podcasts) and
   streams it on demand to mpv/IINA/VLC/Infuse — "your personal Netflix,"
   nothing ever written to disk.
-- [**drivecast-app**](https://github.com/AdinathChaudhari/drivecast-app) — a
+- [**drivecast-app**](../drivecast-app/README.md) — a
   native Android TV / Fire TV client for drivecast: browses the library and
   plays over its streaming endpoint from the couch, with resume and
   autoplay-next-episode.
 
 **Ingest:**
 
-- [**drive-offload**](https://github.com/AdinathChaudhari/drive-offload) —
+- [**drive-offload**](../drive-offload/README.md) —
   watches a downloads folder and automatically pushes completed files up to a
   Shared Drive to keep a nearly-full local disk clear, plus a direct
   URL-to-cloud streaming mode that never touches local disk at all.
 
-None of these are merged into this repo — each is its own independent project
-you can adopt separately; this toolkit's hub can launch and show status for
-any of them if you register them (see [Fork it](#fork-it-making-it-yours)).
+Each sibling is a standalone project you can adopt independently — this
+toolkit's hub auto-detects and launches all three when checked out inside
+this suite, and can launch and show status for any other tool you register
+(see [Fork it](#fork-it-making-it-yours)).
 
 ## Trademark
 
@@ -230,3 +231,7 @@ are used in this project.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+Part of the [Google Drive Suite](../README.md).
