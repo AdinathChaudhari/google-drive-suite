@@ -7,9 +7,8 @@ One of three sibling repos that make up **Drivecast**, a self-hosted media syste
 
 Environment:
 - App build: no JDK on PATH — `JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home`; Android SDK at `/opt/homebrew/share/android-commandlinetools`.
-- Fire TV Stick: `adb connect 192.168.88.9:5555`. VLC (`org.videolan.vlc`) is the default playback target since app v0.3.0 (stick rejects HEVC 10-bit in stock ExoPlayer).
+- Fire TV Stick: `adb connect <fire-tv-ip>:5555`. VLC (`org.videolan.vlc`) is the default playback target since app v0.3.0 (stick rejects HEVC 10-bit in stock ExoPlayer).
 - Server auth: `?token=` query param on every remote request.
-- Push: these are personal (`AdinathChaudhari`) repos; see ~/.claude/CLAUDE.md for the `gh auth switch` dance.
 
 # Drivecast (server)
 
