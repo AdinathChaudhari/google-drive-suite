@@ -50,11 +50,23 @@ def main() -> None:
         )
 
     remote = _choose(remotes)
-    repo_root = str(Path.cwd().resolve())
+    repo_root_path = Path.cwd().resolve()
+    repo_root = str(repo_root_path)
 
     shared = load_shared_config()
     shared["remote"] = remote
     shared["repo_root"] = repo_root
+
+    # If this looks like a `google-drive-suite` checkout (repo_root is a
+    # `toolkit/` dir with `drivecast/app.py` next door), also record
+    # suite_root so hub/registry.py can pick up the sibling suite members
+    # (drivecast, drive-offload, drivecast-app) as built-ins without needing
+    # a hub_tools.json entry for any of them.
+    suite_candidate = repo_root_path.parent
+    if repo_root_path.name == "toolkit" and (suite_candidate / "drivecast" / "app.py").exists():
+        shared["suite_root"] = str(suite_candidate)
+        print("Detected suite layout — saved suite_root %r to the shared config." % str(suite_candidate))
+
     save_shared_config(shared)
 
     print("Saved remote %r and repo_root %r to the shared config." % (remote, repo_root))
