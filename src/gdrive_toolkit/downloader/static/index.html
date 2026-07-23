@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drive Downloader</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Drive Downloader</h1>
+    <div class="picker">
+      <label>Shared drive
+        <select id="drive-select"><option value="">Loading…</option></select>
+      </label>
+      <button id="refresh" title="Reload drive list">↻</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="tree-panel">
+      <div id="tree" class="tree"><p class="hint">Pick a shared drive to browse.</p></div>
+    </section>
+
+    <aside id="side">
+      <h2>Selected <span id="sel-count" class="badge">0</span></h2>
+      <ul id="sel-list" class="sel-list"></ul>
+      <button id="download" disabled>Download → ~/Downloads</button>
+      <button id="cancel" class="ghost" hidden>Cancel</button>
+      <div id="progress" class="progress" hidden></div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
