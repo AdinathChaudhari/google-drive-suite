@@ -1,0 +1,33 @@
+[
+  {
+    "id": "drivecast",
+    "label": "Drivecast",
+    "kind": "web",
+    "dir": "~/Documents/Playground/GitHub/drivecast",
+    "installed_if": ["app.py", "venv/bin/python"],
+    "launch": { "argv": ["venv/bin/python", "app.py"] },
+    "port": {
+      "config": "~/Library/Application Support/drivecast/config.json",
+      "key": "port",
+      "default": 8737
+    }
+  },
+  {
+    "id": "drive-offload",
+    "label": "Drive Offload",
+    "kind": "menubar",
+    "dir": "~/Documents/Playground/GitHub/drive-offload",
+    "installed_if_any": [
+      "~/Library/LaunchAgents/com.driveoffload.app.plist",
+      "/Applications/drive-offload.app"
+    ],
+    "launchd_label": "com.driveoffload.app",
+    "process_pattern": "drive-offload\\.app/Contents/MacOS|offload_app\\.py"
+  },
+  {
+    "id": "drivecast-app",
+    "label": "Drivecast (Fire TV)",
+    "kind": "external",
+    "note": "Android TV / Fire TV client, not a process this Mac can launch or check the status of. Listed here as a reminder of what exists in the ecosystem; the hub should render an 'external' kind as an inert, non-clickable row rather than erroring on the missing launch/port fields other kinds require."
+  }
+]

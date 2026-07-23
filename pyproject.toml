@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-shared-drive-toolkit"
+version = "1.0.0"
+description = "Browse, download, upload, and manage Google Shared Drives via rclone — web UIs plus a macOS menu-bar hub."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+download = ["flask>=3.0", "requests>=2.31"]
+upload   = ["flask>=3.0", "requests>=2.31"]
+hub      = ["rumps>=0.4; sys_platform == 'darwin'"]
+all      = ["google-shared-drive-toolkit[download,upload,hub]"]
+dev      = ["google-shared-drive-toolkit[all]", "py2app; sys_platform == 'darwin'", "pytest"]
+
+[project.scripts]
+gdrive-download = "gdrive_toolkit.downloader.cli:main"
+gdrive-upload   = "gdrive_toolkit.uploader.cli:main"
+gdrive-hub      = "gdrive_toolkit.hub.menubar:main"
+gdrive-setup    = "gdrive_toolkit.common.setup_remote:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"gdrive_toolkit.downloader" = ["static/*"]
+"gdrive_toolkit.uploader"   = ["static/*"]
