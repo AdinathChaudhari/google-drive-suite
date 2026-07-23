@@ -92,11 +92,24 @@ menu-bar `.app`.
    actual launch command (installed console script on `PATH`, or the venv
    script next to the running interpreter) rather than hardcoding paths to
    this specific checkout.
-3. Reads `~/Library/Application Support/gdrive_toolkit/hub_tools.json` if it
-   exists and appends whatever tool dicts it finds — same schema `hub_core.py`
-   already consumes, so adding a tool to the hub is "edit a JSON file," not
-   "edit this package." See [`docs/hub_tools.example.json`](docs/hub_tools.example.json)
-   for the schema and worked examples. Missing file → built-ins only, no error.
+3. Resolves the **suite root** — `GDRIVE_SUITE_ROOT` env var, then `suite_root`
+   from the shared config, then `repo_root.parent` *iff*
+   `(parent/"drivecast"/"app.py").exists()`. When this toolkit is checked out
+   inside a `google-drive-suite` monorepo (i.e. this repo lives at
+   `<suite>/toolkit/`), that resolves to `<suite>` and the hub adds
+   **computed built-ins** for the sibling suite members: `drivecast` (web,
+   port 8737), `drive-offload` (menubar, `launchd_label: com.driveoffload.app`),
+   and `drivecast-app` (kind `external`, inert — Fire TV, nothing to launch
+   from this Mac). Standalone installs (no suite checkout) resolve suite root
+   to `None` and just skip this step — no behavior change for them.
+4. Reads `~/Library/Application Support/gdrive_toolkit/hub_tools.json` if it
+   exists and layers in whatever tool dicts it finds — same schema `hub_core.py`
+   already consumes, so adding (or overriding) a tool in the hub is "edit a
+   JSON file," not "edit this package." A user entry whose `"id"` matches a
+   built-in (this toolkit's own, or a suite sibling's from step 3) **replaces**
+   that built-in in place rather than appending a duplicate row. See
+   [`docs/hub_tools.example.json`](docs/hub_tools.example.json) for the schema
+   and worked examples. Missing file → built-ins only, no error.
 
 `hub_core.py` itself doesn't know or care where a tool dict came from — this
 split is what keeps the hub's core logic free of any account-specific or
