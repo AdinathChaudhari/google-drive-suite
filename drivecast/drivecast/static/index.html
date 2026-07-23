@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f0f13">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="drivecast">
+  <title>drivecast</title>
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <!-- Apply the saved theme before first paint to avoid a flash. Default: dark. -->
+  <script>
+    (function () {
+      try {
+        if (localStorage.getItem("theme") === "light") {
+          document.documentElement.setAttribute("data-theme", "light");
+        }
+      } catch (e) { /* private mode / no storage -> default dark */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" id="homeBtn">
+      <span class="logo">▶</span><span class="brandname">drivecast</span>
+    </div>
+    <div class="searchwrap">
+      <input id="search" type="search" placeholder="Search your library…" autocomplete="off">
+    </div>
+    <nav class="topnav">
+      <button id="refreshBtn" class="navbtn" title="Refresh library">
+        <span class="refresh-icon">⟳</span><span class="refresh-label">Refresh</span>
+      </button>
+      <button id="themeToggle" class="navbtn ghost" title="Toggle light / dark theme" aria-label="Toggle light / dark theme">
+        <span class="theme-icon">🌙</span>
+      </button>
+      <a id="settingsLink" class="navbtn" href="#/settings">Settings</a>
+      <a id="browseLink" class="navbtn ghost" href="#/browse" title="Browse raw files">Browse files</a>
+    </nav>
+  </header>
+
+  <nav id="sectionTabs" class="section-tabs hidden"></nav>
+
+  <div id="banner" class="banner hidden"></div>
+  <div id="scanBar" class="scanbar hidden"></div>
+
+  <main>
+    <!-- ===================== Library view ===================== -->
+    <div id="libraryView">
+      <section id="continueSection" class="shelf hidden">
+        <h2 id="continueHead">Continue Watching</h2>
+        <div id="continueRow" class="row"></div>
+      </section>
+
+      <section id="libSection">
+        <div class="lib-head">
+          <h2 id="libHead">Your Library</h2>
+          <div class="lib-controls">
+            <div class="filters" id="filters">
+              <button class="chip active" data-filter="all">All</button>
+              <button class="chip" data-filter="movie">Movies</button>
+              <button class="chip" data-filter="show">TV Shows</button>
+              <button class="chip" data-filter="documentary">Documentaries</button>
+              <button class="chip" data-filter="other">Other</button>
+            </div>
+            <label class="ctrl">Sort
+              <select id="sortSel">
+                <option value="title">Title (A–Z)</option>
+                <option value="year">Year (newest)</option>
+                <option value="added">Recently added</option>
+                <option value="watched">Recently watched</option>
+              </select>
+            </label>
+            <label class="ctrl">Group
+              <select id="groupSel">
+                <option value="none">None</option>
+                <option value="type">By type</option>
+                <option value="drive">By drive</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div id="libGrid" class="grid"></div>
+      </section>
+
+      <div id="cta" class="cta hidden"></div>
+    </div>
+
+    <!-- ===================== Detail view ===================== -->
+    <div id="detailView" class="hidden">
+      <button class="back" id="detailBack">‹ Back</button>
+      <div id="detailBody"></div>
+    </div>
+
+    <!-- ===================== Settings view ===================== -->
+    <div id="settingsView" class="hidden">
+      <button class="back" id="settingsBack">‹ Back</button>
+      <h2>Settings</h2>
+      <div class="settings-card">
+        <h3>Drives to include</h3>
+        <p class="muted">Only content from the drives you pick appears in your library.</p>
+        <div id="driveList" class="drive-list"></div>
+
+        <div class="tabs-manage">
+          <h4>Your tabs</h4>
+          <p class="muted">Tabs decide how your library is organized. Delete one and its
+            assigned drives fall back to "— choose a tab —" until you pick another.</p>
+          <div id="tabsManageList" class="tabs-manage-list"></div>
+
+          <div id="newSectionForm" class="new-section-form hidden">
+            <h4>Create a tab</h4>
+            <label class="ns-field">
+              <span>Name</span>
+              <input type="text" id="newSectionName" placeholder="e.g. Work Courses" required>
+            </label>
+            <label class="ns-field">
+              <span>Emoji</span>
+              <input type="text" id="newSectionIcon" placeholder="🎬" maxlength="8">
+              <span class="muted ns-hint">Cmd-Ctrl-Space for the emoji picker. Leave blank for the default.</span>
+            </label>
+            <label class="ns-field">
+              <span>Behaves like</span>
+              <select id="newSectionBehavior"></select>
+            </label>
+            <div class="ns-actions">
+              <button id="newSectionCreate" class="btn primary" type="button">Create</button>
+              <button id="newSectionCancel" class="btn ghost" type="button">Cancel</button>
+              <span id="newSectionMsg" class="muted"></span>
+            </div>
+          </div>
+        </div>
+
+        <label class="toggle">
+          <input type="checkbox" id="autoRefresh">
+          <span>Auto-refresh library on launch</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="autoplayNext">
+          <span>Autoplay next episode</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="subtitlesOn">
+          <span>English subtitles when available <span class="muted">(sibling .srt on the drive, or OpenSubtitles with an API key in secrets)</span></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="keepAwake">
+          <span>Keep Mac awake while streaming <span class="muted">(holds a caffeinate assertion during active streams; works in clamshell)</span></span>
+        </label>
+        <div class="setting-row">
+          <label for="playerSelect"><strong>Video player</strong></label>
+          <select id="playerSelect">
+            <option value="auto">Auto (mpv → IINA → VLC)</option>
+            <option value="mpv">mpv</option>
+            <option value="iina">IINA</option>
+            <option value="vlc">VLC</option>
+            <option value="infuse">Infuse</option>
+          </select>
+          <p class="muted" id="playerHint">Which app opens when you press play. mpv, IINA and VLC track your position for Continue Watching; Infuse is launch-only (no Continue Watching or autoplay-next). mpv stays the recommended default.</p>
+        </div>
+        <div class="settings-actions">
+          <button id="saveSettings" class="btn primary">Save</button>
+          <span id="settingsMsg" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="settings-card" id="remoteCard">
+        <h3>Watch on iPhone / iPad</h3>
+        <p class="muted">Open drivecast in your phone or tablet's browser — on the same
+          Tailscale tailnet (recommended) or Wi-Fi network. Compatible files play in the
+          browser; MKV hands off to VLC or Infuse.</p>
+        <label class="toggle">
+          <input type="checkbox" id="remoteAccess">
+          <span>Enable remote access</span>
+        </label>
+        <div id="remoteDetails" class="remote-details hidden">
+          <div id="remoteUrls" class="remote-urls"></div>
+          <img id="remoteQr" class="remote-qr" src="" alt="QR code for this drivecast address">
+          <p class="muted">Scan with your phone. Restart drivecast after turning this on.
+            Tailscale recommended — see README.</p>
+          <p id="remoteRestartNote" class="remote-restart hidden">Restart drivecast to apply.</p>
+          <p id="remoteHttpsStale" class="remote-restart hidden">Your Mac's Wi-Fi address
+            changed since drivecast started — restart it to re-issue the HTTPS certificate
+            for the new address.</p>
+          <div id="trustBlock" class="trust-block hidden">
+            <a href="#" id="trustLink" class="remote-url">Trust this Mac on your iPhone (one-time)</a>
+            <ol class="muted trust-steps">
+              <li>Scan the QR above. Safari downloads a profile — tap <b>Allow</b>
+                (and <b>Continue</b> if Safari warns the site isn't secure).</li>
+              <li>Settings → General → VPN &amp; Device Management → <b>drivecast CA</b> → Install.</li>
+              <li>Before tapping Install, open <b>More Details</b> and check the
+                SHA-256 fingerprint matches the one below — if it doesn't, someone on
+                your network is tampering with the download; <b>do not install it</b>.</li>
+              <li>Settings → General → About → Certificate Trust Settings → turn on <b>full trust</b>.</li>
+            </ol>
+            <p class="muted">Expected SHA-256 fingerprint:</p>
+            <code id="trustFingerprint" class="trust-fingerprint"></code>
+            <p class="muted">Then the Wi-Fi (HTTPS) link works in Safari without Tailscale.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===================== Browse (advanced) view ===================== -->
+    <div id="browseView" class="hidden">
+      <button class="back" id="browseBack">‹ Back</button>
+      <nav id="breadcrumb" class="breadcrumb hidden"></nav>
+      <section id="drivesSection" class="shelf">
+        <h2>Shared Drives</h2>
+        <div id="drivesRow" class="row"></div>
+      </section>
+      <section id="gridSection" class="hidden">
+        <h2 id="gridTitle"></h2>
+        <div id="grid" class="grid"></div>
+        <div class="loadmore-wrap">
+          <button id="loadMore" class="loadmore hidden">Load more</button>
+        </div>
+      </section>
+      <div id="empty" class="empty hidden"></div>
+    </div>
+  </main>
+
+  <div id="toasts" class="toasts"></div>
+
+  <!-- Resume/start-over dialog -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <h3 id="modalTitle">Resume playback?</h3>
+      <p id="modalBody"></p>
+      <div class="modal-actions">
+        <button id="btnResume" class="btn primary">Resume</button>
+        <button id="btnStartOver" class="btn">Start over</button>
+        <button id="btnCancel" class="btn ghost">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Web player (remote iPhone / iPad playback) -->
+  <div id="webPlayer" class="webplayer hidden">
+    <div class="wp-bar">
+      <span id="wpTitle" class="wp-title"></span>
+      <button id="wpClose" class="wp-close" aria-label="Close player">✕</button>
+    </div>
+    <video id="wpVideo" controls autoplay playsinline></video>
+  </div>
+
+  <!-- External-player chooser (MKV etc. on remote devices) -->
+  <div id="chooser" class="modal hidden">
+    <div class="modal-card">
+      <h3 id="chooserTitle"></h3>
+      <p class="muted">This file needs an external player to stream on iPhone / iPad.</p>
+      <div class="chooser-actions">
+        <a id="chooserVlc" class="btn primary" href="#">Open in VLC</a>
+        <a id="chooserInfuse" class="btn" href="#">Open in Infuse</a>
+        <button id="chooserBrowser" class="btn">Try in browser anyway</button>
+        <button id="chooserCancel" class="btn ghost">Cancel</button>
+      </div>
+      <p class="muted chooser-note">Resume isn't tracked in external apps.</p>
+    </div>
+  </div>
+
+  <!-- "Fix poster" picker — choose the correct TMDB artwork for a title -->
+  <div id="posterModal" class="modal hidden">
+    <div class="modal-card poster-picker">
+      <button id="posterModalClose" class="wp-close" aria-label="Close">✕</button>
+      <h3 id="posterModalTitle">Fix poster</h3>
+      <p class="muted">Pick the correct match. Your choice is saved and shows everywhere.</p>
+      <div id="posterCandidates" class="poster-candidates"></div>
+    </div>
+  </div>
+
+  <!-- "Are you still watching?" — keep-awake prompt before the Mac sleeps -->
+  <div id="awakeModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>Are you still watching?</h3>
+      <p>The Mac is about to sleep in <span id="awakeCountdown" class="awake-countdown">0</span>s.
+        Keep it awake to continue streaming?</p>
+      <div class="modal-actions">
+        <button id="awakeYes" class="btn primary">Yes, keep watching</button>
+        <button id="awakeNo" class="btn ghost">No</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

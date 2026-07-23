@@ -1,0 +1,3 @@
+# Build-only dependencies (not needed to run drivecast, only to build the
+# standalone macOS app bundle with `python setup_app.py py2app`).
+py2app

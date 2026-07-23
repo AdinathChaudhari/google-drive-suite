@@ -1,0 +1,10 @@
+{
+  "remote": "gdrive1",
+  "player": "auto",
+  "port": 8737,
+  "page_size": 200,
+  "selected_drives": [],
+  "auto_refresh_on_startup": false,
+  "scan_throttle": 0.15,
+  "autoplay_next": true
+}

@@ -1,0 +1,33 @@
+venv/
+data/
+config.json
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+
+# py2app build artifacts
+build/
+dist/
+*.egg-info/
+assets/*.iconset/
+assets/icon_1024.png
+
+# Secrets — API keys & OAuth credentials. Ignore everything under secrets/
+# EXCEPT the checked-in example that documents the format.
+secrets/*
+!secrets/secrets.example.json
+client_secret*.json
+*oauth*.json
+*credentials*.json
+google_client*.json
+gdrive_client*.json
+
+# Personal working docs — kept local, never published
+CASE_STUDY.md
+DISCUSSION.md
+
+# Local working docs + session config (never published)
+SECTIONS_DESIGN.md
+MOVIE_FEATURETTES_PLAN.md
+.claude/
