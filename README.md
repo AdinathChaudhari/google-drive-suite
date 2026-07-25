@@ -58,6 +58,11 @@ Everything needs [rclone](https://rclone.org) with a configured remote (`rclone 
 > documented in **[BUILD-WITH-AI.md](BUILD-WITH-AI.md)** — written to transfer,
 > not to impress.
 
+> **Why a value is that value.** Measurements that overturned an assumption,
+> and constraints the code is shaped around, are logged in
+> **[docs/DECISIONS.md](docs/DECISIONS.md)** — including the one that says
+> "faster downloader" and "more connections" are not the same thing.
+
 ## Security model
 
 - **Binds `127.0.0.1` only.** No tool in this suite listens on any other interface by default.
