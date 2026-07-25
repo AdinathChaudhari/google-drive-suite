@@ -13,7 +13,8 @@ drivecast/      streaming server (FastAPI) — "Netflix for your Drive"
 drivecast-app/  Fire TV / Android TV client (Kotlin, Jetpack Compose for TV)
 drive-offload/  ingest daemon — watcher + todrive/stream-dl/yt-show/yt-video CLIs
 design/         drivedeck.css — canonical design tokens, vendored into each web app
-docs/           case-studies/ (moved from drivecast/drive-offload), media/ (planned assets)
+docs/           DECISIONS.md (learnings log), case-studies/, media/ (planned assets)
+scripts/        sync-css.sh, bench-transfers.py (rclone concurrency benchmark)
 ```
 
 Each of the four component dirs was imported as a **snapshot** of its former
@@ -36,6 +37,29 @@ commit here cites the source repo's HEAD SHA.
    directory, outside git entirely. Never add a personal plugin under
    `drivecast/` in this repo; `conftest.py` in drivecast's tests stubs out
    the user plugin dir precisely so a real plugin can never leak into a run.
+
+## Decisions log — read it before changing a tuning value
+
+[`docs/DECISIONS.md`](docs/DECISIONS.md) records *why a value is that value*:
+measurements that overturned an assumption (**Adopted**), constraints the code
+is shaped around (**Adapted**), and questions asked but not yet answered
+(**Open**, each with a `Revisit when` condition). Code shows what the suite
+does and git history shows when it changed; neither explains why a number is
+8 rather than 4.
+
+Add an entry whenever a benchmark, a failure, or a platform limit changes a
+decision — especially when the resulting code looks arbitrary without the
+backstory. Use the template at the top of the file, take the next `D-NNN`, and
+add the index row. `Where` must cite real `file:line`; a rotted citation is
+worse than no entry.
+
+Live one to know about: **D-002** — the toolkit's Drive concurrency values
+(`Transfers`, `MultiThreadStreams`, `drive_chunk_size`) were never measured,
+and the suite disagrees with itself across `rclone_rc.py`, `todrive`, and
+`yt-show`. `scripts/bench-transfers.py` is the harness that settles it; it
+needs a fast connection to say anything (on a slow uplink every setting scores
+the same, because the pipe is the bottleneck, not rclone). Don't "tidy" those
+constants into agreement without running it first.
 
 ## Design system
 
