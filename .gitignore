@@ -1,2 +1,5 @@
 .DS_Store
 __pycache__/
+
+# Private About-image prompt (personal speciality — not published)
+docs/media/ABOUT-IMAGE.md
