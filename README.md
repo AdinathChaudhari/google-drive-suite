@@ -25,7 +25,9 @@ at 1280×640 once it exists — that's what renders when the repo link is shared
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 [![Built with AI-orchestrated workflow](https://img.shields.io/badge/built%20with-AI--orchestrated%20workflow-b98cff)](BUILD-WITH-AI.md)
 
-<!-- ![hero](docs/media/hero.png) — see docs/media/README.md for the asset plan -->
+<p align="center">
+  <img src="docs/media/hero.png" alt="google-drive-suite — Drivedeck" width="820">
+</p>
 
 ## The suite
 
