@@ -273,6 +273,129 @@ def launch(
 
 
 # ---------------------------------------------------------------------------
+# stop / restart
+# ---------------------------------------------------------------------------
+#
+# WHY STOP USES `bootout` AND NOT `launchctl kill`
+#
+# Both menubar agents in this suite set KeepAlive to the dict form
+# {SuccessfulExit: false} so that each app's own "Quit" menu item — a clean
+# exit 0 — actually sticks instead of being resurrected by launchd. But that
+# predicate treats death-by-signal as an UNSUCCESSFUL exit, so
+# `launchctl kill SIGTERM gui/<uid>/<label>` would be relaunched immediately:
+# exactly the "I quit it and it came back" bug, reintroduced from the outside.
+#
+# `bootout` removes the job from the user's launchd domain entirely, so there
+# is no KeepAlive predicate left to evaluate. It also escalates to SIGKILL on
+# its own, which is what makes it the recovery path for a WEDGED app whose
+# menu bar no longer responds to clicks (its own Quit item is unreachable
+# then, so an outside stop is the only way).
+#
+# The mirror of bootout is `bootstrap`, which launch() already does whenever
+# it finds a plist on disk that isn't loaded — so stop()/launch() compose into
+# a working off/on pair with no extra state.
+
+def _launchd_label_or_raise(tool: dict, action: str) -> str:
+    """The tool's launchd label, or a HubError explaining why `action` can't
+    apply. Keeps stop()/restart() honest about their narrow scope: only
+    launchd-managed menubar agents, never web tools (nothing owns their
+    lifecycle) or inert external entries."""
+    kind = tool.get("kind")
+    label = tool.get("label", tool.get("id", "tool"))
+
+    if kind == "external" or kind not in ("web", "menubar"):
+        return_msg = "%s is external — nothing to %s" % (label, action)
+        raise HubError(return_msg)
+    if kind == "web":
+        raise HubError(
+            "%s is a web tool — %s is only defined for launchd-managed "
+            "menubar agents (close its terminal or browser tab instead)"
+            % (label, action)
+        )
+
+    launchd_label = tool.get("launchd_label")
+    if not launchd_label:
+        raise HubError(
+            "%s has no launchd_label — nothing for %s to act on" % (label, action)
+        )
+    return launchd_label
+
+
+def stop(
+    tool: dict,
+    *,
+    status_fn: Callable[[dict], Status] = status,
+    run: Callable[..., object] = subprocess.run,
+) -> str:
+    """Unload a launchd-managed menubar agent so it stays down.
+
+    Deliberately does NOT re-probe status first, unlike launch(): a wedged app
+    can report RUNNING while being completely unresponsive, and booting out an
+    already-stopped job is harmless (bootout on an unloaded label just returns
+    non-zero, which we swallow). Being able to stop something the status probe
+    disagrees about is the whole point of this action.
+    """
+    launchd_label = _launchd_label_or_raise(tool, "stop")
+    uid = os.getuid()
+
+    result = run(
+        ["launchctl", "bootout", "gui/%d/%s" % (uid, launchd_label)],
+        capture_output=True, text=True, timeout=10,
+    )
+    rc = getattr(result, "returncode", 0)
+    # rc 3 / EINVAL == "no such process" — the job was already unloaded, which
+    # is the requested end state, so report success rather than an error.
+    if rc not in (0, 3):
+        stderr = (getattr(result, "stderr", "") or "").strip()
+        raise HubError(
+            "could not stop %s (launchctl bootout rc=%s%s)"
+            % (tool["label"], rc, ": %s" % stderr if stderr else "")
+        )
+    return "stopped %s — it will stay down until you start it again" % tool["label"]
+
+
+def restart(
+    tool: dict,
+    *,
+    status_fn: Callable[[dict], Status] = status,
+    run: Callable[..., object] = subprocess.run,
+    launch_fn: Optional[Callable[..., str]] = None,
+) -> str:
+    """Restart a launchd-managed menubar agent.
+
+    `kickstart -k` kills any running instance and starts a fresh one in a
+    single step, which is the fix for the wedged-menu-bar case. If the job
+    isn't loaded at all (e.g. after a previous stop()), fall through to
+    launch(), which bootstraps the plist back in.
+    """
+    launchd_label = _launchd_label_or_raise(tool, "restart")
+    uid = os.getuid()
+
+    loaded = run(
+        ["launchctl", "print", "gui/%d/%s" % (uid, launchd_label)],
+        capture_output=True, text=True, timeout=3,
+    )
+    if getattr(loaded, "returncode", 1) != 0:
+        # Not loaded — this is a start, not a restart. launch() owns the
+        # bootstrap/open-the-.app fallback chain; don't duplicate it here.
+        fn = launch_fn if launch_fn is not None else launch
+        return fn(tool, status_fn=lambda t: Status.STOPPED, run=run)
+
+    result = run(
+        ["launchctl", "kickstart", "-k", "gui/%d/%s" % (uid, launchd_label)],
+        capture_output=True, text=True, timeout=10,
+    )
+    rc = getattr(result, "returncode", 0)
+    if rc != 0:
+        stderr = (getattr(result, "stderr", "") or "").strip()
+        raise HubError(
+            "could not restart %s (launchctl kickstart rc=%s%s)"
+            % (tool["label"], rc, ": %s" % stderr if stderr else "")
+        )
+    return "restarted %s" % tool["label"]
+
+
+# ---------------------------------------------------------------------------
 # open_ui
 # ---------------------------------------------------------------------------
 

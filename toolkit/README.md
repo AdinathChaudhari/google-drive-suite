@@ -32,7 +32,9 @@ Three small tools around one shared engine (`rclone`):
   parallel. Copy-only — it never moves or deletes your local files.
 - **`gdrive-hub`** — a macOS menu-bar app that shows install/running status for
   this toolkit and any other tools you register (see [Fork it](#fork-it-making-it-yours))
-  and launches them with one click.
+  and launches them with one click. Background menu-bar apps it manages (like
+  `drive-offload`) get a **Start / Restart / Stop** submenu, so a wedged app can
+  be recovered without touching a terminal.
 
 All three talk to Google Drive through your own `rclone` remote and your own
 OAuth token. Nothing is hosted, nothing phones home.
@@ -58,7 +60,8 @@ account, same permissions — just a faster, scriptable front door.
 - **Parallel copy-only upload** — native macOS file/folder picker, destination
   drive + folder tree with inline "New folder," collision-safe.
 - **One menu-bar hub** — live status (installed / stopped / running) for this
-  toolkit's own tools and any others you register; launches or focuses them.
+  toolkit's own tools and any others you register; launches or focuses them, and
+  start/restart/stops the launchd-managed ones from outside.
 - **Google Docs export handling** — native Google Docs/Sheets/Slides export to
   `docx`/`xlsx`/`pptx`/`svg` on download, or skip them entirely.
 - **Works with any rclone remote** — Google Shared Drives are the focus, but a

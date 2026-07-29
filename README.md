@@ -37,7 +37,7 @@ Four tools, one engine (rclone + the Drive API), zero hosting. Pick what you nee
 |---|---|---|
 | **Download** in bulk | [`toolkit/`](toolkit/) → `gdrive-download` | Web UI: tick a checkbox tree over any Shared Drive, pull it in parallel with live progress |
 | **Upload** in parallel | [`toolkit/`](toolkit/) → `gdrive-upload` | Copy-only uploads with a native macOS picker — never touches your local files |
-| **Control** it all | [`toolkit/`](toolkit/) → `gdrive-hub` | macOS menu-bar hub: live status + one-click launch for every tool here |
+| **Control** it all | [`toolkit/`](toolkit/) → `gdrive-hub` | macOS menu-bar hub: live status, one-click launch, and start/restart/stop for the background apps |
 | **Stream** my Drive | [`drivecast/`](drivecast/) | Your Shared Drives as a poster-tile media library — movies, shows, courses — streamed to mpv/VLC/browser, nothing written to disk |
 | **Watch** on the TV | [`drivecast-app/`](drivecast-app/) | Native Fire TV / Android TV client for drivecast (Kotlin + Compose) — grab the APK from Releases |
 | **Offload** automatically | [`drive-offload/`](drive-offload/) | Daemon that moves finished downloads to Shared Drives and keeps a full disk clear |

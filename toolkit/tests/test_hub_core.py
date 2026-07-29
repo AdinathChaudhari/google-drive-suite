@@ -408,6 +408,148 @@ class TestLaunch(TmpDirTestCase):
 
 
 # ---------------------------------------------------------------------------
+# stop / restart
+# ---------------------------------------------------------------------------
+
+class FakeCompleted:
+    def __init__(self, returncode=0, stderr=""):
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def _menubar_tool(tmp, **extra):
+    tool = {
+        "id": "menubar-tool",
+        "label": "Menubar Tool",
+        "kind": "menubar",
+        "dir": str(tmp),
+        "launchd_label": "com.example.tool",
+    }
+    tool.update(extra)
+    return tool
+
+
+class TestStop(TmpDirTestCase):
+    def test_stop_boots_out_and_never_signals(self):
+        # The whole point: KeepAlive={SuccessfulExit:false} treats SIGTERM as
+        # an unsuccessful exit and would relaunch, so a `launchctl kill` here
+        # would silently reintroduce the "I quit it and it came back" bug.
+        tool = _menubar_tool(self.tmp)
+        calls = []
+
+        msg = hub_core.stop(
+            tool, run=lambda argv, **k: calls.append(argv) or FakeCompleted(0))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["launchctl", "bootout"])
+        self.assertIn("com.example.tool", calls[0][2])
+        self.assertNotIn("kill", " ".join(calls[0]))
+        self.assertIn("stay down", msg)
+
+    def test_stop_does_not_probe_status(self):
+        # A wedged app reports RUNNING while being unresponsive; stop() must
+        # not consult status at all, or it could refuse the recovery path.
+        tool = _menubar_tool(self.tmp)
+        probed = []
+
+        hub_core.stop(
+            tool,
+            status_fn=lambda t: probed.append(t) or Status.RUNNING,
+            run=lambda argv, **k: FakeCompleted(0),
+        )
+        self.assertEqual(probed, [])
+
+    def test_stop_treats_already_unloaded_as_success(self):
+        # rc=3 is launchctl's "no such process" — the requested end state.
+        tool = _menubar_tool(self.tmp)
+        msg = hub_core.stop(tool, run=lambda argv, **k: FakeCompleted(3))
+        self.assertIn("stopped", msg)
+
+    def test_stop_raises_on_real_failure(self):
+        tool = _menubar_tool(self.tmp)
+        with self.assertRaises(hub_core.HubError) as cm:
+            hub_core.stop(
+                tool, run=lambda argv, **k: FakeCompleted(1, "Operation not permitted"))
+        self.assertIn("Operation not permitted", str(cm.exception))
+
+    def test_stop_refuses_web_tool(self):
+        tool = {"id": "w", "label": "Web Tool", "kind": "web", "dir": str(self.tmp)}
+        with self.assertRaises(hub_core.HubError) as cm:
+            hub_core.stop(tool, run=lambda argv, **k: FakeCompleted(0))
+        self.assertIn("web tool", str(cm.exception))
+
+    def test_stop_refuses_menubar_without_launchd_label(self):
+        tool = _menubar_tool(self.tmp)
+        del tool["launchd_label"]
+        with self.assertRaises(hub_core.HubError) as cm:
+            hub_core.stop(tool, run=lambda argv, **k: FakeCompleted(0))
+        self.assertIn("launchd_label", str(cm.exception))
+
+    def test_stop_refuses_external_tool(self):
+        tool = {"id": "x", "label": "Fire TV app", "kind": "external"}
+        with self.assertRaises(hub_core.HubError) as cm:
+            hub_core.stop(tool, run=lambda argv, **k: FakeCompleted(0))
+        self.assertIn("external", str(cm.exception))
+
+
+class TestRestart(TmpDirTestCase):
+    def test_restart_kickstarts_with_dash_k_when_loaded(self):
+        # -k is what makes this work on a WEDGED app: kill the running
+        # instance and start a fresh one in one step.
+        tool = _menubar_tool(self.tmp)
+        calls = []
+
+        def fake_run(argv, **k):
+            calls.append(argv)
+            return FakeCompleted(0)   # `launchctl print` succeeds -> loaded
+
+        msg = hub_core.restart(tool, run=fake_run)
+
+        self.assertEqual(calls[0][:2], ["launchctl", "print"])
+        self.assertEqual(calls[1][:3], ["launchctl", "kickstart", "-k"])
+        self.assertIn("restarted", msg)
+
+    def test_restart_delegates_to_launch_when_not_loaded(self):
+        # After a stop() the job is booted out, so "restart" is really a
+        # start — and launch() owns the bootstrap/open-the-.app fallback.
+        tool = _menubar_tool(self.tmp)
+        launch_args = []
+
+        def fake_launch(t, **kwargs):
+            launch_args.append((t, kwargs))
+            return "bootstrapping Menubar Tool via launchctl"
+
+        msg = hub_core.restart(
+            tool,
+            run=lambda argv, **k: FakeCompleted(1),   # not loaded
+            launch_fn=fake_launch,
+        )
+
+        self.assertEqual(len(launch_args), 1)
+        # Must hand launch() a STOPPED status or launch() would no-op with
+        # "already running".
+        self.assertEqual(launch_args[0][1]["status_fn"](tool), Status.STOPPED)
+        self.assertIn("bootstrap", msg)
+
+    def test_restart_raises_when_kickstart_fails(self):
+        tool = _menubar_tool(self.tmp)
+
+        def fake_run(argv, **k):
+            if "print" in argv:
+                return FakeCompleted(0)
+            return FakeCompleted(2, "Input/output error")
+
+        with self.assertRaises(hub_core.HubError) as cm:
+            hub_core.restart(tool, run=fake_run)
+        self.assertIn("Input/output error", str(cm.exception))
+
+    def test_restart_refuses_web_tool(self):
+        tool = {"id": "w", "label": "Web Tool", "kind": "web", "dir": str(self.tmp)}
+        with self.assertRaises(hub_core.HubError):
+            hub_core.restart(tool, run=lambda argv, **k: FakeCompleted(0))
+
+
+# ---------------------------------------------------------------------------
 # open_ui
 # ---------------------------------------------------------------------------
 
