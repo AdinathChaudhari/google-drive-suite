@@ -289,11 +289,25 @@ uploads with detail (`⬆ name → DriveName — 42% (3.2 MiB/s, ETA 2m58s)`), a
 - **Open log** opens `app.log`.
 
 Install (creates a project-local `.venv`, installs `rumps`, and registers a
-login LaunchAgent that restarts the app if it dies):
+login LaunchAgent that restarts the app if it *crashes*):
 
 ```sh
 ./install-app.sh
 ```
+
+The LaunchAgent uses `KeepAlive = {SuccessfulExit: false}`, not plain
+`KeepAlive: true` — so the app's own **Quit** item actually sticks while a crash
+still auto-heals. To stop it from outside (the only option if the menu bar has
+stopped responding), boot the job out rather than signalling it — a signal
+counts as an unsuccessful exit and gets relaunched:
+
+```sh
+launchctl bootout gui/$(id -u)/com.driveoffload.app   # stop, stays down
+launchctl kickstart -k gui/$(id -u)/com.driveoffload.app   # restart in place
+```
+
+Those two are exactly what the suite's `gdrive-hub` menu-bar app runs from its
+**drive-offload → Start / Restart / Stop** submenu.
 
 Uninstall with `./uninstall-app.sh`. Logs: `app.log` (app), `launchd-app.out.log`
 / `launchd-app.err.log` (launchd). Decisions are remembered per download in

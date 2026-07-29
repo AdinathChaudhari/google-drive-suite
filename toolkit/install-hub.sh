@@ -47,8 +47,16 @@ cat > "$PLIST" <<PLISTEOF
     </array>
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
+    <!-- Dict form, not \`true\`: relaunch only after an UNSUCCESSFUL exit, so
+         the hub's own "Quit" menu item (a clean exit 0) actually sticks.
+         Plain KeepAlive:true resurrects the hub instantly and makes Quit look
+         broken. A crash still auto-heals. Restart it with:
+           launchctl kickstart gui/\$(id -u)/$LABEL -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
