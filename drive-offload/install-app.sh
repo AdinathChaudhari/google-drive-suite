@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # install-app.sh: set up the venv and install the drive-offload menu-bar app
-# as a launchd LaunchAgent (runs at login, restarts if it dies).
+# as a launchd LaunchAgent (runs at login, restarts if it CRASHES).
+#
+# KeepAlive is the dict form (SuccessfulExit=false), not `true`: the app's own
+# "Quit" menu item exits 0, and plain KeepAlive:true would resurrect it
+# instantly, making Quit look broken. Corollary: SIGTERM counts as an
+# unsuccessful exit and WOULD relaunch, so stop it from outside with
+# `launchctl bootout gui/$UID/com.driveoffload.app` (what drive-hub's Stop does).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +41,10 @@ cat > "$PLIST" <<PLISTEOF
         <string>$APP</string>
     </array>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>

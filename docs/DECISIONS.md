@@ -50,6 +50,7 @@ than no entry.
 | [D-009](#d-009--a-download-is-complete-by-name-shape-never-by-size) | A download is "complete" by name shape, never by size | Adopted | drive-offload |
 | [D-010](#d-010--the-100-gb-shared-drive-cap-is-googles-not-ours) | The 100 GB shared-drive cap is Google's, not ours | Adapted | drive-offload |
 | [D-011](#d-011--the-design-tokens-are-vendored-not-shared-at-runtime) | The design tokens are vendored, not shared at runtime | Adapted | suite |
+| [D-012](#d-012--keepalive-true-silently-breaks-every-quit-button) | `KeepAlive: true` silently breaks every Quit button | Adopted | suite |
 
 ---
 
@@ -274,3 +275,47 @@ than no entry.
   vendoring never turns into a rename sweep.
 - **Where** — `CLAUDE.md` § "Design system"; `design/drivedeck.css`;
   `scripts/sync-css.sh`.
+
+---
+
+### D-012 — `KeepAlive: true` silently breaks every Quit button
+**Status:** Adopted · **When:** 2026-07-29
+
+- **Hit** — quitting either menu-bar app (drive-offload's ⬆/☁ icon or the
+  hub's 🧰) from its own **Quit** menu item did nothing observable: the icon
+  vanished for a moment and came straight back. It read as a bug in the apps'
+  quit handling, and separately made a wedged drive-offload unrecoverable
+  without a terminal.
+- **Learned** — nothing was wrong with either app. Both `_quit` callbacks call
+  `rumps.quit_application()`, which is a clean **exit 0**; both LaunchAgents
+  set the bare `KeepAlive: true`, which relaunches on *any* exit including a
+  deliberate one. launchd was overriding the user, and neither app could have
+  detected or prevented it. Switching to the dict predicate
+  `KeepAlive = {SuccessfulExit: false}` restricts relaunch to unsuccessful
+  exits. Verified with a throwaway probe agent rather than from the man page,
+  because the third case below is unintuitive and is the one that bites:
+
+  | Exit path | Starts observed | Behavior |
+  |---|---|---|
+  | clean `exit 0` (the Quit item) | 1 | stays down ✅ |
+  | `exit 3` (a crash) | 3 | auto-heals ✅ |
+  | `launchctl kill SIGTERM` | 2 | **relaunched** ⚠️ |
+
+  Two timing traps make this easy to "verify" wrongly: launchd throttles
+  respawns to ~10 s apart, so a 6-second observation window shows one start
+  for *every* case and looks like a pass; and a probe that exits after 1 s is
+  already gone before a SIGTERM sent at t+2 can land on it.
+- **Did** — dict-form `KeepAlive` in all three generated/templated plists.
+  The SIGTERM row is why `hub_core.stop()` uses **`launchctl bootout`** (which
+  removes the job from the domain, so no predicate is left to evaluate, and
+  which escalates to SIGKILL on its own) and never `launchctl kill` — a kill
+  would have reintroduced the exact same "I quit it and it came back" bug from
+  the outside. `bootout`'s mirror is `bootstrap`, which `launch()` already did
+  for an on-disk-but-unloaded plist, so stop/start compose with no new state.
+- **Where** — `drive-offload/launchd/com.driveoffload.app.plist`,
+  `drive-offload/install-app.sh`, `toolkit/install-hub.sh`;
+  `toolkit/src/gdrive_toolkit/hub/hub_core.py` § "stop / restart".
+- **Revisit when** — a menu-bar app needs to stay dead across a *reboot* too.
+  `bootout` only lasts until the next login, since `RunAtLoad` bootstraps the
+  agent again; a persistent off switch would need `launchctl disable`, which
+  writes to a system-wide override database and is a different tool.

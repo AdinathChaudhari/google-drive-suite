@@ -3,6 +3,19 @@
 Uploader/renamer + storage tooling that gets media onto Google Shared Drives
 for the Drivecast ecosystem (see `drivecast/CLAUDE.md` for the sibling repos).
 
+## LaunchAgent: the `KeepAlive` form is load-bearing
+
+`install-app.sh` and `launchd/com.driveoffload.app.plist` must keep
+`KeepAlive = {SuccessfulExit: false}` — never the bare `true`. The menu-bar
+app's own **Quit** item calls `rumps.quit_application()`, a clean exit 0, and
+plain `KeepAlive: true` relaunches on *any* exit, so Quit silently did nothing
+and a wedged app was unrecoverable without a terminal. Corollary that reads
+backwards: SIGTERM counts as an *unsuccessful* exit, so `launchctl kill` gets
+relaunched — stop the agent with `launchctl bootout gui/$(id -u)/com.driveoffload.app`
+instead (which is what `gdrive-hub`'s Stop action does). Measured proof and the
+respawn-throttle traps that make this easy to verify wrongly: **D-012** in
+`docs/DECISIONS.md`.
+
 ## yt-video
 
 `yt-video` is the SINGLE-video sibling to `yt-show`: download one YouTube video

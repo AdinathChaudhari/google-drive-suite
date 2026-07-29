@@ -14,8 +14,20 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Relaunch only after an UNSUCCESSFUL exit, so the app's own "Quit"
+         menu item (a clean exit 0 via rumps.quit_application) actually
+         sticks. Plain `KeepAlive: true` resurrects the app immediately and
+         makes Quit look broken. A crash still auto-heals.
+
+         Note this also means SIGTERM (`launchctl kill`) counts as
+         unsuccessful and WOULD relaunch — stop the app from outside with
+         `launchctl bootout gui/$UID/com.driveoffload.app` instead, which is
+         what drive-hub's Stop action does. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <!-- Reference template only — install-app.sh generates the real plist
          from $HOME at install time. -->
