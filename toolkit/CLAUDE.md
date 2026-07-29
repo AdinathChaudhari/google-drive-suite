@@ -48,9 +48,9 @@ src/gdrive_toolkit/
     │                     this toolkit's own downloader/uploader from the
     │                     resolved repo root, then merges in whatever's in
     │                     the user's hub_tools.json (see below)
-    ├── hub_core.py       stdlib-only install/status/launch logic, no
-    │                     flask/rumps import — unit-tested with every probe
-    │                     injected
+    ├── hub_core.py       stdlib-only install/status/launch/stop/restart
+    │                     logic, no flask/rumps import — unit-tested with
+    │                     every probe injected
     └── menubar.py        the rumps front-end; imports rumps lazily so this
                           module stays importable headless
 ```
@@ -114,6 +114,26 @@ menu-bar `.app`.
 `hub_core.py` itself doesn't know or care where a tool dict came from — this
 split is what keeps the hub's core logic free of any account-specific or
 installation-specific facts.
+
+## Lifecycle control for peer menu-bar apps
+
+A registry entry with `kind: "menubar"` **and** a `launchd_label` (right now
+just the suite's `drive-offload`) renders as a **submenu** of Start / Restart /
+Stop rather than a single clickable row — see `hub_core.stop` / `.restart` and
+`menubar._is_controllable_menubar`. Two non-obvious rules, both load-bearing:
+
+1. **Stop is `launchctl bootout`, never `launchctl kill`.** Both agents use
+   `KeepAlive = {SuccessfulExit: false}` so their own Quit buttons work, and
+   that predicate counts death-by-signal as *unsuccessful* — a SIGTERM gets
+   relaunched. See **D-012** in `docs/DECISIONS.md` for the measured proof.
+2. **Status does not gate the three actions**, only the parent row's title.
+   A wedged app reports RUNNING while ignoring clicks, and a cleanly-quit one
+   reports STOPPED while its job is still loaded; gating on status is exactly
+   how you lock yourself out of the recovery path. `stop()` deliberately never
+   calls `status()` at all.
+
+The whole point of these living in the hub is that they work from *outside* the
+target app — the case you need them for is a menu bar that no longer opens.
 
 ## Identity strings
 

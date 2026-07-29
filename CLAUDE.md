@@ -86,7 +86,8 @@ theming.
 
 - [`toolkit/CLAUDE.md`](toolkit/CLAUDE.md) — package layout, extras/entry
   points, the hub registry loader (including how it detects this suite
-  layout and adds computed built-ins for the sibling components).
+  layout and adds computed built-ins for the sibling components), and the
+  Start/Restart/Stop lifecycle control it offers for peer menu-bar apps.
 - [`drivecast/CLAUDE.md`](drivecast/CLAUDE.md) — stack, sections
   architecture, the Osho-plugin note above.
 - [`drive-offload/CLAUDE.md`](drive-offload/CLAUDE.md) — the flat-layout
@@ -98,5 +99,5 @@ theming.
 
 No single command runs everything — each component keeps its own venv and
 suite (see [CONTRIBUTING.md](CONTRIBUTING.md) for the exact commands). The
-toolkit's 56-test suite is the fastest signal that a docs/CSS-only change
+toolkit's 67-test suite is the fastest signal that a docs/CSS-only change
 hasn't touched anything it shouldn't have.
