@@ -53,6 +53,7 @@ than no entry.
 | [D-012](#d-012--keepalive-true-silently-breaks-every-quit-button) | `KeepAlive: true` silently breaks every Quit button | Adopted | suite |
 | [D-013](#d-013--selected-drive-order-is-data-not-presentation) | Selected-drive *order* is data, not presentation | Adopted | drivecast |
 | [D-014](#d-014--never-key-a-saveablestateprovider-on-state-you-want-to-reset) | Never key a `SaveableStateProvider` on state you want to reset | Adapted | drivecast-app |
+| [D-015](#d-015--on-android-a-cancelled-focus-enter-consumes-the-d-pad-press) | On Android, a cancelled focus-enter *consumes* the D-pad press | Adapted | drivecast-app |
 
 ---
 
@@ -398,3 +399,54 @@ than no entry.
   `focusRestorer`. The focus-reset half of this is a Compose 1.7 behavior, and
   the pinned-BOM constraint in `drivecast-app/CLAUDE.md` is what keeps it
   stable; verify against the new runtime before trusting the reasoning above.
+
+### D-015 — On Android, a cancelled focus-enter *consumes* the D-pad press
+**Status:** Adapted · **When:** 2026-08-01
+
+- **Hit** — on any home tab with a Continue Watching shelf, the D-pad chain
+  skipped lanes: DOWN off the continue card landed on a grid tile instead of
+  the chips row, and UP off the first tile row jumped past both the chips row
+  and the shelf straight to the tab bar. A tab with no shelf was perfectly
+  symmetric, which made it look intermittent. Measured on the real stick by
+  driving `adb shell input keyevent` and dumping the focused node per press;
+  reproduced identically on the commit before the sort/group work, so it was
+  not a regression from that.
+- **Learned** — two framework behaviors in the pinned Compose 1.7.2, both
+  contrary to what `FocusKit.kt`'s own comment assumed:
+  1. `AndroidComposeView`'s key-input path is
+     `focusSearch(dir, rect) { it.requestFocus(dir) ?: true } ?: true`. A
+     **Cancelled** custom-enter result is `null`, which is coerced to `true` —
+     "handled". So returning `FocusRequester.Cancel` from a `focusRestorer`
+     enter lambda does not fall through to the next candidate and is not a
+     "harmless no-op": it consumes the press and strands focus wherever the
+     enter lambda's own `requestFocus()` probe last committed it.
+  2. `TwoDimensionalFocusSearch.searchChildren` *removes* a deactivated
+     candidate group from the candidate set when its subtree search yields
+     nothing, then continues to the next candidate. A lane that is mid-scroll
+     or recycled presents exactly that shape — its group node still passes the
+     `isAttached` filter while its children fail `isPlaced && isAttached`.
+  The shelf is what arms both: it is ~596px tall, so with the `0.30f` pivot one
+  or two DOWN presses push the header stack out of the composed window exactly
+  when a search tries to enter it. A shelf-less tab keeps its controls row as
+  the topmost grid item, which holds start focus and therefore has a *saved*
+  restorer hash — the success path, which works.
+- **Did** — `tvFocusRestorer` no longer returns `Cancel` on a failed probe, and
+  both header lanes (shelf `LazyRow`, controls `Row`) moved off `tvFocusRestorer`
+  onto `tvFocusEnterFallback`, which re-resolves its target live. On top of that,
+  three UP/DOWN hops are wired explicitly via `tvDpadHop` rather than trusting
+  focus search: shelf→controls, controls→shelf, and first-tile-row→controls (the
+  last two scroll the target back into view first). The pure decision table lives
+  in `ui/home/FocusLanes.kt` with 14 unit tests. Verified on-device afterwards:
+  the full chain is symmetric in both directions and every press moves focus.
+- **Where** — `drivecast-app/app/src/main/java/com/drivecast/tv/ui/common/FocusKit.kt`
+  (`tvFocusRestorer`, `tvDpadHop`, `PositionFocusedItemInLazyLayout`),
+  `ui/home/FocusLanes.kt`, `ui/home/HomeScreen.kt` (the three hop call sites).
+- **Revisit when** — the compose BOM moves off 2024.09.x. Both behaviors above
+  are 1.7.2 specifics read out of that exact AAR; `tvDpadHop` is a workaround
+  whose whole reason to exist may evaporate (or change shape) on a newer
+  foundation. Re-run the on-device matrix before trusting either way. Also note
+  the standing risk a review raised and the device did not reproduce:
+  `requestFocus()` returns `void` in 1.7.2, so a hop that consumes a press
+  cannot actually prove focus moved — every path tested moved focus, but a
+  future lane inserted between shelf/controls/tiles could turn that into a dead
+  press if its resolvers are not updated.
