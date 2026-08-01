@@ -1304,12 +1304,19 @@ class Scanner:
         `scope` limits which drives are re-walked on the Drive API (per-drive
         refresh); the library is ALWAYS rebuilt from the cached raw records of
         every selected drive, so cross-drive grouping stays correct. No scope
-        (or a scope covering everything) is a full refresh.
+        (None) is a full refresh; an explicit empty scope walks nothing and
+        rebuilds from cache only.
         """
         selected = list(selected_drives)
         drive_sections = drive_sections or {}
         drive_hints = drive_hints or {}
-        scope = [d for d in (scope or selected) if d in selected] or selected
+        # scope=None -> full refresh. An EXPLICIT empty scope means "walk
+        # nothing": prune + rebuild the library from the scan cache only
+        # (how a deselected drive's titles leave without touching Drive).
+        if scope is None:
+            scope = list(selected)
+        else:
+            scope = [d for d in scope if d in selected]
         # First run after upgrade / cleared cache: an unscanned drive with no
         # cache entry would lose its titles in the rebuild — escalate to full.
         if any(not self.cache.has(d) for d in selected if d not in scope):

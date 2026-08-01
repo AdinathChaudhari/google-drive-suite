@@ -17,6 +17,13 @@ Built with Kotlin, Jetpack Compose for TV (`androidx.tv`), and Media3 / ExoPlaye
   crowds out the grid below — a section-scoped "Continue Watching" row, a category filter
   (All / Movies / TV Shows / Documentaries / …) on Entertainment, and a poster-tile grid —
   no more one long scroll.
+- **Sort & group** — a **Sort** pill in the controls row cycles **Recently added**, **A–Z** and
+  **Year**; picking the key you're already on flips its direction (A–Z ⇄ Z–A, newest ⇄ oldest).
+  A **Group** pill on Entertainment splits the grid into labelled category groups (Movies, TV
+  Shows, Documentaries, …, then **Other**) with the sort applied inside each one. Titles missing
+  the sort field sort last in either direction. Both choices persist across restarts, and
+  grouping steps aside while a category chip is filtering (the chip already narrowed the grid to
+  one group).
 - **Detail** — movie play / start-over (plus an **Extras** section listing any featurettes /
   bonus clips, each played as a single item); for shows, a **scrollable season rail** (so a
   show with many seasons never hides its episodes) over an episode list with watched and

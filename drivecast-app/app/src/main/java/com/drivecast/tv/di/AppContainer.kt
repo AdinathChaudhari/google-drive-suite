@@ -14,6 +14,7 @@ import com.drivecast.tv.data.KeepAwakeController
 import com.drivecast.tv.data.LibraryRepository
 import com.drivecast.tv.data.ServerConfigStore
 import com.drivecast.tv.data.TokenHolder
+import com.drivecast.tv.ui.home.SortAndGroupPrefs
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
@@ -86,4 +87,11 @@ class AppContainer(context: Context) {
     // overwritten after every successful background refresh.
     @Volatile
     var homeCache: HomeData? = null
+
+    // Same cache-first trick for the persisted sort/group prefs: DataStore has no synchronous
+    // read, so without this a recreated HomeViewModel would render one frame in default order
+    // and then visibly re-sort when the async read lands. Written on first DataStore read and
+    // on every user change.
+    @Volatile
+    var viewPrefs: SortAndGroupPrefs? = null
 }

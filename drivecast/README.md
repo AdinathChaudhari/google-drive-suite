@@ -52,7 +52,11 @@ orphaned posters pruned), and show episode lists are updated.
 **Per-drive refresh.** You usually know which drive you just uploaded to, so
 you don't have to rescan everything: hover a drive in **Settings** for its ⟳
 button, or use the menu-bar **Refresh one drive** submenu (the header ⟳ stays
-a full refresh). Under the hood every scan stores each drive's raw records in
+a full refresh). The same scoping applies automatically when you *change* which
+drives are included — **adding a drive walks only that drive**, not your whole
+library, and a drive whose tab assignment changed is walked with it in the same
+pass. *Removing* a drive walks nothing at all: its titles leave via a
+cache-only rebuild that never touches Drive. Under the hood every scan stores each drive's raw records in
 `data/scan_cache.json` and the library is rebuilt from the cache of **all**
 selected drives — so shows spanning two drives ("Part 1"/"Part 2") stay merged
 correctly no matter which drive you refresh. A drive whose scan errors keeps
@@ -365,10 +369,12 @@ Prefer no terminal? drivecast ships a native macOS **menu-bar app**. It runs the
 same server in-process and puts a small **☁** icon in your menu bar:
 
 - a status line — `drivecast: running on :8737` (or `setup needed` if rclone
-  isn't configured yet, or `scanning… n/total` while a refresh runs)
+  isn't configured yet, `scanning… n/total` while a refresh runs, or
+  `updating library…` during a cache-only rebuild, which has nothing to count)
 - **Open drivecast** — opens `http://127.0.0.1:8737/` in your browser
 - **Drives to include** — a submenu listing every Shared Drive as a checkable
-  item; toggling one updates `selected_drives` and kicks a background refresh
+  item; toggling one updates `selected_drives` and kicks a refresh scoped to
+  just that drive (checking it on), or a cache-only rebuild (checking it off)
 - **Refresh library** — rescans the selected drives now
 - **Auto-refresh on launch** — checkable toggle (`auto_refresh_on_startup`)
 - **Quit** — cleanly shuts the server down and exits

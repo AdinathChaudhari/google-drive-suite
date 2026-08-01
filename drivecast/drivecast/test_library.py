@@ -1236,6 +1236,74 @@ def test_added_at_stable_across_partial_refresh(tmp_path):
     assert lib.get("mv1")["added_at"] == first
 
 
+def test_empty_scope_rebuild_prunes_removed_drive_without_walk(tmp_path, monkeypatch):
+    tree = _two_drive_tree()
+    lib = library.Library(path=str(tmp_path / "library.json"))
+    cache = _cache(tmp_path)
+    scanner = library.Scanner(_FakeScanAPI(tree), _DisabledTMDB(), lib, throttle=0,
+                              cache=cache)
+    asyncio.run(scanner.scan(["drv1", "drv2"], drive_sections=_ent("drv1", "drv2")))
+    assert set(cache.drive_ids()) == {"drv1", "drv2"}
+
+    async def _no_walk(*a, **kw):
+        raise AssertionError("walked")
+
+    monkeypatch.setattr(scanner, "_scan_drive", _no_walk)
+    asyncio.run(scanner.scan(["drv1"], scope=[], drive_sections=_ent("drv1")))
+    assert {t["id"] for t in lib.titles_list()} == {"mv1"}   # drv2's title left
+    assert cache.drive_ids() == ["drv1"]                     # cache pruned
+    assert scanner.status["scope"] == []
+    assert scanner.status["total"] == 0
+    assert scanner.status["error"] is None
+
+
+def test_empty_scope_escalates_when_selected_drive_uncached(tmp_path):
+    # Fresh cache (never scanned): an empty scope must escalate to a real walk
+    # of drv1, not rebuild from an empty cache and drop it.
+    tree = _two_drive_tree()
+    lib = library.Library(path=str(tmp_path / "library.json"))
+    scanner = library.Scanner(_FakeScanAPI(tree), _DisabledTMDB(), lib, throttle=0,
+                              cache=_cache(tmp_path))
+    asyncio.run(scanner.scan(["drv1"], scope=[], drive_sections=_ent("drv1")))
+    assert scanner.status["scope"] == ["drv1"]
+    assert {t["id"] for t in lib.titles_list()} == {"mv1"}
+
+
+def test_readded_drive_rewalks_fresh_content(tmp_path):
+    tree = _two_drive_tree()
+    lib = library.Library(path=str(tmp_path / "library.json"))
+    scanner = library.Scanner(_FakeScanAPI(tree), _DisabledTMDB(), lib, throttle=0,
+                              cache=_cache(tmp_path))
+    asyncio.run(scanner.scan(["drv1", "drv2"], drive_sections=_ent("drv1", "drv2")))
+
+    # Deselect drv2 via a cache-only rebuild.
+    asyncio.run(scanner.scan(["drv1"], scope=[], drive_sections=_ent("drv1")))
+    assert {t["id"] for t in lib.titles_list()} == {"mv1"}
+
+    # New content lands on drv2 while it's deselected.
+    tree["drv2"].append(rawfolder("m3F", "Sandsea (2021)"))
+    tree["m3F"] = [rawfile("mv3", "Sandsea.2021.2160p.mkv", size=10)]
+
+    # Re-add drv2, scoped: it must be genuinely re-walked, not served stale.
+    asyncio.run(scanner.scan(["drv1", "drv2"], scope=["drv2"],
+                             drive_sections=_ent("drv1", "drv2")))
+    assert {t["id"] for t in lib.titles_list()} == {"mv1", "mv2", "mv3"}
+
+
+def test_removing_last_drive_empties_library(tmp_path):
+    tree = _two_drive_tree()
+    lib = library.Library(path=str(tmp_path / "library.json"))
+    cache = _cache(tmp_path)
+    scanner = library.Scanner(_FakeScanAPI(tree), _DisabledTMDB(), lib, throttle=0,
+                              cache=cache)
+    asyncio.run(scanner.scan(["drv1"], drive_sections=_ent("drv1")))
+    assert {t["id"] for t in lib.titles_list()} == {"mv1"}
+
+    asyncio.run(scanner.scan([], scope=[], drive_sections={}))
+    assert lib.titles_list() == []
+    assert cache.drive_ids() == []
+
+
 def test_scan_cache_get_returns_deep_copies(tmp_path):
     from drivecast.scan_cache import ScanCache
     cache = ScanCache(path=str(tmp_path / "sc.json"))
