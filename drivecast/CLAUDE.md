@@ -39,6 +39,18 @@ Local web app that streams video/audio straight from Google **Shared Drives** �
 - Dispatch: `Library._classify` routes courses→`courses.classify_course_drive`, podcasts→`playlists.classify_playlist_drive`, plugins→their `classify` fn, else falls through to the built-in entertainment classifiers.
 - Design doc: `SECTIONS_DESIGN.md`.
 
+## Refresh scoping (three modes — don't collapse them)
+`AppState.start_refresh(scope=…)` / `Scanner.scan(..., scope=…)` distinguish:
+- `scope=None` — full refresh, walk every selected drive.
+- `scope=[ids…]` — walk only those drives (per-drive refresh). The library is **always** rebuilt from the cached records of *all* selected drives, so cross-drive show merges stay correct.
+- `scope=[]` (explicit empty) — **cache-only rebuild**: walk nothing, re-derive `library.json` from `data/scan_cache.json`. This is how a deselected drive's titles leave without touching Drive.
+
+A non-empty scope that filters down to nothing (every named drive is unselected) returns `False` and starts nothing — it must NOT silently downgrade into the cache-only rebuild. The one exception is the mid-scan drain (`_drain_pending_scope`, `_draining=True`), where "nothing left selected" *is* the removal the queued rebuild exists to apply.
+
+`POST /api/settings` scopes to `added_drives ∪ section_changed` (a union — the Settings UI sends an add and its tab assignment in ONE request, and an `if/elif` here silently dropped the add). Removals and a pure **reorder** both fall through to the cache-only rebuild: drive order IS meaningful, because `Scanner.scan` builds `all_records` with `for drive_id in selected` and `group_seasons` merges same-named seasons across drives first-seen-wins — see `docs/DECISIONS.md` D-013. Never revert any of this to full-replace-only scans.
+
+A cache-only rebuild reports `total=0`, which is not "0 of 0 to scan" — both the web UI (`static/app.js` `pollScan`) and the menu bar (`drivecast_menubar.py` `_poll`) render "updating library…" for it instead of a progress fraction. New consumers of `/api/refresh/status` need the same guard.
+
 ## Conventions & gotchas
 - Pure classifier functions do no I/O — they operate on the walked node trees the scanner builds; keep them side-effect-free (plugins get the same shapes).
 - Read-only on Drive: only the local cache (`library.json`, `data/scan_cache.json`, posters, `data/history.json`) is written.
