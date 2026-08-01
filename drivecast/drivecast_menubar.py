@@ -256,8 +256,12 @@ def _run_app(server, port, setup_ok, url):
                 self._auto_refresh = bool(settings.get("auto_refresh_on_startup"))
             status_text = None
             if status and status.get("running"):
-                status_text = "drivecast: scanning… (%d/%d)" % (
-                    status.get("scanned", 0), status.get("total", 0))
+                total = status.get("total", 0)
+                # A cache-only rebuild (no Drive walk) reports total=0 — that's
+                # not "0 of 0 to scan", so don't render it as scan progress.
+                status_text = (
+                    "drivecast: updating library…" if not total
+                    else "drivecast: scanning… (%d/%d)" % (status.get("scanned", 0), total))
             self._rebuild_menu(status_text)
 
         # ---- dispatch ----

@@ -4,6 +4,7 @@ The DriveAPI's low-level GET is stubbed to raise, so any test that accidentally
 reaches the Drive API fails loudly. Playback and library/settings endpoints must
 answer from the cached library alone.
 """
+import asyncio
 import json
 
 import pytest
@@ -356,14 +357,27 @@ def test_refresh_status_shape(client):
 
 
 def _capture_refresh(client):
-    """Stub start_refresh on the live AppState, capturing the scope."""
+    """Stub start_refresh on the live AppState, capturing the scope.
+
+    Mirrors the real method's return contract (rather than a hardcoded
+    `True`) so `refresh_started`/`started` assertions downstream can actually
+    fail: None scopes to a full refresh (True iff drives are selected), an
+    explicitly empty scope is always a cache-only rebuild (True), and a
+    non-empty scope only starts if at least one named drive is selected.
+    """
     calls = []
+    state = client.app.state.dc
 
-    def _fake(scope=None):
+    def _fake(scope=None, _draining=False):
         calls.append(scope)
-        return True
+        drives = state.cfg.get("selected_drives") or []
+        if scope is None:
+            return bool(drives)
+        if not scope:
+            return True
+        return bool([d for d in scope if d in drives])
 
-    client.app.state.dc.start_refresh = _fake
+    state.start_refresh = _fake
     return calls
 
 
@@ -409,6 +423,162 @@ def test_settings_drive_sections_roundtrip_and_scoped_refresh(client):
     # Changing drv1's section triggered a refresh scoped to just drv1.
     assert calls == [["drv1"]]
     assert client.get("/api/settings").json()["drive_sections"] == {"drv1": "podcasts"}
+
+
+def test_settings_add_drive_scopes_refresh_to_added(client):
+    calls = _capture_refresh(client)
+    r = client.post("/api/settings", json={"selected_drives": ["drv1", "drv2"]})
+    assert r.status_code == 200
+    assert r.json()["refresh_started"] is True
+    assert calls == [["drv2"]]   # only the added drive is walked, not drv1
+
+
+def test_settings_remove_drive_kicks_cache_only_rebuild(client):
+    calls = _capture_refresh(client)
+    r = client.post("/api/settings", json={"selected_drives": []})
+    assert r.status_code == 200
+    assert calls == [[]]   # empty-scope rebuild requested, NOT None/full and NOT silence
+    assert r.json()["refresh_started"] is True
+
+
+def test_settings_swap_drive_single_scoped_pass(client):
+    calls = _capture_refresh(client)
+    r = client.post("/api/settings", json={"selected_drives": ["drv2"]})
+    assert r.status_code == 200
+    # Exactly one refresh, scoped to the added drive; the removal (drv1)
+    # rides that scan's built-in prune+rebuild.
+    assert calls == [["drv2"]]
+    assert r.json()["refresh_started"] is True
+
+
+def test_settings_add_and_section_change_union_scope(client):
+    # Baseline: drv1 and drv2 already selected, neither tab-assigned yet.
+    client.post("/api/settings", json={
+        "tabs": [{"key": "podcasts", "label": "Podcasts", "behavior": "podcasts"}]})
+    client.post("/api/settings", json={"selected_drives": ["drv1", "drv2"]})
+    calls = _capture_refresh(client)
+    # This POST only-adds drv3 and only-retabs drv1 — added_drives={drv3} and
+    # section_changed={drv1} are disjoint, so a union bug (either set winning
+    # over the other) drops one of them instead of merging both.
+    r = client.post("/api/settings", json={
+        "selected_drives": ["drv1", "drv2", "drv3"],
+        "drive_sections": {"drv1": "podcasts"}})
+    assert r.status_code == 200
+    assert r.json()["refresh_started"] is True
+    assert calls == [["drv1", "drv3"]]
+
+
+def test_settings_reorder_drives_kicks_cache_only_rebuild(client):
+    # Order IS meaningful: Scanner.scan walks `selected_drives` in list order
+    # (library.py:1370) and group_seasons merges cross-drive same-named
+    # seasons first-seen-wins (library.py:543-650), so a pure reorder can flip
+    # which drive's year/thumbnail/drive_id wins a merged show record. A
+    # reorder must still rebuild — but only from cache, no Drive re-walk.
+    client.post("/api/settings", json={"selected_drives": ["drv1", "drv2"]})
+    calls = _capture_refresh(client)
+    r = client.post("/api/settings", json={"selected_drives": ["drv2", "drv1"]})
+    assert r.status_code == 200
+    assert calls == [[]]   # cache-only rebuild, not a full walk and not silence
+    assert r.json()["refresh_started"] is True
+
+
+def test_settings_orphaned_removed_drive_still_rebuilds(client):
+    # HTTP-path twin of FINDING A (the drain-path regression above): a drive
+    # can end up both in `removed_drives` AND `section_changed` in the SAME
+    # POST — here, drv2 is deselected while its tab is simultaneously
+    # deleted, orphaning its now-stale drive_sections entry (see the
+    # reconciliation block after the "tabs" handling in server.py). scope
+    # (added_drives | section_changed) is then non-empty but names only
+    # drv2, which is no longer selected — start_refresh(scope=["drv2"])
+    # correctly returns False, but the library still owes a cache-only
+    # rebuild to drop drv2's titles (removed_drives=["drv2"]). An if/elif
+    # dispatch that only checks `if scope:` never reaches that rebuild.
+    client.post("/api/settings", json={
+        "tabs": [{"key": "podcasts", "label": "Podcasts", "behavior": "podcasts"}]})
+    client.post("/api/settings", json={"selected_drives": ["drv1", "drv2"]})
+    client.post("/api/settings", json={"drive_sections": {"drv2": "podcasts"}})
+    calls = _capture_refresh(client)
+    r = client.post("/api/settings", json={
+        "selected_drives": ["drv1"],
+        "tabs": []})
+    assert r.status_code == 200
+    assert r.json()["refresh_started"] is True
+    # First attempt is the scoped call (drv2, no longer selected -> False),
+    # then the dispatch falls through to the cache-only rebuild it still owes.
+    assert calls == [["drv2"], []]
+
+
+def test_removal_during_running_scan_queues_rebuild(client):
+    state = client.app.state.dc
+    state.scanner.status["running"] = True
+    r = client.post("/api/settings", json={"selected_drives": []})
+    assert r.status_code == 200
+    assert r.json()["refresh_started"] is False
+    assert state._pending_rebuild is True
+
+    state.scanner.status["running"] = False
+    calls = []
+
+    def _fake(scope=None, _draining=False):
+        calls.append(scope)
+        return True
+
+    state.start_refresh = _fake
+    state._drain_pending_scope(None)
+    assert calls == [[]]   # the queued rebuild is re-kicked
+
+
+def test_start_refresh_nonempty_scope_all_unselected_starts_nothing(client):
+    # An explicit, non-empty scope that filters down to nothing (every named
+    # drive is unselected) must NOT be treated as an explicit-empty
+    # cache-only rebuild — it should start nothing, same as before per-drive
+    # scoping existed.
+    state = client.app.state.dc
+    assert state.start_refresh(scope=["not-selected"]) is False
+    assert state._refresh_task is None
+    assert state._pending_scope == set()
+    assert state._pending_rebuild is False
+
+
+def test_drain_degrades_to_cache_only_when_queued_drive_fully_deselected(client):
+    # FINDING A regression: a scope queued mid-scan (e.g. a section change on
+    # drv2) must not be silently dropped just because drv2 also got fully
+    # deselected before the scan finished and drains. The removal still needs
+    # the library rebuilt from cache, so the drain re-kick must degrade to
+    # the cache-only rebuild (empty scope) rather than hit the "non-empty
+    # scope that filters to nothing" early return meant for external calls.
+    # cfg is set directly (not via /api/settings) so no real scan is ever
+    # kicked off the TestClient's own event loop before the scenario below.
+    state = client.app.state.dc
+    state.cfg["selected_drives"] = ["drv1", "drv2"]
+
+    calls = []
+
+    async def _fake_scan(selected_drives, scope=None, **kw):
+        calls.append(list(scope) if scope is not None else None)
+        return None
+
+    state.scanner.scan = _fake_scan
+
+    async def _run():
+        # A scope for drv2 arrives while a scan is already running -> queued.
+        state.scanner.status["running"] = True
+        assert state.start_refresh(scope=["drv2"]) is False
+        assert state._pending_scope == {"drv2"}
+        assert state._pending_rebuild is True
+        assert state._refresh_task is None   # nothing has run yet
+
+        # drv2 is fully deselected before the running scan finishes.
+        state.cfg["selected_drives"] = ["drv1"]
+        state.scanner.status["running"] = False
+
+        # The running scan's done-callback fires and drains the queue.
+        state._drain_pending_scope(None)
+        assert state._refresh_task is not None
+        await state._refresh_task
+
+    asyncio.run(_run())
+    assert calls == [[]]   # degraded to a cache-only rebuild, not dropped
 
 
 def test_watched_map_progress_shape(client):
