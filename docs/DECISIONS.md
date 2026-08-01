@@ -51,6 +51,8 @@ than no entry.
 | [D-010](#d-010--the-100-gb-shared-drive-cap-is-googles-not-ours) | The 100 GB shared-drive cap is Google's, not ours | Adapted | drive-offload |
 | [D-011](#d-011--the-design-tokens-are-vendored-not-shared-at-runtime) | The design tokens are vendored, not shared at runtime | Adapted | suite |
 | [D-012](#d-012--keepalive-true-silently-breaks-every-quit-button) | `KeepAlive: true` silently breaks every Quit button | Adopted | suite |
+| [D-013](#d-013--selected-drive-order-is-data-not-presentation) | Selected-drive *order* is data, not presentation | Adopted | drivecast |
+| [D-014](#d-014--never-key-a-saveablestateprovider-on-state-you-want-to-reset) | Never key a `SaveableStateProvider` on state you want to reset | Adapted | drivecast-app |
 
 ---
 
@@ -319,3 +321,80 @@ than no entry.
   `bootout` only lasts until the next login, since `RunAtLoad` bootstraps the
   agent again; a persistent off switch would need `launchctl disable`, which
   writes to a system-wide override database and is a different tool.
+
+---
+
+### D-013 — Selected-drive *order* is data, not presentation
+**Status:** Adopted · **When:** 2026-08-01
+
+- **Hit** — making "add a drive" rescan only that drive (instead of the whole
+  library) meant replacing an order-sensitive `new_drives != old_drives` check
+  in `POST /api/settings` with a set diff of added/removed ids. That silently
+  reclassified a pure **reorder** of `selected_drives` as a no-op: config was
+  saved, nothing was rebuilt. The comment written to justify it claimed drive
+  order "isn't meaningful downstream, only membership".
+- **Learned** — that claim was false, and a probe against the real code
+  disproved it. `Scanner.scan` builds `all_records` with
+  `for drive_id in selected` — *list* order — and `group_seasons` merges
+  same-named seasons across drives **first-seen-wins** through its `order`
+  list. Two drives each holding `The Ladle Season 1` / `Season 2` produce, for
+  order `[A, B]`: `drive_id=drvA`, `year=2019`, `_thumb=th_drvA`,
+  `source_drives=[drvA, drvB]`; for `[B, A]`: `drvB`, `2022`, `th_drvB`,
+  `[drvB, drvA]`. The group **id** is stable, so nothing looks broken — but the
+  merged record's owning drive, year and poster source all flip. Reordering is
+  a real content change that happens to walk zero drives.
+- **Did** — `order_changed` is tracked separately from added/removed and falls
+  through to the **cache-only rebuild** (`scope=[]`): no Drive walk, but the
+  library is re-derived so the merge resolves in the new order. Removals take
+  the same path — that is what makes a deselected drive's titles leave without
+  touching Drive. The general rule this bought: a scoped refresh answers "what
+  must be re-*walked*", never "whether a rebuild is owed"; those are separate
+  questions and the settings route now dispatches on both.
+- **Where** — `drivecast/drivecast/server.py` § `api_post_settings` (the
+  `added_drives`/`removed_drives`/`order_changed` block and the refresh
+  dispatch at the end); `drivecast/drivecast/library.py:1370` (`for drive_id in
+  selected`), `library.py:543-650` (`group_seasons`, `order` at `:556`/`:592`);
+  `AppState.start_refresh`'s three scope modes in `server.py`.
+- **Revisit when** — the library gains an explicit per-drive priority field. A
+  real priority would make list order presentational again, and *then* a
+  reorder could legitimately skip the rebuild.
+
+### D-014 — Never key a `SaveableStateProvider` on state you want to reset
+**Status:** Adapted · **When:** 2026-08-01
+
+- **Hit** — the Fire TV home grid's new Sort/Group controls reorder every tab's
+  list at once, but each tab holds its own `rememberSaveable` `LazyGridState`
+  inside `tabStateHolder.SaveableStateProvider(idx)`. After a reorder, an
+  off-screen tab's saved scroll offset points into a list that no longer
+  exists. The obvious fix — fold a `reorderEpoch` into the provider key so a
+  pick invalidates every tab's saved state — compiled, passed its unit tests,
+  and broke two things that no JVM test could see.
+- **Learned** — `SaveableStateProvider` calls
+  `Composer.startReusableGroup(reuseKey, key)`, i.e. **`ReusableContent`**
+  semantics: on a key change the group is *reused*, every `remember` recomputes,
+  and LayoutNodes are reused via `resetModifierState()` / `onReset()`.
+  `FocusTargetNode.onReset` force-clears focus when its state was
+  Active/Captured — so every Sort pick reset the tab's `FocusRequester`s and the
+  focus of the very pill the user had just pressed, leaving the D-pad dead
+  (nothing re-requests focus: the initial-focus effect is gated by a
+  `focusedOnce` flag that is already true). Second failure: the epoch was a
+  plain `remember` while every state keyed on it was `rememberSaveable`, so a
+  back-nav or process death reset the epoch to 0 while the Bundle still held
+  entries saved under epoch 1 — the grid lost its restored position, and a
+  later pick re-hit the stranded entry and restored a *stale* offset.
+- **Did** — the provider is keyed on `idx` **alone**. The epoch survives only
+  as a `LaunchedEffect` key that `removeState()`s the tabs that are *not* on
+  screen; the on-screen tab keeps its live subtree (and its focus) and is
+  snapped to top by its own `snapshotFlow` effect. Two guards fell out of the
+  lifetimes: the effect no-ops while `reorderEpoch == 0`, so a fresh mount
+  can't wipe just-restored state, and `maxTabCount` is `rememberSaveable`
+  (matching the saveable holder it guards) so a tab list that shrank while the
+  app was dead can't strand an entry above a freshly-initialised high-water
+  mark.
+- **Where** — `drivecast-app/app/src/main/java/com/drivecast/tv/ui/home/HomeScreen.kt`
+  — `reorderEpoch` (`:147`), the purge `LaunchedEffect` + `maxTabCount`
+  (`:340`), `tabStateHolder.SaveableStateProvider(idx)` (`:485`).
+- **Revisit when** — the app moves to Compose ≥1.8 / a tv-material that changes
+  `focusRestorer`. The focus-reset half of this is a Compose 1.7 behavior, and
+  the pinned-BOM constraint in `drivecast-app/CLAUDE.md` is what keeps it
+  stable; verify against the new runtime before trusting the reasoning above.
