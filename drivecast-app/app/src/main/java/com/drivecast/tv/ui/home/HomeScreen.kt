@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -116,6 +117,7 @@ import androidx.tv.material3.SurfaceDefaults
 import androidx.tv.material3.Text
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.drop
 
 private const val ENTERTAINMENT = "entertainment"
 
@@ -129,6 +131,20 @@ fun HomeScreen(
     val vm: HomeViewModel = viewModel(factory = HomeViewModel.factory(container))
     val state by vm.state.collectAsStateWithLifecycle()
     val pendingDismiss = remember { mutableStateOf<ContinueItem?>(null) }
+    val overlayRequest = remember { mutableStateOf<HomeOverlay?>(null) }
+    // The Group overlay must show the EFFECTIVE group (post category-chip suppression) as
+    // selected, matching the pill it was opened from — not the raw pref, which would disagree
+    // with the pill during suppression. Only known at the call site (inside the per-tab scope
+    // below), so it's stashed here at open-time. Same MutableState-reference trick as
+    // overlayRequest: read only inside SortGroupOverlayHost, so opening the menu never
+    // recomposes HomeScreen itself.
+    val overlayGroupContext = remember { mutableStateOf(GroupKey.NONE) }
+    // Bumped only by an actual Sort/Group pick below (never by the async prefs load in
+    // HomeViewModel.init, which would otherwise fire this exact same frame on cold start and
+    // discard a just-restored scroll position before the user ever touched either menu). See
+    // HomeContent's reorderEpoch LaunchedEffect for what this bump drives (purging every
+    // off-screen tab's saved grid state so it starts fresh at the top next time it's visited).
+    val reorderEpoch = remember { mutableIntStateOf(0) }
 
     // Refresh-on-return from Settings: Navigation-Compose scopes each destination's
     // ViewModelStore (and SavedStateHandle) to its own NavBackStackEntry, and that entry *is*
@@ -190,6 +206,14 @@ fun HomeScreen(
                             onRefresh = { vm.refresh() },
                             onOpenSettings = onOpenSettings,
                             posterUrl = { key -> container.repository.posterUrl(key) },
+                            sort = state.sort,
+                            group = state.group,
+                            reorderEpoch = reorderEpoch.intValue,
+                            onOpenSortMenu = { overlayRequest.value = HomeOverlay.SORT },
+                            onOpenGroupMenu = { effectiveGroup ->
+                                overlayGroupContext.value = effectiveGroup
+                                overlayRequest.value = HomeOverlay.GROUP
+                            },
                         )
                     }
                 }
@@ -205,6 +229,38 @@ fun HomeScreen(
                     vm.dismissContinueItem(item.fileId)
                 },
                 onCancel = { pendingDismiss.value = null },
+            )
+
+            // Same MutableState-reference pattern as DismissDialogHost: only the host reads
+            // .value (request's and groupContext's), so opening the sort/group overlay never
+            // recomposes the grid.
+            SortGroupOverlayHost(
+                request = overlayRequest,
+                sort = state.sort,
+                groupContext = overlayGroupContext,
+                // Every real pick reorders every tab, not just the one on screen — bump the
+                // epoch here (the one place both menus funnel through) rather than diffing
+                // state.sort/group downstream, so this can never fire on the load-time jump
+                // from HomeUiState()'s defaults to the persisted prefs. Re-picking the group
+                // that's already set is a genuine no-op (only two values exist, no direction to
+                // flip like Sort has) — skip both the epoch bump and the prefs write for it,
+                // rather than needlessly resetting every tab's scroll for nothing.
+                onPickSort = { key -> reorderEpoch.intValue++; vm.pickSort(key) },
+                onPickGroup = { key ->
+                    // Compare against the EFFECTIVE group stashed in overlayGroupContext (what the
+                    // overlay is actually highlighting), not the raw state.group — under
+                    // suppression those two differ, and guarding on the raw pref would misfire in
+                    // both directions (mutate on the highlighted pick, silently drop the other).
+                    if (key != overlayGroupContext.value) {
+                        // …but bump the epoch only when the PREF actually moves. Under suppression
+                        // (chip active, pref already CATEGORY, overlay showing None) picking
+                        // "Category" is a legitimate non-no-op input — it must reach the store —
+                        // yet nothing on screen reorders, so purging every other tab's scroll for
+                        // it would be pure collateral damage.
+                        if (key != state.group) reorderEpoch.intValue++
+                        vm.pickGroup(key)
+                    }
+                },
             )
         }
     }
@@ -223,6 +279,14 @@ private fun HomeContent(
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
     posterUrl: (String?) -> String?,
+    sort: SortSpec,
+    group: GroupKey,
+    reorderEpoch: Int,
+    onOpenSortMenu: () -> Unit,
+    // Takes the active tab's effectiveGroup (not the raw pref) so the overlay it opens can show
+    // the same selection the pill itself displays — see the call site inside the per-tab scope
+    // below and effectiveGroupFor's doc comment for why they can otherwise disagree.
+    onOpenGroupMenu: (GroupKey) -> Unit,
 ) {
     // ONE stable (String) -> Unit reference handed to every grid item lambda below, instead of
     // each item closing over `onOpenTitle` + its own `title` fresh every recomposition.
@@ -242,6 +306,45 @@ private fun HomeContent(
     // browsing, not always tab 0.
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     val tabIndex = selectedTab.coerceIn(0, (tabs.size - 1).coerceAtLeast(0))
+
+    // reorderEpoch changing means a Sort/Group pick just reordered every tab's list, including
+    // ones NOT currently composed — whose rememberSaveable LazyGridState (below) would otherwise
+    // keep an offset into the old order and land mid-list (or past the new end) on re-entry.
+    // An earlier version folded the epoch into each tab's SaveableStateProvider key (below) to
+    // force that miss — but SaveableStateProvider is ReusableContent under the hood, so a key
+    // change on the ACTIVE tab's own provider re-runs every `remember` in its subtree and resets
+    // (FocusTargetNode.onReset) whatever currently holds focus there, including the Sort/Group
+    // pill the user just pressed. Purging only the OFF-SCREEN tabs avoids that: removeState
+    // deletes a key's savedStates entry outright — safe for any tab with no live RegistryHolder,
+    // i.e. every tab except tabIndex — so those tabs start fresh at the top next time they're
+    // switched to, while the active tab keeps its live subtree and gets snapped to top by its own
+    // snapshotFlow(sort, effectiveGroup).drop(1) effect (below) instead.
+    //
+    // Guarded on reorderEpoch > 0, not just keyed on it: this composable (and reorderEpoch along
+    // with it, since it's a plain `remember` in HomeScreen) is torn down and rebuilt on every
+    // back-nav from detail and on process death, so LaunchedEffect(reorderEpoch) also fires once
+    // on that fresh mount with whatever epoch value survived (0, since reorderEpoch is no longer
+    // saveable — it no longer needs to be, now that nothing saveable is keyed on it). Since
+    // reorderEpoch only ever increments from an actual Sort/Group pick, `== 0` unambiguously
+    // means "nothing picked yet this session" — skipping it there is what keeps an ordinary
+    // back-nav/re-entry from wiping every other tab's just-restored scroll position for nothing.
+    // Purging must cover any index a stranded savedStates entry could exist at, not just the
+    // CURRENT tabs.size — if the tab list shrinks (a server section removed) and a pick purges
+    // only that smaller range, an entry beyond it survives untouched; if that tab later regrows
+    // (the section re-added), it resurfaces with its stale pre-reorder offset. This high-water
+    // mark only ever grows, so the purge range can't shrink back out from under a stranded entry.
+    // rememberSaveable, NOT remember: the entries it has to cover live in tabStateHolder, which is
+    // a rememberSaveableStateHolder() and so survives back-nav and process death. A plain remember
+    // would reset the mark to the CURRENT tabs.size on every remount, and a section removed while
+    // the app was dead would strand its restored entry above the fresh mark forever.
+    val maxTabCount = rememberSaveable { mutableIntStateOf(tabs.size) }
+    SideEffect { if (tabs.size > maxTabCount.intValue) maxTabCount.intValue = tabs.size }
+
+    LaunchedEffect(reorderEpoch) {
+        if (reorderEpoch > 0) {
+            (0 until maxTabCount.intValue).filter { it != tabIndex }.forEach { tabStateHolder.removeState(it) }
+        }
+    }
 
     // Category filter (entertainment tab only). null == "All". Resets whenever the tab changes.
     var selectedCat by remember(tabIndex) { mutableStateOf<String?>(null) }
@@ -374,6 +477,11 @@ private fun HomeContent(
                     // reset that tab's scroll to the top. Wrapping each child in this hoisted
                     // holder's SaveableStateProvider(idx) performs save-on-dispose / restore-on-
                     // re-entry, giving each tab its own persisted scroll+focus position.
+                    // Keyed on idx alone, deliberately NOT folding reorderEpoch in here too: see
+                    // the reorderEpoch comment above tabStateHolder's declaration for why a
+                    // Sort/Group pick purges the OTHER tabs' saved state directly instead — a key
+                    // change here would tear down this tab's own live subtree on every pick,
+                    // including whichever pill the user is currently focused on.
                     tabStateHolder.SaveableStateProvider(idx) {
                     val section = tabs.getOrNull(idx)
                     val sectionKey = section?.key ?: ENTERTAINMENT
@@ -382,11 +490,8 @@ private fun HomeContent(
                     val isEntertainment =
                         section?.behavior?.let { it == ENTERTAINMENT } ?: (sectionKey == ENTERTAINMENT)
 
-                    val sectionTitles = remember(bySection, sectionKey) {
-                        (bySection[sectionKey] ?: emptyList()).sortedWith(
-                            compareByDescending<Title> { it.addedAt ?: Double.NEGATIVE_INFINITY }
-                                .thenBy { it.displayTitle.lowercase() }
-                        )
+                    val sectionTitles = remember(bySection, sectionKey, sort) {
+                        sortTitles(bySection[sectionKey] ?: emptyList(), sort)
                     }
                     val chips = remember(sectionTitles, isEntertainment) {
                         if (isEntertainment) visibleChips(sectionTitles) else emptyList()
@@ -394,6 +499,13 @@ private fun HomeContent(
                     val gridTitles = remember(sectionTitles, selectedCat, isEntertainment) {
                         if (isEntertainment) sectionTitles.filter { matchesCategory(it, selectedCat) } else sectionTitles
                     }
+                    // Grouping is entertainment vocabulary only, and is suppressed while a
+                    // specific category chip is active — gridTitles is already narrowed to that
+                    // one category, so grouping it would just repeat the chip's label as a lone
+                    // header. See effectiveGroupFor's doc comment.
+                    val effectiveGroup = effectiveGroupFor(isEntertainment, selectedCat, group)
+                    // gridTitles is already sorted, so buildGridRows only interleaves headers.
+                    val rows = remember(gridTitles, effectiveGroup) { buildGridRows(gridTitles, effectiveGroup) }
                     val sectionContinue = remember(continueItems, sectionKey) {
                         continueItems.filter { sectionKeyOf(it) == sectionKey }
                     }
@@ -420,11 +532,42 @@ private fun HomeContent(
                     // key is needed here.
                     val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
 
-                    // The continue shelf and chips row each occupy one LazyGridScope item() slot
-                    // ahead of itemsIndexed(gridTitles), so a tile's *global* grid index is offset
-                    // by however many of those header slots are actually present.
-                    val headerSlots = (if (sectionContinue.isNotEmpty()) 1 else 0) +
-                        (if (chips.size > 1) 1 else 0)
+                    // A sort/group change reorders the whole list — snap to top so the user sees
+                    // the new order from its start; focus stays alive on the Sort/Group pill the
+                    // user is holding (controls row is composed at scroll-top). snapshotFlow +
+                    // drop(1) means the CURRENT value on (re-)entry never fires — the saved
+                    // per-tab scroll/focus restore is untouched; only an actual change scrolls.
+                    // currentGroup is the EFFECTIVE group, not the raw pref — so a category-chip
+                    // switch only lands here (and only scrolls to top) when the group pref is
+                    // CATEGORY, since that's the only case where suppression actually changes its
+                    // value; with the pref at NONE a chip switch leaves effectiveGroup at NONE
+                    // both before and after, so nothing fires. Deliberate asymmetry, not a bug.
+                    // The chip-switch case is additionally gated on the epoch below, so it only
+                    // snaps to top once a Sort/Group pick has happened this session — a chip press
+                    // on a freshly-restored grid keeps the offset the Bundle just handed back.
+                    val currentSort by rememberUpdatedState(sort)
+                    val currentGroup by rememberUpdatedState(effectiveGroup)
+                    // reorderEpoch only increments from an actual Sort/Group pick (see HomeScreen);
+                    // the async default->persisted-prefs hydration in HomeViewModel.init never
+                    // touches it. Reading it live via rememberUpdatedState (this effect is
+                    // LaunchedEffect(Unit), so a plain closure over the parameter would see only
+                    // its value at mount) means the first sort/group change this tab observes only
+                    // scrolls to top when a real pick already bumped the epoch — not when that
+                    // hydration update lands moments after mount and would otherwise blow away the
+                    // scroll position just restored from the Bundle.
+                    val currentEpoch by rememberUpdatedState(reorderEpoch)
+                    LaunchedEffect(Unit) {
+                        snapshotFlow { currentSort to currentGroup }
+                            .drop(1)
+                            .collect { if (currentEpoch > 0) gridState.scrollToItem(0) }
+                    }
+
+                    // The continue shelf (0 or 1 slot) and the controls row (ALWAYS 1 slot now —
+                    // the Sort pill exists on every tab) sit ahead of itemsIndexed(rows), so:
+                    //   globalGridIndex = headerSlots + rowIndex   (rowIndex indexes `rows`)
+                    // Group headers are NOT part of headerSlots — they live inside `rows`
+                    // and are handled by the Tile-aware scan in firstTileRowIndex below.
+                    val headerSlots = (if (sectionContinue.isNotEmpty()) 1 else 0) + 1
 
                     // `firstTile` used to be pinned to the grid's literal first tile (local index
                     // 0) — but that's exactly as scrollable-away as continueLane/continueFirst:
@@ -438,14 +581,23 @@ private fun HomeContent(
                     // derivedStateOf collapses per-frame scroll-offset churn down to a value that
                     // only changes when the reported item index actually changes, so this doesn't
                     // recompose the visible tiles on every scroll pixel.
-                    // Keyed on gridTitles too (not just headerSlots): a category-chip switch
-                    // rebuilds gridTitles without necessarily changing headerSlots, and remember()
-                    // would otherwise keep the old derivedStateOf around, closing over the stale
-                    // list's size for the coerceIn bound below.
-                    val firstVisibleTileIndex by remember(headerSlots, gridTitles) {
+                    // Keyed on rows too (not just headerSlots): a category-chip switch rebuilds
+                    // rows without necessarily changing headerSlots, and remember() would
+                    // otherwise keep the old derivedStateOf around, closing over the stale list's
+                    // size for the coerceIn bound below.
+                    // As before, but Tile-aware: with group headers interleaved in `rows`, the
+                    // first *visible* grid item may be a full-span header — never hand firstTile
+                    // to one. Scan the visible window for the first item that maps to a Tile row;
+                    // if only headers are visible (can't happen for more than a frame — a header
+                    // is always followed by its tiles), fall back to the first Tile row overall.
+                    val firstTileRowIndex by remember(headerSlots, rows) {
                         derivedStateOf {
-                            val globalIdx = gridState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: 0
-                            (globalIdx - headerSlots).coerceIn(0, (gridTitles.size - 1).coerceAtLeast(0))
+                            val visibleTile = gridState.layoutInfo.visibleItemsInfo.firstOrNull { info ->
+                                (rows.getOrNull(info.index - headerSlots)) is GridRow.Tile
+                            }
+                            val rowIdx = visibleTile?.let { it.index - headerSlots }
+                                ?: rows.indexOfFirst { it is GridRow.Tile }
+                            rowIdx.coerceIn(0, (rows.size - 1).coerceAtLeast(0))
                         }
                     }
 
@@ -478,11 +630,13 @@ private fun HomeContent(
                         // tab pills into the grid deterministically drops to zero focused nodes" bug.
                         // tvFocusEnterFallback skips that step entirely and always re-resolves the
                         // target itself. Same fallback order as before: firstTile is tied to
-                        // whichever tile the grid itself reports visible (see firstVisibleTileIndex
-                        // above), so it stays a legitimate, currently-composed target regardless of
-                        // scroll depth; chipsFirst/continueFirst are only reached when there are no
-                        // tiles at all, i.e. the grid hasn't scrolled past the header yet, so they're
-                        // still on-screen whenever they're actually picked. The `idx != tabIndex`
+                        // whichever tile the grid itself reports visible (see firstTileRowIndex
+                        // above — an index into `rows`, not the tile list, since group headers can
+                        // sit ahead of the first tile), so it stays a legitimate, currently-composed
+                        // target regardless of scroll depth; chipsFirst/continueFirst are only
+                        // reached when there are no tiles at all, i.e. the grid hasn't scrolled
+                        // past the header yet, so they're still on-screen whenever they're
+                        // actually picked. The `idx != tabIndex`
                         // branch is what actually blocks the outgoing tab's subtree from taking focus
                         // during the AnimatedContent crossfade (both tabs are briefly composed
                         // together), so a D-pad press mid-fade can never wander into a subtree that's
@@ -504,11 +658,9 @@ private fun HomeContent(
                                     gridState.firstVisibleItemScrollOffset == 0
                                 when {
                                     atTop && sectionContinue.isNotEmpty() -> continueFirst
-                                    atTop && chips.size > 1 -> chipsFirst
+                                    atTop -> chipsFirst
                                     gridTitles.isNotEmpty() -> firstTile
-                                    chips.size > 1 -> chipsFirst
-                                    sectionContinue.isNotEmpty() -> continueFirst
-                                    else -> FocusRequester.Default
+                                    else -> chipsFirst
                                 }
                             }
                         },
@@ -544,12 +696,22 @@ private fun HomeContent(
                             }
                         }
 
-                        if (chips.size > 1) {
-                            item(span = { GridItemSpan(maxLineSpan) }) {
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    modifier = Modifier.tvFocusRestorer { chipsFirst },
-                                ) {
+                        // Controls row: category chips (entertainment only) + Sort/Group pills.
+                        // Deliberately still a plain Row, NOT a LazyRow: worst case is 6 pills
+                        // ("All | Movies | TV Shows | Other | Sort: Oldest ⌄ | Group: Category ⌄"
+                        // ≈ 700–730dp incl. 5×8dp gaps) inside the 864dp content width (Fire TV
+                        // always composes the 960×540dp canvas; 96dp is grid padding) — it fits,
+                        // scrolling would be dead weight, and a recycling LazyRow would
+                        // re-introduce the restore-by-stale-hash focus bug this row's
+                        // tvFocusRestorer comment warns about. Fixed children keep chipsFirst
+                        // (attached to whichever pill is first) always composed and valid.
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            val showChips = isEntertainment && chips.size > 1
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.tvFocusRestorer { chipsFirst },
+                            ) {
+                                if (showChips) {
                                     chips.forEachIndexed { chipIdx, chip ->
                                         PillButton(
                                             selected = selectedCat == chip.category,
@@ -559,28 +721,69 @@ private fun HomeContent(
                                         )
                                     }
                                 }
+                                PillButton(
+                                    selected = false,
+                                    label = sortPillLabel(sort) + " ⌄",
+                                    onClick = onOpenSortMenu,
+                                    modifier = if (!showChips) Modifier.focusRequester(chipsFirst) else Modifier,
+                                )
+                                if (isEntertainment) {
+                                    // Reflects effectiveGroup, not the raw group pref: with a
+                                    // category chip active, grouping is suppressed (see
+                                    // effectiveGroup above), so the pill must say "Group: None"
+                                    // and sit unselected rather than claim to be on when it isn't.
+                                    // Passing effectiveGroup into onOpenGroupMenu means the
+                                    // overlay it opens shows that same selection instead of the
+                                    // raw pref, so the pill and the overlay can never disagree.
+                                    // Picking a group in the overlay still writes the real pref —
+                                    // that's what takes effect once the user returns to "All".
+                                    PillButton(
+                                        selected = effectiveGroup != GroupKey.NONE,
+                                        label = groupPillLabel(effectiveGroup) + " ⌄",
+                                        onClick = { onOpenGroupMenu(effectiveGroup) },
+                                    )
+                                }
                             }
                         }
 
                         itemsIndexed(
-                            gridTitles,
-                            key = { _, title -> title.id },
-                            contentType = { _, _ -> "poster" },
-                        ) { i, title ->
-                            LibraryTile(
-                                title = title,
-                                section = section,
-                                isEntertainment = isEntertainment,
-                                posterUrl = posterUrl(title.poster),
-                                onOpenTitle = onTitleClick,
-                                onFocused = { onCardFocused(BackdropItem(title.id, title.poster)) },
-                                focusRequester = if (i == firstVisibleTileIndex) firstTile else null,
-                                // Chip filtering removes/adds items; the remaining ones glide to
-                                // their new position instead of popping.
-                                modifier = Modifier.animateItem(
-                                    placementSpec = tween(300, easing = MotionTokens.Emphasized)
-                                ),
-                            )
+                            rows,
+                            key = { _, row ->
+                                when (row) {
+                                    is GridRow.Header -> "hdr:" + row.label
+                                    is GridRow.Tile -> row.title.id
+                                }
+                            },
+                            span = { _, row ->
+                                if (row is GridRow.Header) GridItemSpan(maxLineSpan) else GridItemSpan(1)
+                            },
+                            contentType = { _, row -> if (row is GridRow.Header) "groupHeader" else "poster" },
+                        ) { i, row ->
+                            when (row) {
+                                is GridRow.Header ->
+                                    // Plain text, deliberately NOT focusable (no clickable/
+                                    // focusable modifier) so D-pad search skips straight over it.
+                                    GroupHeader(
+                                        text = row.label,
+                                        modifier = Modifier.animateItem(
+                                            placementSpec = tween(300, easing = MotionTokens.Emphasized)
+                                        ),
+                                    )
+                                is GridRow.Tile -> LibraryTile(
+                                    title = row.title,
+                                    section = section,
+                                    isEntertainment = isEntertainment,
+                                    posterUrl = posterUrl(row.title.poster),
+                                    onOpenTitle = onTitleClick,
+                                    onFocused = { onCardFocused(BackdropItem(row.title.id, row.title.poster)) },
+                                    focusRequester = if (i == firstTileRowIndex) firstTile else null,
+                                    // Chip filtering removes/adds items; the remaining ones glide to
+                                    // their new position instead of popping.
+                                    modifier = Modifier.animateItem(
+                                        placementSpec = tween(300, easing = MotionTokens.Emphasized)
+                                    ),
+                                )
+                            }
                         }
                     }
                     }
@@ -698,31 +901,6 @@ private fun tabLabel(tab: SectionInfo): String {
     return if (icon != null) "$icon $label" else label
 }
 
-private fun categoryOf(title: Title): String =
-    title.category?.ifBlank { null } ?: if (title.isShow) "show" else "movie"
-
-private data class CategoryChip(val label: String, val category: String?)
-
-private val KNOWN_CATEGORIES = setOf("movie", "show")
-
-private fun matchesCategory(title: Title, selected: String?): Boolean = when (selected) {
-    null -> true
-    "other" -> categoryOf(title) !in KNOWN_CATEGORIES
-    else -> categoryOf(title) == selected
-}
-
-/** Chips for the categories actually present; "All" always, "Other" only if any uncategorised. */
-private fun visibleChips(titles: List<Title>): List<CategoryChip> {
-    val present = titles.map { categoryOf(it) }.toSet()
-    val hasOther = titles.any { categoryOf(it) !in KNOWN_CATEGORIES }
-    return buildList {
-        add(CategoryChip("All", null))
-        if ("movie" in present) add(CategoryChip("Movies", "movie"))
-        if ("show" in present) add(CategoryChip("TV Shows", "show"))
-        if (hasOther) add(CategoryChip("Other", "other"))
-    }
-}
-
 private fun subtitleFor(title: Title, section: SectionInfo?, isEntertainment: Boolean): String {
     if (isEntertainment) {
         return if (title.isShow) plural(title.seasons.size, "season") else title.year?.toString().orEmpty()
@@ -825,6 +1003,16 @@ private fun PillButton(
 @Composable
 private fun ShelfHeader(text: String) {
     Text(text, style = MaterialTheme.typography.titleLarge, color = TextPrimary)
+}
+
+@Composable
+private fun GroupHeader(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleLarge,
+        color = TextPrimary,
+        modifier = modifier.padding(top = 8.dp),
+    )
 }
 
 @Composable

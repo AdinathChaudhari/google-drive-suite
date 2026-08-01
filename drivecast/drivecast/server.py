@@ -71,28 +71,55 @@ class AppState:
         self.setup_error = None  # populated by preflight if rclone is unusable
         self._refresh_task = None
         self._pending_scope = set()  # scopes requested while a scan was running
+        self._pending_rebuild = False  # a rebuild/scope arrived mid-scan; re-kick on finish
         self.stream_activity = {}  # file_id -> epoch of last GET /stream request
 
-    def start_refresh(self, scope=None):
+    def start_refresh(self, scope=None, _draining=False):
         """Kick a background library scan, if idle.
 
-        `scope` optionally limits the Drive re-walk to specific selected
-        drives (per-drive refresh); the library is still rebuilt over all
-        selected drives from the scan cache. Returns True if a scan started.
-        A scoped request that arrives while a scan is running is queued and
-        re-kicked when the running scan finishes (a section change saved
-        mid-scan must not be silently dropped).
+        `scope=None` is a full refresh over all selected drives (returns
+        False when none are selected). `scope=[]` is a cache-only rebuild —
+        no Drive walk, but deselected drives' titles still leave the library.
+        A non-empty `scope` that filters down to nothing (every named drive
+        is unselected) starts nothing and returns False — same as an empty
+        `scope=None` refresh — rather than silently downgrading into that
+        cache-only rebuild.
+        A request that arrives while a scan is running is queued and
+        re-kicked when the running scan finishes (a section change or
+        removal saved mid-scan must not be silently dropped). `_draining` is
+        set only by that re-kick (`_drain_pending_scope`): the drives it
+        named may have been deselected entirely while the scan ran, and that
+        removal still needs the library rebuilt from cache — so on drain a
+        non-empty scope that filters to nothing degrades to the cache-only
+        rebuild instead of the "start nothing" early return below.
         """
         drives = self.cfg.get("selected_drives") or []
-        scope = [d for d in (scope or drives) if d in drives]
-        if not scope:
-            return False
+        if scope is None:
+            if not drives:
+                return False
+            scope = list(drives)
+        else:
+            requested = list(scope)
+            # Explicit scope: filter to selected. An (explicitly) empty result
+            # still runs — a cache-only rebuild that prunes deselected drives.
+            # But a NON-EMPTY request that filters down to nothing (every
+            # named drive turned out to be unselected) must not be silently
+            # treated as that same "walk nothing" rebuild request — unless
+            # we're draining a queued scope, where "nothing left selected"
+            # is exactly the removal the queued rebuild exists to apply.
+            scope = [d for d in requested if d in drives]
+            if requested and not scope:
+                if not _draining:
+                    return False
+                scope = []
         if self.scanner.status.get("running"):
             self._pending_scope.update(scope)
+            self._pending_rebuild = True
             return False
-        if self._pending_scope:
+        if self._pending_scope or self._pending_rebuild:
             scope = sorted(set(scope) | self._pending_scope)
             self._pending_scope.clear()
+            self._pending_rebuild = False
         self._refresh_task = asyncio.create_task(self.scanner.scan(
             drives, scope=scope,
             drive_hints=self.cfg.get("drive_hints") or {},
@@ -102,11 +129,12 @@ class AppState:
 
     def _drain_pending_scope(self, _task):
         """After a scan finishes, run any refresh that was requested meanwhile."""
-        if not self._pending_scope:
+        if not self._pending_scope and not self._pending_rebuild:
             return
         pending = sorted(self._pending_scope)
         self._pending_scope.clear()
-        self.start_refresh(scope=pending)
+        self._pending_rebuild = False
+        self.start_refresh(scope=pending, _draining=True)
 
     def maybe_autorefresh(self):
         """On startup: rescan if configured to, or if we have drives but no cache.
@@ -476,11 +504,27 @@ def create_app(cfg=None):
     async def api_post_settings(request: Request):
         state = app.state.dc
         body = await request.json()
-        drives_changed = False
+        added_drives = []
+        removed_drives = []
+        order_changed = False
         if "selected_drives" in body:
+            old_drives = state.cfg.get("selected_drives") or []
             new_drives = list(body.get("selected_drives") or [])
-            if new_drives != (state.cfg.get("selected_drives") or []):
-                drives_changed = True
+            # Set diff, not `!=`, for added/removed — but order itself IS
+            # meaningful downstream and a pure reorder still needs a rebuild:
+            # Scanner.scan builds all_records by `for drive_id in selected`
+            # (library.py:1370, `selected` == this selected-drives list), and
+            # group_seasons (library.py:543-650) merges same-named seasons
+            # across drives first-seen-wins via its `order` list (library.py
+            # :556/592) — the merged record's drive_id/year/_thumb and
+            # source_drives order all follow whichever drive's records were
+            # walked first. Reordering with no add/remove is flagged
+            # separately (order_changed) so it can still kick a cheap
+            # cache-only rebuild below without a Drive re-walk.
+            added_drives = [d for d in new_drives if d not in old_drives]
+            removed_drives = [d for d in old_drives if d not in new_drives]
+            order_changed = (not added_drives and not removed_drives
+                             and new_drives != old_drives)
             state.cfg["selected_drives"] = new_drives
         # Tabs MUST be processed before drive_sections below: the
         # drive_sections `valid = sections_mod.all_sections()` check has to
@@ -613,10 +657,26 @@ def create_app(cfg=None):
                         section_changed.append(d)
         config_mod.save_config(state.cfg)
         started = False
-        if drives_changed:
-            started = state.start_refresh()
-        elif section_changed:
-            started = state.start_refresh(scope=section_changed)
+        # Walk only what changed: newly selected drives plus drives whose tab
+        # assignment changed (union — an add + a section change in one POST,
+        # which is exactly what the Settings UI sends, must not drop either).
+        scope = sorted(set(added_drives) | set(section_changed))
+        if scope:
+            started = state.start_refresh(scope=scope)
+            if not started and (removed_drives or order_changed):
+                # The scoped refresh named only drives that turned out to be
+                # unselected by the time this ran (e.g. a section change on a
+                # drive that this same POST also deselected) — start_refresh
+                # correctly started nothing, but a rebuild is still owed
+                # below, so fall through to it instead of dropping it.
+                started = state.start_refresh(scope=[])
+        elif removed_drives or order_changed:
+            # Nothing new to walk, but either the removed drives' titles must
+            # leave, or the reorder can flip which drive wins a cross-drive
+            # season merge (see order_changed's comment above) — a cache-only
+            # rebuild (empty scope) re-derives the library from cache without
+            # touching Drive.
+            started = state.start_refresh(scope=[])
         return {
             "ok": True,
             "selected_drives": state.cfg.get("selected_drives", []),

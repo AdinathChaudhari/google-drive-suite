@@ -716,7 +716,9 @@ async function pollScan() {
   if (st.running) {
     show(bar, true);
     const names = st.scope_names || [];
-    const label = names.length && names.length <= 3
+    const label = !st.total
+      ? "Updating library…"
+      : names.length && names.length <= 3
       ? `Refreshing ${names.join(", ")}… ${st.scanned}/${st.total}`
       : `Scanning drives… ${st.scanned}/${st.total}`;
     bar.textContent = label + (st.added ? ` · +${st.added} new` : "");
@@ -1366,7 +1368,7 @@ async function saveSettings() {
     if ($("remoteRestartNote")) show($("remoteRestartNote"), !!res.restart_required);
     if (res.restart_required) toast("Restart drivecast to apply remote access.");
     await renderRemoteBlock();
-    if (res.refresh_started) { toast("Drives changed — refreshing library…"); startScanWatch(); }
+    if (res.refresh_started) { toast("Updating library…"); startScanWatch(); }
   } catch (e) {
     $("settingsMsg").textContent = "Save failed: " + e.message;
   }

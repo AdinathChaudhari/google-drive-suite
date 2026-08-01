@@ -13,6 +13,7 @@ import com.drivecast.tv.di.HomeData
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -27,6 +28,8 @@ data class HomeUiState(
     val continueItems: List<ContinueItem> = emptyList(),
     val refreshing: Boolean = false,
     val error: String? = null,
+    val sort: SortSpec = SortSpec(),
+    val group: GroupKey = GroupKey.NONE,
 )
 
 /**
@@ -41,17 +44,31 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
     private val repository = container.repository
 
     private val _state = MutableStateFlow(
-        container.homeCache?.let { cached ->
+        (container.homeCache?.let { cached ->
             HomeUiState(
                 titles = cached.titles,
                 sections = cached.sections,
                 continueItems = cached.continueItems,
             )
-        } ?: HomeUiState()
+        } ?: HomeUiState()).let { base ->
+            container.viewPrefs?.let { base.copy(sort = it.sort, group = it.group) } ?: base
+        }
     )
     val state: StateFlow<HomeUiState> = _state.asStateFlow()
 
     init {
+        if (container.viewPrefs == null) {
+            viewModelScope.launch {
+                val cfg = container.configStore.config.first()
+                val key = SortKey.fromId(cfg.sortKeyId)
+                val prefs = SortAndGroupPrefs(
+                    sort = SortSpec(key, cfg.sortAscending ?: key.defaultAscending),
+                    group = GroupKey.fromId(cfg.groupId),
+                )
+                container.viewPrefs = prefs
+                _state.update { it.copy(sort = prefs.sort, group = prefs.group) }
+            }
+        }
         load()
     }
 
@@ -100,6 +117,23 @@ class HomeViewModel(private val container: AppContainer) : ViewModel() {
             val updated = runCatching { repository.continueWatching() }.getOrDefault(optimistic)
             _state.update { it.copy(continueItems = updated) }
             container.homeCache = container.homeCache?.copy(continueItems = updated)
+        }
+    }
+
+    fun pickSort(picked: SortKey) {
+        val next = nextSortSpec(_state.value.sort, picked)
+        applyPrefs(SortAndGroupPrefs(next, _state.value.group))
+    }
+
+    fun pickGroup(picked: GroupKey) {
+        applyPrefs(SortAndGroupPrefs(_state.value.sort, picked))
+    }
+
+    private fun applyPrefs(prefs: SortAndGroupPrefs) {
+        container.viewPrefs = prefs
+        _state.update { it.copy(sort = prefs.sort, group = prefs.group) }
+        viewModelScope.launch {
+            container.configStore.saveViewPrefs(prefs.sort.key.id, prefs.sort.ascending, prefs.group.id)
         }
     }
 

@@ -17,6 +17,9 @@ data class ServerConfig(
     val baseUrl: String? = null,
     val token: String? = null,
     val subtitlesEnabled: Boolean = true,
+    val sortKeyId: String? = null,
+    val sortAscending: Boolean? = null,
+    val groupId: String? = null,
 ) {
     val isConfigured: Boolean get() = !baseUrl.isNullOrBlank() && !token.isNullOrBlank()
 }
@@ -27,6 +30,9 @@ class ServerConfigStore(private val context: Context) {
         val BASE_URL = stringPreferencesKey("base_url")
         val TOKEN = stringPreferencesKey("token")
         val SUBTITLES = booleanPreferencesKey("subtitles_enabled")
+        val SORT_KEY = stringPreferencesKey("home_sort_key")
+        val SORT_ASC = booleanPreferencesKey("home_sort_ascending")
+        val GROUP_KEY = stringPreferencesKey("home_group_key")
     }
 
     val config: Flow<ServerConfig> = context.dataStore.data.map { prefs ->
@@ -34,6 +40,9 @@ class ServerConfigStore(private val context: Context) {
             baseUrl = prefs[Keys.BASE_URL],
             token = prefs[Keys.TOKEN],
             subtitlesEnabled = prefs[Keys.SUBTITLES] ?: true,
+            sortKeyId = prefs[Keys.SORT_KEY],
+            sortAscending = prefs[Keys.SORT_ASC],
+            groupId = prefs[Keys.GROUP_KEY],
         )
     }
 
@@ -46,6 +55,14 @@ class ServerConfigStore(private val context: Context) {
 
     suspend fun setSubtitlesEnabled(enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[Keys.SUBTITLES] = enabled }
+    }
+
+    suspend fun saveViewPrefs(sortKeyId: String, sortAscending: Boolean, groupId: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SORT_KEY] = sortKeyId
+            prefs[Keys.SORT_ASC] = sortAscending
+            prefs[Keys.GROUP_KEY] = groupId
+        }
     }
 
     suspend fun clear() {
