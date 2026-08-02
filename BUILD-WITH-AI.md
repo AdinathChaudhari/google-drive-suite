@@ -112,6 +112,84 @@ the logic worth testing is tangled up with a Flask route or an `osascript`
 call — is itself a spec decision, and it's why this suite's test suites run
 in milliseconds with no live account required.
 
+## What the workflow missed — a field report
+
+The sections above describe the process working. This one is the counterweight,
+from a single session (2026-08-01) that shipped two features across the server
+and the Fire TV client. It ran the roles above exactly — Fable planning, Opus
+orchestrating and verifying, Sonnet executing — and the failures below are the
+transferable part, more than the successes are.
+
+**Green tests and a clean build are not evidence the feature works.** The
+sort/group work landed with 20 new unit tests passing and `assembleRelease`
+clean. A D-pad navigation bug on the same screen was invisible to every one of
+them, because the thing that was broken — which node takes focus after a
+keypress — has no seam a JVM test can reach. When an adversarial reviewer was
+finally pointed at it, its verdict on the primary scenario was *"unclear"*:
+static reasoning over Compose's focus internals could not settle it either.
+
+What settled it was six keypresses against the real device:
+
+```
+adb shell input keyevent DPAD_DOWN   # then: uiautomator dump, read focused node
+```
+
+Driving the physical stick and dumping the focused node after every press turns
+"does focus go where it should" from an opinion into a table you can diff. That
+loop found the bug, proved the fix, and cost minutes. **If a behavior has no
+testable seam, build the crude external harness instead of arguing about it.**
+
+**Attribute before you fix.** The nav bug surfaced immediately after shipping a
+feature that rewrote the very row it involved, so the obvious reading was "we
+broke it." Instead: check out the commit *before* the feature into a worktree,
+build it, install it, and run the byte-identical keypress walk. Same failure,
+press for press — the defect predated the feature by weeks. That cost about
+four minutes and prevented "fixing" a non-regression by reverting good work.
+
+**A test that cannot fail is worse than no test**, because it reads as
+coverage. A regression test written for this session's scoped-refresh fix
+asserted the right value while being structurally incapable of failing: the two
+sets it compared overlapped, so the bug it guarded could be reintroduced in one
+direction with the suite still green. It was caught only because a reviewer was
+told to *mutate the production code and prove the test fails*. That instruction
+is now the standard for any test guarding a specific bug — write it, break the
+fix, watch it go red, restore.
+
+**Never let a model document a claim it has not executed.** A comment was added
+asserting that the order of the selected-drive list "isn't meaningful
+downstream." It was false. A probe against the real function showed that
+reordering two drives that share a show flips the merged record's owning drive,
+year, and poster source. A confident comment is worse than no comment; it
+survives review and gets trusted. The finding became [D-013](docs/DECISIONS.md).
+
+**Check the environment before you diagnose the code.** Twice in one session
+the system lied convincingly:
+
+- "The fix doesn't work — it still scans every drive." The running server had
+  been up for five days and held the pre-fix modules in memory. Nothing on disk
+  mattered until it was restarted.
+- Five consecutive D-pad presses moved nothing, matching a dead-press failure a
+  reviewer had predicted in that exact code. The device was asleep
+  (`mWakefulness=Asleep`).
+
+Both would have produced a confident, wrong fix to real code. Cheap habit:
+before believing a diagnosis, confirm the thing under test is actually running
+the code under test.
+
+**Fix rounds regress, so each one needs the same adversarial pass as the
+original.** This session took four rounds. Round two's fix — folding a counter
+into a `SaveableStateProvider` key — compiled, passed its tests, and introduced
+two new defects that only a fresh review caught, including one that cleared
+focus off the control the user had just pressed. It became
+[D-014](docs/DECISIONS.md). A fix is not smaller than a feature just because
+its diff is.
+
+**On-device probing mutates real state.** Driving a live device with synthetic
+input is the best verification available here, and it is not free: a stray
+`DPAD_CENTER` during a focus probe started playback and overwrote a real resume
+position (recovered afterwards via the progress API). Treat someone's running
+device like production, because it is — snapshot what you are about to disturb.
+
 ## Case studies
 
 Two components have their own full case-study writeups — how they were
@@ -126,3 +204,9 @@ What the human actually did in this loop: assigned roles, wrote acceptance
 criteria into the specs up front, and refused to accept a merge whose code
 couldn't be traced back to a spec decision. That's the transferable part —
 not the specific models, not how long anything took.
+
+The other half of the transferable part is the field report above: role
+separation catches a great deal, and it still cannot tell you whether the
+thing works. Only running it can. Where a behavior has no seam a test can
+reach — focus, scroll, anything a person perceives — build the external
+harness and let the artifact answer.
