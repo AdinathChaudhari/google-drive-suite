@@ -45,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -97,6 +98,9 @@ import com.drivecast.tv.ui.theme.Surface as SurfaceColor
 import com.drivecast.tv.ui.theme.SurfaceVariant
 import com.drivecast.tv.ui.theme.TextPrimary
 import com.drivecast.tv.ui.theme.TextSecondary
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -119,6 +123,7 @@ import androidx.tv.material3.Text
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.launch
 
 private const val ENTERTAINMENT = "entertainment"
 
@@ -624,7 +629,7 @@ private fun HomeContent(
 
                     LazyVerticalGrid(
                         state = gridState,
-                        columns = GridCells.Adaptive(132.dp),
+                        columns = GridCells.Adaptive(124.dp),
                         // bottom padding is NOT cosmetic: the focusable node is the poster Card,
                         // while a tile's name + year are siblings BELOW it in LibraryTile's Column.
                         // Bring-into-view therefore stops as soon as the POSTER is visible, so on
@@ -985,6 +990,7 @@ private fun plural(n: Int, word: String): String = "$n $word" + if (n == 1) "" e
 
 // ---- Tiles & chrome ----
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun LibraryTile(
     title: Title,
@@ -996,13 +1002,27 @@ private fun LibraryTile(
     onFocused: (() -> Unit)? = null,
     focusRequester: FocusRequester? = null,
 ) {
-    Column(modifier.width(132.dp)) {
+    // The focus target is the poster Card, but a tile's name + year are siblings BELOW it, and
+    // PositionFocusedItemInLazyLayout's spec short-circuits with `return 0f` as soon as the
+    // REQUESTING node is fully on screen (FocusKit.kt). So on the last grid row the poster would
+    // settle flush with the bottom edge and its labels stayed under it, unreachable at any scroll
+    // position — measured at 160dp, 132dp and 124dp, each clipping a different amount, because
+    // tile geometry only shifts where the poster's bottom lands rather than putting the labels
+    // into the calculation. Requesting bring-into-view for the whole Column is what actually puts
+    // them in it. Not a scroll-behaviour change in the common case: the same spec returns 0f when
+    // the Column is already fully visible, so only an edge row ever moves.
+    val bringIntoView = remember { BringIntoViewRequester() }
+    val scope = rememberCoroutineScope()
+    Column(modifier.width(124.dp).bringIntoViewRequester(bringIntoView)) {
         PosterCard(
             title = title.displayTitle,
             posterUrl = posterUrl,
             onClick = { onOpenTitle(title.id) },
-            widthDp = 132.dp,
-            onFocused = onFocused,
+            widthDp = 124.dp,
+            onFocused = {
+                onFocused?.invoke()
+                scope.launch { bringIntoView.bringIntoView() }
+            },
             modifier = focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier,
         ) {
             if (isEntertainment && title.isShow) {
@@ -1320,18 +1340,18 @@ private fun HomeSkeleton() {
 
             Spacer(Modifier.height(16.dp))
             // Grid row 1 — the 2nd of the "top 2 rows" that shimmer. Width matches the real
-            // 132dp GridCells.Adaptive LibraryTile. 5 boxes at 132dp + 16dp spacing = 724dp, fits.
+            // 124dp GridCells.Adaptive LibraryTile. 6 boxes at 124dp + 16dp spacing = 824dp, fits.
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                repeat(5) {
-                    SkeletonBox(modifier = Modifier.width(132.dp).aspectRatio(2f / 3f), animated = true)
+                repeat(6) {
+                    SkeletonBox(modifier = Modifier.width(124.dp).aspectRatio(2f / 3f), animated = true)
                 }
             }
 
             Spacer(Modifier.height(16.dp))
             // Grid row 2 — below the fold, static.
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                repeat(5) {
-                    SkeletonBox(modifier = Modifier.width(132.dp).aspectRatio(2f / 3f), animated = false)
+                repeat(6) {
+                    SkeletonBox(modifier = Modifier.width(124.dp).aspectRatio(2f / 3f), animated = false)
                 }
             }
         }
