@@ -104,9 +104,10 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import com.drivecast.tv.ui.common.HopTarget
 import com.drivecast.tv.ui.common.PositionFocusedItemInLazyLayout
+import com.drivecast.tv.ui.common.tvDpadHop
 import com.drivecast.tv.ui.common.tvFocusEnterFallback
-import com.drivecast.tv.ui.common.tvFocusRestorer
 import androidx.tv.material3.Border
 import androidx.tv.material3.Button
 import androidx.tv.material3.ButtonDefaults
@@ -355,7 +356,7 @@ private fun HomeContent(
     // exists and never on the skeleton. Gated by a rememberSaveable flag: NavHost disposes and
     // recomposes the home destination on every back-nav from detail (it renders instantly from
     // cache), and without the gate this effect would re-fire on every re-entry, snapping focus
-    // back to the first card and defeating tvFocusRestorer + the saved grid state's job of
+    // back to the first card and defeating tvFocusEnterFallback + the saved grid state's job of
     // returning the user to the exact card they left. rememberSaveable survives that dispose via
     // NavHost's SaveableStateProvider, so the snap happens exactly once per back-stack entry.
     // Pills row is static chrome — always exactly one instance on screen, even mid tab-crossfade —
@@ -392,16 +393,18 @@ private fun HomeContent(
     Box(Modifier.fillMaxSize()) {
         HomeBackdrop(item = { backdropItem }, posterUrl = posterUrl)
 
-        // Secondary/defense-in-depth for the onRestoreFailed fallback-recycling bug (see
-        // tvFocusRestorer's fallback chain above and FocusKit.kt's onRestoreFailed handling for
-        // the actual fixes): a 0.10f pivot pins the focused row almost flush with the top of the
-        // viewport, so descending just one or two grid rows already scrolls the Continue shelf +
-        // chips header fully out of the composed/cached window, recycling continueLane/
-        // continueFirst/chipsFirst — exactly the targets a restore fallback may need. A gentler
-        // 0.30f pivot leaves more headroom above the focused row, so the same downward scroll
-        // covers less distance per row and the header rows stay composed for longer before they
-        // scroll off, without going so far (e.g. a centered ~0.5f) that it fights the natural
-        // reading position of a focused tile.
+        // A 0.10f pivot would pin the focused row almost flush with the top of the viewport, so
+        // descending just one or two grid rows already scrolls the Continue shelf + chips header
+        // fully out of the composed/cached window, recycling continueLane/continueFirst/
+        // chipsFirst. That used to matter because a recycled restore target could silently strand
+        // focus (see FocusKit.kt's tvFocusRestorer/tvFocusEnterFallback docs and ui/common's
+        // tvDpadHop, which now guarantee entry into these lanes deterministically regardless of
+        // scroll depth — see the hop wiring on the shelf LazyRow, controls Row, and this grid
+        // below). The pivot itself is kept gentle anyway, as a UX keyline choice rather than a
+        // correctness knob: 0.30f leaves more headroom above the focused row, so the same
+        // downward scroll covers less distance per row and the header rows stay composed for
+        // longer before they scroll off, without going so far (e.g. a centered ~0.5f) that it
+        // fights the natural reading position of a focused tile.
         PositionFocusedItemInLazyLayout(0.30f) {
             Column(Modifier.fillMaxSize()) {
             Row(
@@ -517,19 +520,26 @@ private fun HomeContent(
                     // land focus on the outgoing tab's node moments before it's disposed — focus
                     // would silently die or jump. One instance per tab (scoped by the enclosing
                     // SaveableStateProvider(idx)) means each tab's lanes only ever reference that
-                    // tab's own, currently-composed nodes. Each lane's tvFocusRestorer still gets a
-                    // fallback so a failed restore can never swallow the key press: worst case,
-                    // focus lands on the lane's first item.
+                    // tab's own, currently-composed nodes. Each lane's tvFocusEnterFallback still
+                    // resolves a fresh target on every entry so a dead/recycled node can never
+                    // swallow the key press: worst case, focus lands on the lane's first item.
                     val continueLane = remember { FocusRequester() }
                     val continueFirst = remember { FocusRequester() }
                     val chipsFirst = remember { FocusRequester() }
                     val firstTile = remember { FocusRequester() }
 
+                    // Deterministic-hop bookkeeping (see FocusKit.kt's tvDpadHop / FocusLanes.kt):
+                    // the currently-focused TILE's index into `rows`, or -1 while focus sits on a
+                    // lane rather than a tile. Written by each tile's onFocused hook below, reset
+                    // by the shelf/controls lanes' own onFocusChanged — read only inside the
+                    // grid's tvDpadHop resolver, so it never triggers a recomposition on its own.
+                    val focusedRow = remember { mutableIntStateOf(-1) }
+
                     // One scroll+focus position per tab (fixes scroll carryover across tabs);
-                    // rememberSaveable survives process death and, combined with tvFocusRestorer
-                    // below, restores both scroll offset and the focused card on back-navigation.
-                    // Scoped by the enclosing SaveableStateProvider(idx) above, so no explicit idx
-                    // key is needed here.
+                    // rememberSaveable survives process death and, combined with
+                    // tvFocusEnterFallback below, restores both scroll offset and the focused card
+                    // on back-navigation. Scoped by the enclosing SaveableStateProvider(idx)
+                    // above, so no explicit idx key is needed here.
                     val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
 
                     // A sort/group change reorders the whole list — snap to top so the user sees
@@ -569,6 +579,11 @@ private fun HomeContent(
                     // and are handled by the Tile-aware scan in firstTileRowIndex below.
                     val headerSlots = (if (sectionContinue.isNotEmpty()) 1 else 0) + 1
 
+                    // Hop 3's tvDpadHop (below) needs the controls row's own global grid index to
+                    // scroll it into view before probing focus on chipsFirst — it's always the
+                    // last header slot (0 with no shelf, 1 with one).
+                    val controlsSlot = headerSlots - 1
+
                     // `firstTile` used to be pinned to the grid's literal first tile (local index
                     // 0) — but that's exactly as scrollable-away as continueLane/continueFirst:
                     // once the pivot (PositionFocusedItemInLazyLayout above; gentled to 0.30f as a
@@ -590,14 +605,13 @@ private fun HomeContent(
                     // to one. Scan the visible window for the first item that maps to a Tile row;
                     // if only headers are visible (can't happen for more than a frame — a header
                     // is always followed by its tiles), fall back to the first Tile row overall.
+                    // The scan itself is lifted into firstTileRowIndexOf (ui/home/FocusLanes.kt,
+                    // covered by FocusLanesTest) — this just keeps the derivedStateOf plumbing
+                    // that reads the grid's live layoutInfo.
                     val firstTileRowIndex by remember(headerSlots, rows) {
                         derivedStateOf {
-                            val visibleTile = gridState.layoutInfo.visibleItemsInfo.firstOrNull { info ->
-                                (rows.getOrNull(info.index - headerSlots)) is GridRow.Tile
-                            }
-                            val rowIdx = visibleTile?.let { it.index - headerSlots }
-                                ?: rows.indexOfFirst { it is GridRow.Tile }
-                            rowIdx.coerceIn(0, (rows.size - 1).coerceAtLeast(0))
+                            val visibleRowIndices = gridState.layoutInfo.visibleItemsInfo.map { it.index - headerSlots }
+                            firstTileRowIndexOf(visibleRowIndices, rows)
                         }
                     }
 
@@ -610,8 +624,15 @@ private fun HomeContent(
 
                     LazyVerticalGrid(
                         state = gridState,
-                        columns = GridCells.Adaptive(160.dp),
-                        contentPadding = PaddingValues(start = 48.dp, end = 48.dp, top = 8.dp, bottom = 48.dp),
+                        columns = GridCells.Adaptive(132.dp),
+                        // bottom padding is NOT cosmetic: the focusable node is the poster Card,
+                        // while a tile's name + year are siblings BELOW it in LibraryTile's Column.
+                        // Bring-into-view therefore stops as soon as the POSTER is visible, so on
+                        // the last row the labels sat under the screen edge (measured on a 1080p
+                        // stick: poster 577..1057, name/year past 1080) and the grid was already at
+                        // its scroll ceiling, leaving the pivot no room to lift it. The extra room
+                        // here raises max scroll so the 0.30f pivot can pull the final row clear.
+                        contentPadding = PaddingValues(start = 48.dp, end = 48.dp, top = 8.dp, bottom = 96.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
                         horizontalArrangement = Arrangement.spacedBy(16.dp),
                         // The grid is the outermost focus group: entering it from the pills (or
@@ -641,7 +662,30 @@ private fun HomeContent(
                         // during the AnimatedContent crossfade (both tabs are briefly composed
                         // together), so a D-pad press mid-fade can never wander into a subtree that's
                         // about to be disposed.
-                        modifier = Modifier.fillMaxSize().tvFocusEnterFallback {
+                        modifier = Modifier.fillMaxSize()
+                            // Hop 3 (ui/home/FocusLanes.kt's upHopTarget, ui/common/FocusKit.kt's
+                            // tvDpadHop): UP from the grid's very first tile row must reach the
+                            // controls row even when that row is currently scrolled/recycled out
+                            // of the search's reach (the failure mode this whole fix addresses —
+                            // see the investigation this implements). columns is derived from the
+                            // framework's own per-item column index rather than recomputing
+                            // GridCells.Adaptive's breakpoint math; recomputed fresh on every UP
+                            // press rather than tracked as composition state, since it's only ever
+                            // read here, at press time.
+                            .tvDpadHop(
+                                onUp = {
+                                    val columns = gridState.layoutInfo.visibleItemsInfo
+                                        .filter { rows.getOrNull(it.index - headerSlots) is GridRow.Tile }
+                                        .maxOfOrNull { it.column }
+                                        ?.plus(1) ?: 1
+                                    val firstRowRange = firstTileRowRange(rows, columns)
+                                    val hop = upHopTarget(focusedRow.intValue, firstRowRange, hasShelf = sectionContinue.isNotEmpty())
+                                    if (hop == UpHop.ToControls) {
+                                        HopTarget(chipsFirst, scrollFirst = { gridState.scrollToItem(controlsSlot) })
+                                    } else null
+                                },
+                            )
+                            .tvFocusEnterFallback {
                             if (idx != tabIndex) {
                                 FocusRequester.Cancel
                             } else {
@@ -675,7 +719,13 @@ private fun HomeContent(
                                         contentPadding = PaddingValues(vertical = 24.dp),
                                         modifier = Modifier
                                             .focusRequester(continueLane)
-                                            .tvFocusRestorer { continueFirst },
+                                            .tvFocusEnterFallback { continueFirst }
+                                            // Hop 1: DOWN off the shelf always reaches the
+                                            // controls row, even mid-scroll (the controls item is
+                                            // composed whenever the shelf itself is focused, so no
+                                            // scrollFirst is needed here).
+                                            .tvDpadHop(onDown = { HopTarget(chipsFirst) })
+                                            .onFocusChanged { if (it.hasFocus) focusedRow.intValue = -1 },
                                     ) {
                                         itemsIndexed(
                                             sectionContinue,
@@ -703,13 +753,27 @@ private fun HomeContent(
                         // always composes the 960×540dp canvas; 96dp is grid padding) — it fits,
                         // scrolling would be dead weight, and a recycling LazyRow would
                         // re-introduce the restore-by-stale-hash focus bug this row's
-                        // tvFocusRestorer comment warns about. Fixed children keep chipsFirst
+                        // tvFocusEnterFallback comment warns about. Fixed children keep chipsFirst
                         // (attached to whichever pill is first) always composed and valid.
                         item(span = { GridItemSpan(maxLineSpan) }) {
                             val showChips = isEntertainment && chips.size > 1
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.tvFocusRestorer { chipsFirst },
+                                modifier = Modifier
+                                    .tvFocusEnterFallback { chipsFirst }
+                                    // Hop 2: UP off the controls row reaches the continue shelf's
+                                    // first card when this tab has one (scrolling it back into
+                                    // view first, since it may have recycled off the top); with no
+                                    // shelf this declines and the press falls through to the
+                                    // normal search, landing on the tab bar — tab-0 parity.
+                                    .tvDpadHop(
+                                        onUp = {
+                                            if (controlsUpHopTarget(hasShelf = sectionContinue.isNotEmpty()) == UpHop.ToShelf) {
+                                                HopTarget(continueFirst, scrollFirst = { gridState.scrollToItem(0) })
+                                            } else null
+                                        },
+                                    )
+                                    .onFocusChanged { if (it.hasFocus) focusedRow.intValue = -1 },
                             ) {
                                 if (showChips) {
                                     chips.forEachIndexed { chipIdx, chip ->
@@ -775,7 +839,12 @@ private fun HomeContent(
                                     isEntertainment = isEntertainment,
                                     posterUrl = posterUrl(row.title.poster),
                                     onOpenTitle = onTitleClick,
-                                    onFocused = { onCardFocused(BackdropItem(row.title.id, row.title.poster)) },
+                                    onFocused = {
+                                        onCardFocused(BackdropItem(row.title.id, row.title.poster))
+                                        // Hop 3 bookkeeping (see focusedRow's declaration above):
+                                        // i is this tile's own index into `rows`.
+                                        focusedRow.intValue = i
+                                    },
                                     focusRequester = if (i == firstTileRowIndex) firstTile else null,
                                     // Chip filtering removes/adds items; the remaining ones glide to
                                     // their new position instead of popping.
@@ -927,12 +996,12 @@ private fun LibraryTile(
     onFocused: (() -> Unit)? = null,
     focusRequester: FocusRequester? = null,
 ) {
-    Column(modifier.width(160.dp)) {
+    Column(modifier.width(132.dp)) {
         PosterCard(
             title = title.displayTitle,
             posterUrl = posterUrl,
             onClick = { onOpenTitle(title.id) },
-            widthDp = 160.dp,
+            widthDp = 132.dp,
             onFocused = onFocused,
             modifier = focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier,
         ) {
@@ -1251,18 +1320,18 @@ private fun HomeSkeleton() {
 
             Spacer(Modifier.height(16.dp))
             // Grid row 1 — the 2nd of the "top 2 rows" that shimmer. Width matches the real
-            // 160dp GridCells.Adaptive LibraryTile. 4 boxes at 160dp + 16dp spacing = 688dp, fits.
+            // 132dp GridCells.Adaptive LibraryTile. 5 boxes at 132dp + 16dp spacing = 724dp, fits.
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                repeat(4) {
-                    SkeletonBox(modifier = Modifier.width(160.dp).aspectRatio(2f / 3f), animated = true)
+                repeat(5) {
+                    SkeletonBox(modifier = Modifier.width(132.dp).aspectRatio(2f / 3f), animated = true)
                 }
             }
 
             Spacer(Modifier.height(16.dp))
             // Grid row 2 — below the fold, static.
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                repeat(4) {
-                    SkeletonBox(modifier = Modifier.width(160.dp).aspectRatio(2f / 3f), animated = false)
+                repeat(5) {
+                    SkeletonBox(modifier = Modifier.width(132.dp).aspectRatio(2f / 3f), animated = false)
                 }
             }
         }

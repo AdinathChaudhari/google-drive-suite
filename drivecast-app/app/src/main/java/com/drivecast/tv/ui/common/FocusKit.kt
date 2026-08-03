@@ -6,12 +6,20 @@ import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.foundation.focusGroup
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRestorer
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import kotlinx.coroutines.launch
 
 /**
  * One wrapper around [Modifier.focusRestorer] so the Compose 1.8 signature
@@ -43,13 +51,22 @@ fun Modifier.tvFocusRestorer(onRestoreFailed: (() -> FocusRequester)? = null): M
         // officially-timed, authoritative attempt and reports the true Redirected /
         // RedirectCancelled outcome, instead of a result we've already forced to "cancelled."
         // The crash guard is preserved for the one case it exists for: a genuinely-detached
-        // target (probe throws) degrades to a harmless Cancel no-op rather than a crash.
+        // target (probe throws) degrades to Default (NOT Cancel — see below) so search can
+        // still find something instead of crashing.
         val target = onRestoreFailed?.invoke() ?: FocusRequester.Default
         if (target == FocusRequester.Default || target == FocusRequester.Cancel) {
             target
         } else {
+            // On Android, AndroidComposeView's key-input path (dispatchKeyEvent ->
+            // focusSearch(direction) { it.requestFocus(direction) ?: true }) coerces a
+            // Cancelled requestFocus() result to `true`, which means "this move was handled
+            // (or cancelled) — stop searching, consume the press." A dead target here would
+            // therefore not degrade to a normal search landing on some other candidate; it
+            // would consume the D-pad press and leave focus wherever it last was (a dead
+            // press). Returning Default instead makes performCustomEnter report "no custom
+            // enter happened," so the search proceeds to find a real focusable child normally.
             val attached = runCatching { target.requestFocus() }.isSuccess
-            if (attached) target else FocusRequester.Cancel
+            if (attached) target else FocusRequester.Default
         }
     }.focusGroup()
 
@@ -123,4 +140,63 @@ fun PositionFocusedItemInLazyLayout(
         }
     }
     CompositionLocalProvider(LocalBringIntoViewSpec provides spec, content = content)
+}
+
+/**
+ * A [tvDpadHop] resolution: the requester to focus, and an optional suspend action (typically a
+ * lazy layout's `scrollToItem`) to run first when the target isn't attached yet — e.g. it's
+ * currently scrolled/recycled out of composition and needs to be brought back before it can take
+ * focus at all.
+ */
+class HopTarget(val requester: FocusRequester, val scrollFirst: (suspend () -> Unit)? = null)
+
+/**
+ * Bypasses Compose's focus search entirely for a DPAD UP/DOWN press on this node, in favor of a
+ * deterministic target — for the specific hops (continue shelf <-> controls row <-> first tile
+ * row) where the search's own two failure exits strand focus on a shelf tab (see tvFocusRestorer's
+ * and tvFocusEnterFallback's doc comments above, and the investigation this fixes: Cancel-from-
+ * enter consumes the press instead of redirecting, and a deactivated/recycling lane can be dropped
+ * from the candidate set mid-search). [onUp]/[onDown] resolve lazily on every matching press
+ * (rather than once) since the decision can depend on live state (e.g. "does this tab currently
+ * have a continue shelf"); returning null declines the hop for this press, leaving the key event
+ * unconsumed so it falls through to Compose's normal focus search exactly as if this modifier
+ * weren't here (e.g. a shelf-less tab's controls row still lets UP reach the tab bar).
+ *
+ * On a resolved [HopTarget], `requestFocus()` is tried first; only if that fails AND a
+ * [HopTarget.scrollFirst] was supplied does this launch it (then retry focus) — a lane that's
+ * still composed skips the scroll entirely, and a lane with no scroll option that fails to focus
+ * simply falls through rather than eating the press.
+ *
+ * Caution: this consumes the matching direction's KeyDown on its container wholesale. Any future
+ * lane inserted between the shelf, the controls row, and the tile grid will be shadowed by these
+ * hops until the resolvers wiring them (in HomeScreen.kt) are updated to route through it.
+ */
+@OptIn(ExperimentalComposeUiApi::class)
+fun Modifier.tvDpadHop(
+    onUp: (() -> HopTarget?)? = null,
+    onDown: (() -> HopTarget?)? = null,
+): Modifier = composed {
+    val scope = rememberCoroutineScope()
+    onPreviewKeyEvent { event ->
+        if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+        val resolver = when (event.key) {
+            Key.DirectionUp -> onUp
+            Key.DirectionDown -> onDown
+            else -> null
+        } ?: return@onPreviewKeyEvent false
+        val hop = resolver() ?: return@onPreviewKeyEvent false
+        when {
+            runCatching { hop.requester.requestFocus() }.isSuccess -> true
+            hop.scrollFirst != null -> {
+                val scrollFirst = hop.scrollFirst
+                val requester = hop.requester
+                scope.launch {
+                    scrollFirst()
+                    runCatching { requester.requestFocus() }
+                }
+                true
+            }
+            else -> false
+        }
+    }
 }
