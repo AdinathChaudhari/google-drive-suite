@@ -74,6 +74,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.runtime.DisposableEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -136,6 +140,40 @@ fun HomeScreen(
     val container = LocalAppContainer.current
     val vm: HomeViewModel = viewModel(factory = HomeViewModel.factory(container))
     val state by vm.state.collectAsStateWithLifecycle()
+
+    // A running scan keeps polling the server every 1.2s (see HomeViewModel.startPolling) —
+    // pause that while the app isn't in the foreground and re-attach on return, rather than
+    // leaking a poll loop against a backgrounded activity. Home's NavBackStackEntry-scoped
+    // LocalLifecycleOwner also fires ON_START/ON_STOP on a plain in-app back-nav (e.g. Detail/
+    // Player popping back to Home), not just an Activity-level foreground/background — so this
+    // is the same hook that re-fetches the watched map on resume (MAJOR 2), when sort ==
+    // WATCHED: whatever the user just watched must be reflected the moment Home is back on
+    // screen, not just on cold start — see the ON_START branch below for why that refresh is
+    // gated on the active sort instead of firing unconditionally.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> {
+                    vm.resumePolling()
+                    // Only refresh here when the active sort actually reads watchedMap — the
+                    // other three sort keys never consult it, so refreshing unconditionally would
+                    // re-sort the grid under a scroll position ON_START just restored, bypassing
+                    // the reorderEpoch machinery that exists to keep scroll and order consistent
+                    // (docs/DECISIONS.md D-014). A reorder here IS expected — and correct — when
+                    // sort == WATCHED and the user has just finished watching something; that's
+                    // the whole point of this hook, not a bug. pickSort(WATCHED) already covers
+                    // the mirror case of switching TO this sort.
+                    if (state.sort.key == SortKey.WATCHED) vm.refreshWatchedMap()
+                }
+                Lifecycle.Event.ON_STOP -> vm.pausePolling()
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
     val pendingDismiss = remember { mutableStateOf<ContinueItem?>(null) }
     val overlayRequest = remember { mutableStateOf<HomeOverlay?>(null) }
     // The Group overlay must show the EFFECTIVE group (post category-chip suppression) as
@@ -209,11 +247,13 @@ fun HomeScreen(
                                 if (titleId != null) onPlay(titleId, item.fileId)
                             },
                             onDismissRequest = { pendingDismiss.value = it },
-                            onRefresh = { vm.refresh() },
+                            onRefresh = { vm.rescan() },
                             onOpenSettings = onOpenSettings,
                             posterUrl = { key -> container.repository.posterUrl(key) },
                             sort = state.sort,
                             group = state.group,
+                            watchedMap = state.watchedMap,
+                            scan = state.scan,
                             reorderEpoch = reorderEpoch.intValue,
                             onOpenSortMenu = { overlayRequest.value = HomeOverlay.SORT },
                             onOpenGroupMenu = { effectiveGroup ->
@@ -287,6 +327,8 @@ private fun HomeContent(
     posterUrl: (String?) -> String?,
     sort: SortSpec,
     group: GroupKey,
+    watchedMap: Map<String, Double>,
+    scan: ScanUi,
     reorderEpoch: Int,
     onOpenSortMenu: () -> Unit,
     // Takes the active tab's effectiveGroup (not the raw pref) so the overlay it opens can show
@@ -418,11 +460,27 @@ private fun HomeContent(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Row(
+                    // fill = false: claims only what its content needs, but caps at the space the
+                    // trailing ⟳/⚙ icon Row leaves behind — without this a long status/notice Text
+                    // (the server's raw error can run to hundreds of chars) squeezes those
+                    // IconButtons toward zero width instead of the status line ellipsizing.
+                    modifier = Modifier.weight(1f, fill = false),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text("drivecast", style = MaterialTheme.typography.headlineMedium, color = Accent)
-                    if (refreshing) RefreshIndicator()
+                    if (refreshing || scan.running) RefreshIndicator()
+                    val statusText = scan.notice ?: scan.label
+                    if (statusText != null) {
+                        Text(
+                            statusText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (scan.notice != null && scan.noticeIsError) ErrorRed else TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                    }
                 }
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -498,8 +556,8 @@ private fun HomeContent(
                     val isEntertainment =
                         section?.behavior?.let { it == ENTERTAINMENT } ?: (sectionKey == ENTERTAINMENT)
 
-                    val sectionTitles = remember(bySection, sectionKey, sort) {
-                        sortTitles(bySection[sectionKey] ?: emptyList(), sort)
+                    val sectionTitles = remember(bySection, sectionKey, sort, watchedMap) {
+                        sortTitles(bySection[sectionKey] ?: emptyList(), sort, watchedMap)
                     }
                     val chips = remember(sectionTitles, isEntertainment) {
                         if (isEntertainment) visibleChips(sectionTitles) else emptyList()
@@ -753,8 +811,8 @@ private fun HomeContent(
 
                         // Controls row: category chips (entertainment only) + Sort/Group pills.
                         // Deliberately still a plain Row, NOT a LazyRow: worst case is 6 pills
-                        // ("All | Movies | TV Shows | Other | Sort: Oldest ⌄ | Group: Category ⌄"
-                        // ≈ 700–730dp incl. 5×8dp gaps) inside the 864dp content width (Fire TV
+                        // ("All | Movies | TV Shows | Other | Sort: Watched ↓ ⌄ | Group: Category ⌄"
+                        // ≈ 730–760dp incl. 5×8dp gaps) inside the 864dp content width (Fire TV
                         // always composes the 960×540dp canvas; 96dp is grid padding) — it fits,
                         // scrolling would be dead weight, and a recycling LazyRow would
                         // re-introduce the restore-by-stale-hash focus bug this row's
