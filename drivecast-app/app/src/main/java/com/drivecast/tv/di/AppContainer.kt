@@ -29,6 +29,7 @@ data class HomeData(
     val sections: List<SectionInfo>,
     val continueItems: List<ContinueItem>,
     val fetchedAtMs: Long,
+    val watchedMap: Map<String, Double> = emptyMap(),
 )
 
 /**

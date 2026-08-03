@@ -1,11 +1,14 @@
 package com.drivecast.tv.data
 
+import com.drivecast.tv.api.ApiError
 import com.drivecast.tv.api.AwakeStatus
 import com.drivecast.tv.api.ContinueItem
 import com.drivecast.tv.api.DrivecastApi
 import com.drivecast.tv.api.LibraryResponse
 import com.drivecast.tv.api.PlaylistItem
 import com.drivecast.tv.api.ProgressBody
+import com.drivecast.tv.api.RefreshStarted
+import com.drivecast.tv.api.RefreshStatus
 import com.drivecast.tv.api.RemoteInfo
 import com.drivecast.tv.api.SectionInfo
 import com.drivecast.tv.api.SettingsPatch
@@ -202,6 +205,32 @@ class LibraryRepository(
         withAutoRediscover { requireApi().streamRecent() }
     }
 
+    /** Ask the server to start a FULL rescan (walk every selected drive). */
+    suspend fun startRescan(): RescanStart = withContext(Dispatchers.IO) {
+        val resp = withAutoRediscover { requireApi().startRefresh() }
+        if (resp.isSuccessful) {
+            val body = resp.body() ?: RefreshStarted()
+            if (body.started) RescanStart.Started else RescanStart.AlreadyRunning
+        } else {
+            val err = runCatching {
+                json.decodeFromString<ApiError>(resp.errorBody()?.string().orEmpty())
+            }.getOrNull()
+            val fallback = when (resp.code()) {
+                503 -> "Server needs setup — open drivecast on your Mac."
+                400 -> "No drives selected. Pick drives in Settings."
+                else -> "Rescan failed (HTTP ${resp.code()})."
+            }
+            RescanStart.Rejected(err?.message?.ifBlank { null } ?: fallback)
+        }
+    }
+
+    /** One poll of the running scan. Deliberately NOT wrapped in withAutoRediscover:
+     *  a dead server mid-poll must fail fast (the caller counts failures), not sweep
+     *  the /24 every 1.2 seconds. */
+    suspend fun rescanStatus(): RefreshStatus = withContext(Dispatchers.IO) {
+        requireApi().refreshStatus()
+    }
+
     // ---- keep-awake ("Are you still watching?") ----
 
     suspend fun awakeStatus(): AwakeStatus = withContext(Dispatchers.IO) { requireApi().awakeStatus() }
@@ -296,6 +325,14 @@ fun toTabPatch(sections: List<SectionInfo>): List<TabPatch> = sections.map { sec
         accent = section.accent,
         accent2 = section.accent2,
     )
+}
+
+/** Outcome of asking the server to start a full rescan. */
+sealed interface RescanStart {
+    data object Started : RescanStart
+    data object AlreadyRunning : RescanStart
+    /** Server refused with a human-readable reason (503 setup, 400 no_drives). */
+    data class Rejected(val message: String) : RescanStart
 }
 
 /** Holds the live access token so the shared interceptor can read it after re-pairing. */
