@@ -5,7 +5,8 @@ import com.drivecast.tv.api.Title
 enum class SortKey(val id: String, val defaultAscending: Boolean) {
     RECENT("recent", defaultAscending = false),
     TITLE("title", defaultAscending = true),
-    YEAR("year", defaultAscending = false);
+    YEAR("year", defaultAscending = false),
+    WATCHED("watched", defaultAscending = false);
     companion object { fun fromId(id: String?): SortKey = entries.firstOrNull { it.id == id } ?: RECENT }
 }
 
@@ -15,7 +16,7 @@ data class SortSpec(
 )
 
 enum class GroupKey(val id: String) {
-    NONE("none"), CATEGORY("category");
+    NONE("none"), TYPE("type"), CATEGORY("category");
     companion object { fun fromId(id: String?): GroupKey = entries.firstOrNull { it.id == id } ?: NONE }
 }
 
@@ -27,21 +28,36 @@ fun nextSortSpec(current: SortSpec, picked: SortKey): SortSpec =
     if (picked == current.key) current.copy(ascending = !current.ascending)
     else SortSpec(picked, picked.defaultAscending)
 
-fun sortTitles(titles: List<Title>, spec: SortSpec): List<Title> = titles.sortedWith(comparatorFor(spec))
+fun sortTitles(titles: List<Title>, spec: SortSpec, watchedMap: Map<String, Double> = emptyMap()): List<Title> =
+    titles.sortedWith(comparatorFor(spec, watchedMap))
 
 // Nulls last REGARDLESS of direction: direction is applied inside the non-null branch only —
-// never via Comparator.reversed(), which would move nulls first.
-internal fun comparatorFor(spec: SortSpec): Comparator<Title> {
+// never via Comparator.reversed(), which would move nulls first. The comparator stays PURE: the
+// watched-map is passed in, never read from a singleton.
+internal fun comparatorFor(spec: SortSpec, watchedMap: Map<String, Double> = emptyMap()): Comparator<Title> {
     val titleTiebreak = compareBy<Title>({ it.displayTitle.lowercase() }, { it.id })
     return when (spec.key) {
-        SortKey.RECENT -> nullsLastBy(spec.ascending) { it.addedAt }.then(titleTiebreak)
-        SortKey.YEAR   -> nullsLastBy(spec.ascending) { it.year }.then(titleTiebreak)
-        SortKey.TITLE  -> {
+        SortKey.RECENT  -> nullsLastBy(spec.ascending) { it.addedAt }.then(titleTiebreak)
+        SortKey.YEAR    -> nullsLastBy(spec.ascending) { it.year }.then(titleTiebreak)
+        SortKey.WATCHED -> nullsLastBy(spec.ascending) { lastPlayedOf(it, watchedMap) }.then(titleTiebreak)
+        SortKey.TITLE   -> {
             val primary = compareBy<Title> { it.displayTitle.lowercase() } // displayTitle is never null ("Untitled" fallback)
             (if (spec.ascending) primary else primary.reversed()).thenBy { it.id }
         }
     }
 }
+
+/** Newest last-played epoch across a title's playable files; null = never watched
+ *  (sorts LAST in both directions via nullsLastBy — the canonical nulls rule).
+ *  Mirrors app.js fileIdsOf/lastPlayedOf: shows aggregate over ALL seasons'
+ *  episodes (including extras pseudo-seasons); movies use file_id only (movie
+ *  `extras` do NOT count, matching the web). */
+internal fun lastPlayedOf(title: Title, watchedMap: Map<String, Double>): Double? =
+    fileIdsOf(title).mapNotNull { watchedMap[it] }.maxOrNull()
+
+internal fun fileIdsOf(title: Title): List<String> =
+    if (title.isShow) title.seasons.flatMap { s -> s.episodes.mapNotNull { it.fileId } }
+    else listOfNotNull(title.fileId)
 
 private fun <K : Comparable<K>> nullsLastBy(ascending: Boolean, selector: (Title) -> K?): Comparator<Title> =
     Comparator { a, b ->
@@ -62,17 +78,28 @@ sealed interface GridRow {
 
 /**
  * [sortedTitles] must already be sorted (groupBy is stable, so within-group order == sort order).
- * NONE -> tiles only, no headers. CATEGORY -> Movies, TV Shows, then trailing "Other"
- * (unknown category values); empty groups omitted. Mirrors the chip vocabulary exactly.
+ * NONE -> tiles only, no headers. TYPE -> Movies, TV Shows (structural: title.isShow, so nothing
+ * is ever dropped). CATEGORY -> Movies, TV Shows, then trailing "Other" (unknown category values);
+ * empty groups omitted. Mirrors the chip vocabulary exactly.
  */
-fun buildGridRows(sortedTitles: List<Title>, group: GroupKey): List<GridRow> {
-    if (group == GroupKey.NONE) return sortedTitles.map { GridRow.Tile(it) }
-    val buckets = sortedTitles.groupBy { categoryOf(it).let { c -> if (c in KNOWN_CATEGORIES) c else "other" } }
-    return buildList {
-        listOf("movie" to "Movies", "show" to "TV Shows", "other" to "Other").forEach { (cat, label) ->
-            buckets[cat]?.let { titles ->
-                add(GridRow.Header(label))
-                titles.forEach { add(GridRow.Tile(it)) }
+fun buildGridRows(sortedTitles: List<Title>, group: GroupKey): List<GridRow> = when (group) {
+    GroupKey.NONE -> sortedTitles.map { GridRow.Tile(it) }
+    GroupKey.TYPE -> {
+        val buckets = sortedTitles.groupBy { if (it.isShow) "show" else "movie" }
+        buildList {
+            listOf("movie" to "Movies", "show" to "TV Shows").forEach { (k, label) ->
+                buckets[k]?.let { add(GridRow.Header(label)); it.forEach { t -> add(GridRow.Tile(t)) } }
+            }
+        }
+    }
+    GroupKey.CATEGORY -> {
+        val buckets = sortedTitles.groupBy { categoryOf(it).let { c -> if (c in KNOWN_CATEGORIES) c else "other" } }
+        buildList {
+            listOf("movie" to "Movies", "show" to "TV Shows", "other" to "Other").forEach { (cat, label) ->
+                buckets[cat]?.let { titles ->
+                    add(GridRow.Header(label))
+                    titles.forEach { add(GridRow.Tile(it)) }
+                }
             }
         }
     }
@@ -80,13 +107,17 @@ fun buildGridRows(sortedTitles: List<Title>, group: GroupKey): List<GridRow> {
 
 // ---- Pill / overlay labels (pure, unit-tested) ----
 fun sortPillLabel(spec: SortSpec): String = when (spec.key) {
-    SortKey.RECENT -> if (spec.ascending) "Sort: Oldest" else "Sort: Recent"
-    SortKey.TITLE  -> if (spec.ascending) "Sort: A–Z" else "Sort: Z–A"
-    SortKey.YEAR   -> if (spec.ascending) "Sort: Year ↑" else "Sort: Year ↓"
+    SortKey.RECENT  -> if (spec.ascending) "Sort: Oldest" else "Sort: Recent"
+    SortKey.TITLE   -> if (spec.ascending) "Sort: A–Z" else "Sort: Z–A"
+    SortKey.YEAR    -> if (spec.ascending) "Sort: Year ↑" else "Sort: Year ↓"
+    SortKey.WATCHED -> if (spec.ascending) "Sort: Watched ↑" else "Sort: Watched ↓"
 }
 
-fun groupPillLabel(group: GroupKey): String =
-    if (group == GroupKey.NONE) "Group: None" else "Group: Category"
+fun groupPillLabel(group: GroupKey): String = when (group) {
+    GroupKey.NONE -> "Group: None"
+    GroupKey.TYPE -> "Group: Type"
+    GroupKey.CATEGORY -> "Group: Category"
+}
 
 /**
  * The group actually applied to the grid: a specific category chip already narrows the tab down
@@ -99,7 +130,12 @@ fun effectiveGroupFor(isEntertainment: Boolean, selectedCat: String?, group: Gro
 
 /** Active key shows its live direction (SELECT on it flips); inactive keys show just the name. */
 fun sortOptionLabel(key: SortKey, current: SortSpec): String {
-    val base = when (key) { SortKey.RECENT -> "Recently added"; SortKey.TITLE -> "Title"; SortKey.YEAR -> "Year" }
+    val base = when (key) {
+        SortKey.RECENT -> "Recently added"
+        SortKey.TITLE -> "Title"
+        SortKey.YEAR -> "Year"
+        SortKey.WATCHED -> "Recently watched"
+    }
     if (key != current.key) return base
     val dir = when (key) {
         SortKey.TITLE -> if (current.ascending) "A–Z" else "Z–A"
@@ -108,8 +144,11 @@ fun sortOptionLabel(key: SortKey, current: SortSpec): String {
     return "$base · $dir"
 }
 
-fun groupOptionLabel(group: GroupKey): String =
-    if (group == GroupKey.NONE) "None" else "Category"
+fun groupOptionLabel(group: GroupKey): String = when (group) {
+    GroupKey.NONE -> "None"
+    GroupKey.TYPE -> "Type"
+    GroupKey.CATEGORY -> "Category"
+}
 
 // ---- MOVED (verbatim, made internal) from HomeScreen.kt lines 701–724 ----
 internal fun categoryOf(title: Title): String =
