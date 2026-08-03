@@ -55,6 +55,7 @@ than no entry.
 | [D-014](#d-014--never-key-a-saveablestateprovider-on-state-you-want-to-reset) | Never key a `SaveableStateProvider` on state you want to reset | Adapted | drivecast-app |
 | [D-015](#d-015--on-android-a-cancelled-focus-enter-consumes-the-d-pad-press) | On Android, a cancelled focus-enter *consumes* the D-pad press | Adapted | drivecast-app |
 | [D-016](#d-016--bring-into-view-follows-the-focus-target-not-the-tile) | Bring-into-view follows the focus target, not the tile | Adopted | drivecast-app |
+| [D-017](#d-017--a-tab-less-drive-silently-disabled-per-drive-refresh) | A tab-less drive silently disabled per-drive refresh | Adopted | drivecast |
 
 ---
 
@@ -490,3 +491,40 @@ than no entry.
   wrap the labels. Either changes which node should own the request; the rule
   to keep is that whatever asks for bring-into-view must be the thing you
   actually need on screen.
+
+### D-017 — A tab-less drive silently disabled per-drive refresh
+**Status:** Adopted · **When:** 2026-08-03
+
+- **Hit** — after per-drive refresh scoping shipped ([D-013](#d-013--selected-drive-order-is-data-not-presentation)),
+  refreshes were still walking all 35 drives. Separately, ticking a new drive in
+  Settings and saving appeared to do nothing at all.
+- **Learned** — one root cause behind both. A drive with **no tab assignment**
+  classifies into nothing: it is walked, produces no records, and therefore never
+  earns a `scan_cache` entry. `Scanner.scan`'s escalation guard treated any
+  uncached selected drive as "would lose its titles in a rebuild" and escalated
+  the scope to every selected drive — so a single unassigned drive turned *every*
+  scoped refresh, per-drive button included, into a full re-walk, permanently,
+  because walking it again could never produce the cache entry that would end the
+  escalation. The server had been reporting the cause all along in
+  `/api/refresh/status.warning` ("N drive(s) need a tab assignment in Settings")
+  and **no client displayed it**. The web Settings compounded it: the tab picker
+  was only built for drives *already* included (`openSettings`), so a drive ticked
+  in the current visit never showed one, and `saveSettings`' "choose a tab for
+  every included drive" guard — which walks `select.drive-section` — never saw the
+  row. The drive saved unassigned, scanned, and vanished into nothing.
+- **Did** — three changes, one per layer. The escalation guard now exempts drives
+  that resolve to no section (`sections.section_for_drive(...) is None`), matching
+  what `maybe_autorefresh` already did; such a drive has no titles to lose, so the
+  guard was protecting nothing. The tab picker is built for every drive row and
+  revealed the moment its checkbox is ticked, focus moving to it, so the blocked
+  save can actually be acted on — and the block now names the offending drive.
+  `pollScan` surfaces `status.warning`. Two tests pin the guard: a tab-less
+  uncached sibling must NOT escalate, an assigned uncached sibling still must.
+- **Where** — `drivecast/drivecast/library.py` § `Scanner.scan` (the `needs_cache`
+  filter), `drivecast/drivecast/static/app.js` § `openSettings` / `saveSettings` /
+  `pollScan`, `drivecast/drivecast/test_library.py` §
+  `test_tabless_drive_does_not_escalate_a_scoped_scan` and
+  § `test_assigned_uncached_sibling_still_escalates`.
+- **Revisit when** — drives get a default tab again. A zero-default tab model is
+  what makes "selected but classifies into nothing" reachable at all; restore a
+  fallback and this whole failure mode disappears with it.

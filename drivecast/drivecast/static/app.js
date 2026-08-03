@@ -783,6 +783,10 @@ async function pollScan() {
     $("refreshBtn").classList.remove("spinning");
     show(bar, false);
     if (st.error) toast("Scan finished with issues: " + st.error, "error");
+    // The server has always reported this; nothing ever displayed it. A drive with
+    // no tab is scanned and then dropped on the floor, so without this the user
+    // sees a refresh "succeed" and change nothing, with no clue why.
+    else if (st.warning) toast(st.warning, "error");
     await loadLibrary();
     if (currentRoute() === "library") { renderLibrary(); loadContinue(); }
   }
@@ -1277,7 +1281,15 @@ async function openSettings() {
     label.className = "drive-row";
     label.innerHTML = `<input type="checkbox" value="${escapeHTML(d.id)}" ${selected.has(d.id) ? "checked" : ""}>
       <span class="drive-name">${escapeHTML(d.name || d.id)}</span>`;
-    if (selected.has(d.id)) {
+    // The tab picker is built for EVERY drive, not just the already-included ones,
+    // and revealed the moment its checkbox is ticked. Building it only for
+    // `selected.has(d.id)` meant a drive you included in *this* visit never showed
+    // one — so saveSettings' "choose a tab for every included drive" guard (which
+    // walks select.drive-section) never saw the row, the drive saved with no tab,
+    // and an unassigned drive classifies into nothing: the scoped rescan ran, found
+    // no section to file anything under, wrote no records and no scan-cache entry,
+    // and the user saw precisely nothing happen.
+    {
       // Tab assignment for included drives — no default, the drive stays on
       // the placeholder until the user actively picks (or creates) a tab.
       const sel = document.createElement("select");
@@ -1305,6 +1317,22 @@ async function openSettings() {
         refreshDrives([d.id], d.name || d.id);
       });
       label.appendChild(btn);
+
+      // Reveal the picker exactly when the drive is included, and pull focus to it
+      // on a fresh tick so the next thing the user sees is "which tab?" rather than
+      // a silently-unassigned drive. The per-drive ⟳ is meaningless until the drive
+      // has a tab (nothing would be classified), so it hides with the picker.
+      const cb = label.querySelector("input[type=checkbox]");
+      const syncRow = (focusOnReveal) => {
+        const on = cb.checked;
+        show(sel, on);
+        show(btn, on && !!assigned[d.id]);
+        label.classList.toggle("drive-row-pending", on && !sel.value);
+        if (on && focusOnReveal && !sel.value) sel.focus();
+      };
+      cb.addEventListener("change", () => syncRow(true));
+      sel.addEventListener("change", () => syncRow(false));
+      syncRow(false);
     }
     list.appendChild(label);
   }
@@ -1398,11 +1426,20 @@ async function saveSettings() {
     const cb = sel.closest("label").querySelector("input[type=checkbox]");
     if (cb && !cb.checked) continue;
     if (!sel.value || sel.value === "__new__") {
-      $("settingsMsg").textContent = "Choose a tab for every included drive before saving.";
+      // Name the drive rather than saying "every included drive": with 36 rows the
+      // generic message left the user hunting for which one was blocking the save.
+      const row = sel.closest("label");
+      const name = (row && row.querySelector(".drive-name").textContent) || "This drive";
+      $("settingsMsg").textContent = `Pick a tab for “${name}” before saving — a drive with no tab has nowhere to file its titles, so it would be scanned and then ignored.`;
+      if (row) row.classList.add("drive-row-pending");
+      sel.focus();
       return;
     }
     driveSections[sel.dataset.driveId] = sel.value;
   }
+  // What's newly included in THIS save — used only to name the drive in the toast
+  // below, so "refresh just that drive" is visibly true rather than merely claimed.
+  const newlyAdded = selected.filter((id) => !(state.selectedDrives || []).includes(id));
   $("settingsMsg").textContent = "Saving…";
   try {
     const res = await api("/api/settings", {
@@ -1424,7 +1461,19 @@ async function saveSettings() {
     if ($("remoteRestartNote")) show($("remoteRestartNote"), !!res.restart_required);
     if (res.restart_required) toast("Restart drivecast to apply remote access.");
     await renderRemoteBlock();
-    if (res.refresh_started) { toast("Updating library…"); startScanWatch(); }
+    if (res.refresh_started) {
+      // Name the drive when exactly one was just added — the whole point of the
+      // scoped refresh is that it is NOT a full rescan, so say so.
+      const names = newlyAdded.map((id) => {
+        const cb = $("driveList").querySelector(`input[value="${CSS.escape(id)}"]`);
+        const row = cb && cb.closest("label");
+        return (row && row.querySelector(".drive-name").textContent) || id;
+      });
+      toast(names.length === 1 ? `Scanning ${names[0]}…`
+            : names.length ? `Scanning ${names.length} new drives…`
+            : "Updating library…");
+      startScanWatch();
+    }
   } catch (e) {
     $("settingsMsg").textContent = "Save failed: " + e.message;
   }
