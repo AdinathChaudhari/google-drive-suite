@@ -92,8 +92,11 @@ theming.
   architecture, the Osho-plugin note above.
 - [`drive-offload/CLAUDE.md`](drive-offload/CLAUDE.md) — the flat-layout
   rule above, plus the yt-show/yt-video pipeline internals.
-- `drivecast-app/` has no CLAUDE.md yet; see its README for build/sideload
-  instructions.
+- [`drivecast-app/CLAUDE.md`](drivecast-app/CLAUDE.md) — stack, hard focus/Compose
+  invariants, and the SeededShuffle-parity note.
+- [`docs/FEATURE-PARITY.md`](docs/FEATURE-PARITY.md) — living checklist of
+  what the web UI vs. the Fire TV client can do, the canonical sort/group
+  vocabulary both must speak, and which gaps between them are deliberate.
 
 ## Testing
 

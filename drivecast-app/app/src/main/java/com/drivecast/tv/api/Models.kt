@@ -232,3 +232,33 @@ data class StreamActivity(
     val ts: Double? = null,
     val age: Double? = null,
 )
+
+/** POST /api/refresh 200 body. {started:false, running:true} = a scan was already going. */
+@Serializable
+data class RefreshStarted(
+    val started: Boolean = false,
+    val running: Boolean = false,
+    val scope: List<String> = emptyList(),
+)
+
+/** GET /api/refresh/status — mirrors Scanner.status (drivecast/drivecast/library.py:1106-1112).
+ *  total == 0 while running means a cache-only rebuild, NOT "0 of 0 scanned". */
+@Serializable
+data class RefreshStatus(
+    val running: Boolean = false,
+    val scanned: Int = 0,
+    val total: Int = 0,
+    val added: Int = 0,
+    val removed: Int = 0,
+    val error: String? = null,
+    val warning: String? = null,
+    val scope: List<String> = emptyList(),
+    @SerialName("scope_names") val scopeNames: List<String> = emptyList(),
+)
+
+/** Error envelope for 503 {"error":"setup",...} and 400 {"error":"no_drives",...}. */
+@Serializable
+data class ApiError(
+    val error: String? = null,
+    val message: String? = null,
+)
