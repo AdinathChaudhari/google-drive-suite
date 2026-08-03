@@ -54,6 +54,7 @@ than no entry.
 | [D-013](#d-013--selected-drive-order-is-data-not-presentation) | Selected-drive *order* is data, not presentation | Adopted | drivecast |
 | [D-014](#d-014--never-key-a-saveablestateprovider-on-state-you-want-to-reset) | Never key a `SaveableStateProvider` on state you want to reset | Adapted | drivecast-app |
 | [D-015](#d-015--on-android-a-cancelled-focus-enter-consumes-the-d-pad-press) | On Android, a cancelled focus-enter *consumes* the D-pad press | Adapted | drivecast-app |
+| [D-016](#d-016--bring-into-view-follows-the-focus-target-not-the-tile) | Bring-into-view follows the focus target, not the tile | Adopted | drivecast-app |
 
 ---
 
@@ -450,3 +451,42 @@ than no entry.
   cannot actually prove focus moved — every path tested moved focus, but a
   future lane inserted between shelf/controls/tiles could turn that into a dead
   press if its resolvers are not updated.
+
+### D-016 — Bring-into-view follows the focus target, not the tile
+**Status:** Adopted · **When:** 2026-08-02
+
+- **Hit** — on the last row of the home grid, a tile's name and year were
+  unreachable: scrolled all the way down, the poster sat flush with the bottom
+  edge and its labels stayed underneath it, at every scroll position. Reported
+  as "you cannot even see the name of the movie in last tile".
+- **Learned** — it is not a height budget being exceeded, which is why two
+  plausible fixes both failed. The focus target is the poster `Card`, while
+  `LibraryTile` puts the name and year *below* it as siblings in the same
+  `Column`. `PositionFocusedItemInLazyLayout`'s spec opens with
+  `if (offset >= 0f && offset + size <= containerSize) return 0f` — and `size`
+  is the **requesting node**, the poster. Once the poster is fully on screen
+  the grid is told no scrolling is needed, and the labels are never in the
+  calculation at all. Two attempts that only changed the odds:
+  - Raising the grid's bottom `contentPadding` 48dp → 96dp. Measured: the name
+    came into view, the year still clipped (1075..1080 of 28px needed).
+  - Shrinking the tile. Measured across three sizes, each clipping a *different*
+    amount — 160dp cut name+year, 132dp showed the name and cut the year, and
+    124dp cut the name again at 13px of 33. Smaller tiles just relocate where
+    the poster's bottom lands relative to the screen edge.
+  A smaller *font* fails the same way and fails arithmetic too: the measured
+  deficit was 23px, and dropping name/year from 14/13sp to 12/11sp recovers
+  about 9px, to an unreadable 10/9sp about 18px — while 12sp is the floor of
+  the type scale for a 10-foot UI.
+- **Did** — a `BringIntoViewRequester` on `LibraryTile`'s `Column`, triggered
+  from the poster's `onFocused`, so the request carries the whole tile's
+  height. Deliberately not a scroll-behaviour change in the common case: the
+  same spec still returns `0f` when the Column is already fully visible, so
+  only an edge row ever moves. Verified on the stick — zero clipped labels,
+  last row reads poster 626..998, name 1010..1043, year 1043..1071.
+- **Where** — `drivecast-app/app/src/main/java/com/drivecast/tv/ui/home/HomeScreen.kt`
+  (`LibraryTile`), `ui/common/FocusKit.kt` (`PositionFocusedItemInLazyLayout`,
+  the `return 0f` short-circuit).
+- **Revisit when** — a tile grows a third line, or the focus treatment moves to
+  wrap the labels. Either changes which node should own the request; the rule
+  to keep is that whatever asks for bring-into-view must be the thing you
+  actually need on screen.
