@@ -1210,6 +1210,36 @@ def test_partial_scope_escalates_when_sibling_cache_missing(tmp_path):
     assert {t["id"] for t in lib.titles_list()} == {"mv1", "mv2"}
 
 
+def test_tabless_drive_does_not_escalate_a_scoped_scan(tmp_path):
+    # A drive with no tab assignment classifies into nothing, so it never earns a
+    # cache entry no matter how often it is walked. Counting it as an "uncached
+    # sibling" made it a PERMANENT escalation trigger: one unassigned drive turned
+    # every scoped refresh — including the per-drive button — into a full re-walk.
+    # It also has no titles to lose in a rebuild, which is what the guard protects.
+    tree = _two_drive_tree()
+    lib = library.Library(path=str(tmp_path / "library.json"))
+    scanner = library.Scanner(_FakeScanAPI(tree), _DisabledTMDB(), lib, throttle=0,
+                              cache=_cache(tmp_path))
+    # drv1 assigned + scanned; drv2 selected but assigned to NO tab.
+    asyncio.run(scanner.scan(["drv1", "drv2"], scope=["drv1"], drive_sections=_ent("drv1")))
+    assert scanner.status["total"] == 1                     # scoped, NOT escalated
+    assert scanner.status["scope"] == ["drv1"]
+    assert {t["id"] for t in lib.titles_list()} == {"mv1"}   # drv2 contributes nothing
+
+
+def test_assigned_uncached_sibling_still_escalates(tmp_path):
+    # The counterpart to the above: an uncached sibling that DOES have a tab still
+    # forces the escalation, because it genuinely would lose titles in a rebuild.
+    tree = _two_drive_tree()
+    lib = library.Library(path=str(tmp_path / "library.json"))
+    scanner = library.Scanner(_FakeScanAPI(tree), _DisabledTMDB(), lib, throttle=0,
+                              cache=_cache(tmp_path))
+    asyncio.run(scanner.scan(["drv1", "drv2"], scope=["drv1"],
+                             drive_sections=_ent("drv1", "drv2")))
+    assert scanner.status["total"] == 2
+    assert {t["id"] for t in lib.titles_list()} == {"mv1", "mv2"}
+
+
 def test_deselected_drive_pruned_from_cache_and_library(tmp_path):
     tree = _two_drive_tree()
     lib = library.Library(path=str(tmp_path / "library.json"))

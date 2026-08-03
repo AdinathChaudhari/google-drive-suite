@@ -1,5 +1,7 @@
 package com.drivecast.tv.ui.home
 
+import com.drivecast.tv.api.Episode
+import com.drivecast.tv.api.Season
 import com.drivecast.tv.api.Title
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -12,7 +14,24 @@ private fun t(
     addedAt: Double? = null,
     category: String? = null,
     type: String? = null,
-) = Title(id = id, title = title, year = year, addedAt = addedAt, category = category, type = type)
+    fileId: String? = null,
+) = Title(id = id, title = title, year = year, addedAt = addedAt, category = category, type = type, fileId = fileId)
+
+/** Builds a show Title with the given seasons' episode file IDs (a "extras" pseudo-season is
+ *  marked via [Season.extras] on the season carrying the given name). */
+private fun show(id: String, vararg seasons: Pair<String, List<String?>>, extrasSeasonName: String? = null) =
+    Title(
+        id = id,
+        title = id,
+        type = "show",
+        seasons = seasons.map { (name, fileIds) ->
+            Season(
+                name = name,
+                extras = name == extrasSeasonName,
+                episodes = fileIds.map { Episode(fileId = it) },
+            )
+        },
+    )
 
 class SortAndGroupTest {
 
@@ -260,5 +279,128 @@ class SortAndGroupTest {
         assertEquals("Year · Newest first", sortOptionLabel(SortKey.YEAR, yearDesc))
         val yearAsc = SortSpec(SortKey.YEAR, ascending = true)
         assertEquals("Year · Oldest first", sortOptionLabel(SortKey.YEAR, yearAsc))
+
+        assertEquals("Sort: Watched ↓", sortPillLabel(SortSpec(SortKey.WATCHED, ascending = false)))
+        assertEquals("Sort: Watched ↑", sortPillLabel(SortSpec(SortKey.WATCHED, ascending = true)))
+        val watchedDesc = SortSpec(SortKey.WATCHED, ascending = false)
+        assertEquals("Recently watched · Newest first", sortOptionLabel(SortKey.WATCHED, watchedDesc))
+        val watchedAsc = SortSpec(SortKey.WATCHED, ascending = true)
+        assertEquals("Recently watched · Oldest first", sortOptionLabel(SortKey.WATCHED, watchedAsc))
+        assertEquals("Recently watched", sortOptionLabel(SortKey.WATCHED, recentDesc))
+
+        assertEquals("Group: None", groupPillLabel(GroupKey.NONE))
+        assertEquals("Group: Type", groupPillLabel(GroupKey.TYPE))
+        assertEquals("Group: Category", groupPillLabel(GroupKey.CATEGORY))
+        assertEquals("None", groupOptionLabel(GroupKey.NONE))
+        assertEquals("Type", groupOptionLabel(GroupKey.TYPE))
+        assertEquals("Category", groupOptionLabel(GroupKey.CATEGORY))
+    }
+
+    // ---- watched-key comparator (map passed in, never a singleton) ----
+
+    @Test
+    fun watchedDescending_newestFirst_neverWatchedLast() {
+        val watchedMap = mapOf("f-a" to 100.0, "f-b" to 300.0, "f-d" to 200.0)
+        val input = listOf(
+            t("a", fileId = "f-a"),
+            t("b", fileId = "f-b"),
+            t("c", fileId = "f-c"),   // no entry in the map -> never watched
+            t("d", fileId = "f-d"),
+        )
+        val result = sortTitles(input, SortSpec(SortKey.WATCHED, ascending = false), watchedMap)
+        assertEquals(listOf("b", "d", "a", "c"), result.map { it.id })
+    }
+
+    @Test
+    fun watchedAscending_oldestFirst_neverWatchedStillLast() {
+        val watchedMap = mapOf("f-a" to 100.0, "f-b" to 300.0, "f-d" to 200.0)
+        val input = listOf(
+            t("a", fileId = "f-a"),
+            t("b", fileId = "f-b"),
+            t("c", fileId = "f-c"),
+            t("d", fileId = "f-d"),
+        )
+        val result = sortTitles(input, SortSpec(SortKey.WATCHED, ascending = true), watchedMap)
+        assertEquals(listOf("a", "d", "b", "c"), result.map { it.id })
+    }
+
+    @Test
+    fun watchedTies_brokenByTitleAscending() {
+        val watchedMap = mapOf("f-a" to 100.0, "f-b" to 100.0, "f-c" to 100.0)
+        val input = listOf(
+            t("a", title = "Banana", fileId = "f-a"),
+            t("b", title = "apple", fileId = "f-b"),
+            t("c", title = "Cherry", fileId = "f-c"),
+        )
+        val result = sortTitles(input, SortSpec(SortKey.WATCHED, ascending = false), watchedMap)
+        assertEquals(listOf("apple", "Banana", "Cherry"), result.map { it.displayTitle })
+    }
+
+    @Test
+    fun watched_showAggregatesMaxAcrossAllSeasonsEpisodes() {
+        val watchedMap = mapOf("s1e1" to 100.0, "s1e2" to 500.0, "extra1" to 900.0)
+        val title = show(
+            "sh1",
+            "Season 1" to listOf("s1e1", "s1e2"),
+            "Featurettes" to listOf("extra1"),
+            extrasSeasonName = "Featurettes",
+        )
+        // The max across every season INCLUDING the extras pseudo-season is 900.0.
+        assertEquals(900.0, lastPlayedOf(title, watchedMap))
+    }
+
+    @Test
+    fun watched_movieUsesFileIdOnly_movieExtrasIgnored() {
+        val watchedMap = mapOf("m1" to 50.0, "extra-of-m1" to 999.0)
+        // A movie's `extras` list uses the Season shape too, but must NOT feed lastPlayedOf.
+        val movie = Title(
+            id = "m1",
+            title = "m1",
+            fileId = "m1",
+            extras = listOf(Season(name = "Extras", extras = true, episodes = listOf(Episode(fileId = "extra-of-m1")))),
+        )
+        assertEquals(50.0, lastPlayedOf(movie, watchedMap))
+    }
+
+    @Test
+    fun watched_emptyMap_allNull_fallsBackToTitleOrder() {
+        val input = listOf(t("a", title = "Banana", fileId = "f-a"), t("b", title = "apple", fileId = "f-b"))
+        val result = sortTitles(input, SortSpec(SortKey.WATCHED, ascending = false), emptyMap())
+        assertEquals(listOf("apple", "Banana"), result.map { it.displayTitle })
+    }
+
+    // ---- buildGridRows(..., GroupKey.TYPE) ----
+
+    @Test
+    fun buildGridRows_type_orderIsMoviesThenShows_emptyOmitted() {
+        val input = listOf(t("m1", type = "movie"), t("s1", type = "show"))
+        val rows = buildGridRows(input, GroupKey.TYPE)
+        assertEquals(
+            listOf("Movies", "m1", "TV Shows", "s1"),
+            rows.map { when (it) { is GridRow.Header -> it.label; is GridRow.Tile -> it.title.id } },
+        )
+
+        val moviesOnly = buildGridRows(listOf(t("m1", type = "movie"), t("m2", type = "movie")), GroupKey.TYPE)
+        assertEquals(listOf("Movies"), moviesOnly.filterIsInstance<GridRow.Header>().map { it.label })
+    }
+
+    @Test
+    fun buildGridRows_type_nullType_bucketsViaIsShow_nothingDropped() {
+        val input = listOf(
+            t("show1", type = null).copy(seasons = listOf(Season(season = 1, episodes = emptyList()))),
+            t("movie1", type = null),
+            t("documentary1", type = "documentary"),
+        )
+        val rows = buildGridRows(input, GroupKey.TYPE)
+        val tiles = rows.filterIsInstance<GridRow.Tile>().map { it.title.id }
+        assertEquals(input.size, tiles.size)   // count in == count out, nothing dropped
+        val headers = rows.filterIsInstance<GridRow.Header>().map { it.label }
+        assertEquals(listOf("Movies", "TV Shows"), headers)
+    }
+
+    @Test
+    fun sortKeyFromId_watched_andGroupKeyFromId_type() {
+        assertEquals(SortKey.WATCHED, SortKey.fromId("watched"))
+        assertEquals(GroupKey.TYPE, GroupKey.fromId("type"))
     }
 }

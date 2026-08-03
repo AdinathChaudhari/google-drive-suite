@@ -467,6 +467,11 @@ h2 { font-size: 16px; font-weight: 600; margin: 0 0 14px; color: var(--text-2); 
 }
 .drive-row:hover .drive-refresh { opacity: 1; }
 .drive-refresh:hover { color: var(--link); border-color: var(--accent); }
+/* A drive that has just been ticked but has no tab yet. Save is blocked until it
+   does, so mark the row rather than letting it look finished — an unassigned drive
+   is scanned and then silently ignored, which reads as "nothing happened". */
+.drive-row-pending { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.drive-row-pending select.drive-section { border-color: var(--accent); }
 .drive-row input, .toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
 .toggle { margin-top: 8px; }
 .settings-actions { margin-top: 22px; display: flex; align-items: center; gap: 14px; }

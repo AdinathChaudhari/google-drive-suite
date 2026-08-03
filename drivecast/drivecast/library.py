@@ -1319,7 +1319,22 @@ class Scanner:
             scope = [d for d in scope if d in selected]
         # First run after upgrade / cleared cache: an unscanned drive with no
         # cache entry would lose its titles in the rebuild — escalate to full.
-        if any(not self.cache.has(d) for d in selected if d not in scope):
+        #
+        # A drive with no tab assignment is exempt, and the exemption matters:
+        # such a drive classifies into nothing, so it contributes no records and
+        # never gets a cache entry no matter how often it is walked. Without this
+        # it is a permanent escalation trigger — one unassigned drive silently
+        # turns EVERY scoped refresh (per-drive button included) into a full
+        # re-walk of every selected drive, which is the exact opposite of what
+        # scoping is for. It also cannot lose titles in a rebuild, having none.
+        # `maybe_autorefresh` already skips tab-less drives the same way.
+        from . import sections as sections_mod
+        needs_cache = [
+            d for d in selected
+            if d not in scope
+            and sections_mod.section_for_drive(drive_sections, d) is not None
+        ]
+        if any(not self.cache.has(d) for d in needs_cache):
             scope = list(selected)
         self.status.update(running=True, scanned=0, total=len(scope),
                            added=0, removed=0, error=None, warning=None,

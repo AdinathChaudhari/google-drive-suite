@@ -48,7 +48,8 @@ const state = {
   remoteInfo: null,     // cached /api/remote payload (urls, port, token)
   filter: "all",        // all | movie | show | documentary | other
   sort: "title",        // title | year | added | watched
-  group: "none",        // none | type | drive
+  sortAsc: true,        // direction for state.sort; per-key defaults in SORT_DEFAULT_ASC
+  group: "none",        // none | type | category | drive
   query: "",            // client-side search over the library
   watchedMap: {},       // file_id -> last_played epoch (for "Recently watched")
   progress: {},         // file_id -> {percent, watched} (lesson/episode progress)
@@ -467,8 +468,17 @@ async function loadLibrary() {
 
 // Effective category: TMDB-derived when known, else the structural type
 // (movie/show), so libraries scanned without a TMDB key still filter sanely.
+// Folded to the chip vocabulary (movie/show/documentary/other) here — the ONE
+// place that happens — so a record can never land in chip-Other while a
+// grouping view (groupItems's "category" branch) puts it in a different
+// bucket (or vice versa) for carrying an unrecognized drive_hints category.
+const KNOWN_CATEGORIES = new Set(["movie", "show", "documentary"]);
 function categoryOf(rec) {
-  return rec.category || (rec.type === "show" ? "show" : "movie");
+  // isShowRec, not `type === "show"`: the TV's twin (SortAndGroup.kt § categoryOf) falls back to
+  // the structural Title.isShow, so a record with seasons but no type would be a "movie" here and
+  // a "show" there — the chips and the Category grouping would disagree across the two clients.
+  const c = rec.category || (isShowRec(rec) ? "show" : "movie");
+  return KNOWN_CATEGORIES.has(c) ? c : "other";
 }
 
 function matchesFilter(rec) {
@@ -498,8 +508,17 @@ function updateFilterChips(items) {
 }
 
 // ---------- sorting / grouping (client-side over cached library) ----------
+// Structural "is this a show" check — mirrors the TV client's Title.isShow exactly (parity
+// contract: MAJOR 3). Do not narrow this to `rec.type === "show"` alone.
+function isShowRec(rec) {
+  return rec.type === "show" || !!(rec.seasons && rec.seasons.length);
+}
+
 function fileIdsOf(rec) {
-  if (rec.type === "show") {
+  // isShowRec, not `type === "show"`: a record with seasons but no type would otherwise
+  // fall through to the movie branch, return no file ids, and so report a last-played of 0 —
+  // silently sorting to the end of "Recently watched" while the TV sorts it correctly.
+  if (isShowRec(rec)) {
     const ids = [];
     for (const s of rec.seasons || [])
       for (const e of s.episodes || []) if (e.file_id) ids.push(e.file_id);
@@ -514,21 +533,45 @@ function lastPlayedOf(rec) {
   return m;
 }
 
+// Per-key default direction — must mirror the TV's SortKey.defaultAscending.
+const SORT_DEFAULT_ASC = { title: true, year: false, added: false, watched: false };
+function defaultAscFor(key) { return (key in SORT_DEFAULT_ASC) ? SORT_DEFAULT_ASC[key] : true; }
+
+// Nulls last in BOTH directions: direction applies only inside the non-null
+// branch (mirrors the TV's nullsLastBy). `(b.year || 0)` coercion is gone — it
+// put every year-less title FIRST once the direction flipped.
+function cmpNullsLast(a, b, asc) {
+  const an = a == null, bn = b == null;
+  if (an && bn) return 0;
+  if (an) return 1;
+  if (bn) return -1;
+  if (a === b) return 0;
+  return (a < b ? -1 : 1) * (asc ? 1 : -1);
+}
+
 function sortItems(items) {
   const arr = items.slice();
+  const asc = state.sortAsc;
   const byTitle = (a, b) => (a.title || "").localeCompare(b.title || "");
-  if (state.sort === "year") arr.sort((a, b) => ((b.year || 0) - (a.year || 0)) || byTitle(a, b));
-  else if (state.sort === "added") arr.sort((a, b) => ((b.added_at || 0) - (a.added_at || 0)) || byTitle(a, b));
-  else if (state.sort === "watched") arr.sort((a, b) => (lastPlayedOf(b) - lastPlayedOf(a)) || byTitle(a, b));
-  else arr.sort(byTitle);
+  const keyOf = {
+    year:    (r) => (r.year == null ? null : r.year),
+    added:   (r) => (r.added_at == null ? null : r.added_at),
+    watched: (r) => (lastPlayedOf(r) || null),   // 0 = never watched -> null -> last, both directions
+  }[state.sort];
+  if (keyOf) arr.sort((a, b) => cmpNullsLast(keyOf(a), keyOf(b), asc) || byTitle(a, b));
+  else arr.sort((a, b) => (asc ? byTitle(a, b) : byTitle(b, a)));   // title
   return arr;
 }
 
 function driveLabel(id) { return state.driveName[id] || id || "Unknown drive"; }
 
 function groupItems(items) {
-  // Non-entertainment sections group into shelves by default ("Python",
-  // "Audio Series", "Talks", ...) — the classifier sets rec.shelf.
+  // Non-entertainment sections group into shelves by DEFAULT ("Python",
+  // "Audio Series", "Talks", ...) — the classifier sets rec.shelf. This must
+  // stay `=== "none"`: auto-shelf is a default the user can override with an
+  // explicit pick (type/category/drive), not a blanket that only "drive" can
+  // opt out of — a Courses/Podcasts tab picking "By type"/"By category" must
+  // actually apply it, not silently fall back to shelves (MAJOR 4).
   if ((SECTION_META[state.section] || {}).behavior !== "entertainment" && state.group === "none") {
     const map = {};
     for (const r of items) (map[r.shelf || ""] = map[r.shelf || ""] || []).push(r);
@@ -537,12 +580,25 @@ function groupItems(items) {
     return keys.map((k) => ({ key: k || "_more", title: k || "More", items: map[k] }));
   }
   if (state.group === "type") {
-    const movies = items.filter((r) => r.type === "movie");
-    const shows = items.filter((r) => r.type === "show");
+    // Structural contract shared with the TV client's Title.isShow (type == "show" || seasons
+    // non-empty) — NOT `type !== "show"` for Movies, which put a `type: null` + seasons record
+    // in Movies here while the TV put the same record in TV Shows (MAJOR 3). Keep this in sync
+    // with isShowRec()/the TV's isShow rather than "simplifying" either back to a type check.
+    const shows = items.filter(isShowRec);
+    const movies = items.filter((r) => !isShowRec(r));
     const groups = [];
     if (movies.length) groups.push({ key: "movie", title: "Movies", items: movies });
     if (shows.length) groups.push({ key: "show", title: "TV Shows", items: shows });
     return groups;
+  }
+  if (state.group === "category") {
+    const order = ["movie", "show", "documentary", "other"];
+    const labels = { movie: "Movies", show: "TV Shows", documentary: "Documentaries", other: "Other" };
+    const map = {};
+    // categoryOf() already folds to this exact vocabulary — the chips' "Other" logic reused,
+    // not reimplemented, so a title can't be in chip-Other but group-Documentaries (MINOR 6).
+    for (const r of items) { const c = categoryOf(r); (map[c] = map[c] || []).push(r); }
+    return order.filter((k) => map[k]).map((k) => ({ key: k, title: labels[k], items: map[k] }));
   }
   if (state.group === "drive") {
     const map = {};
@@ -727,6 +783,10 @@ async function pollScan() {
     $("refreshBtn").classList.remove("spinning");
     show(bar, false);
     if (st.error) toast("Scan finished with issues: " + st.error, "error");
+    // The server has always reported this; nothing ever displayed it. A drive with
+    // no tab is scanned and then dropped on the floor, so without this the user
+    // sees a refresh "succeed" and change nothing, with no clue why.
+    else if (st.warning) toast(st.warning, "error");
     await loadLibrary();
     if (currentRoute() === "library") { renderLibrary(); loadContinue(); }
   }
@@ -1221,7 +1281,15 @@ async function openSettings() {
     label.className = "drive-row";
     label.innerHTML = `<input type="checkbox" value="${escapeHTML(d.id)}" ${selected.has(d.id) ? "checked" : ""}>
       <span class="drive-name">${escapeHTML(d.name || d.id)}</span>`;
-    if (selected.has(d.id)) {
+    // The tab picker is built for EVERY drive, not just the already-included ones,
+    // and revealed the moment its checkbox is ticked. Building it only for
+    // `selected.has(d.id)` meant a drive you included in *this* visit never showed
+    // one — so saveSettings' "choose a tab for every included drive" guard (which
+    // walks select.drive-section) never saw the row, the drive saved with no tab,
+    // and an unassigned drive classifies into nothing: the scoped rescan ran, found
+    // no section to file anything under, wrote no records and no scan-cache entry,
+    // and the user saw precisely nothing happen.
+    {
       // Tab assignment for included drives — no default, the drive stays on
       // the placeholder until the user actively picks (or creates) a tab.
       const sel = document.createElement("select");
@@ -1249,6 +1317,22 @@ async function openSettings() {
         refreshDrives([d.id], d.name || d.id);
       });
       label.appendChild(btn);
+
+      // Reveal the picker exactly when the drive is included, and pull focus to it
+      // on a fresh tick so the next thing the user sees is "which tab?" rather than
+      // a silently-unassigned drive. The per-drive ⟳ is meaningless until the drive
+      // has a tab (nothing would be classified), so it hides with the picker.
+      const cb = label.querySelector("input[type=checkbox]");
+      const syncRow = (focusOnReveal) => {
+        const on = cb.checked;
+        show(sel, on);
+        show(btn, on && !!assigned[d.id]);
+        label.classList.toggle("drive-row-pending", on && !sel.value);
+        if (on && focusOnReveal && !sel.value) sel.focus();
+      };
+      cb.addEventListener("change", () => syncRow(true));
+      sel.addEventListener("change", () => syncRow(false));
+      syncRow(false);
     }
     list.appendChild(label);
   }
@@ -1342,11 +1426,20 @@ async function saveSettings() {
     const cb = sel.closest("label").querySelector("input[type=checkbox]");
     if (cb && !cb.checked) continue;
     if (!sel.value || sel.value === "__new__") {
-      $("settingsMsg").textContent = "Choose a tab for every included drive before saving.";
+      // Name the drive rather than saying "every included drive": with 36 rows the
+      // generic message left the user hunting for which one was blocking the save.
+      const row = sel.closest("label");
+      const name = (row && row.querySelector(".drive-name").textContent) || "This drive";
+      $("settingsMsg").textContent = `Pick a tab for “${name}” before saving — a drive with no tab has nowhere to file its titles, so it would be scanned and then ignored.`;
+      if (row) row.classList.add("drive-row-pending");
+      sel.focus();
       return;
     }
     driveSections[sel.dataset.driveId] = sel.value;
   }
+  // What's newly included in THIS save — used only to name the drive in the toast
+  // below, so "refresh just that drive" is visibly true rather than merely claimed.
+  const newlyAdded = selected.filter((id) => !(state.selectedDrives || []).includes(id));
   $("settingsMsg").textContent = "Saving…";
   try {
     const res = await api("/api/settings", {
@@ -1368,7 +1461,19 @@ async function saveSettings() {
     if ($("remoteRestartNote")) show($("remoteRestartNote"), !!res.restart_required);
     if (res.restart_required) toast("Restart drivecast to apply remote access.");
     await renderRemoteBlock();
-    if (res.refresh_started) { toast("Updating library…"); startScanWatch(); }
+    if (res.refresh_started) {
+      // Name the drive when exactly one was just added — the whole point of the
+      // scoped refresh is that it is NOT a full rescan, so say so.
+      const names = newlyAdded.map((id) => {
+        const cb = $("driveList").querySelector(`input[value="${CSS.escape(id)}"]`);
+        const row = cb && cb.closest("label");
+        return (row && row.querySelector(".drive-name").textContent) || id;
+      });
+      toast(names.length === 1 ? `Scanning ${names[0]}…`
+            : names.length ? `Scanning ${names.length} new drives…`
+            : "Updating library…");
+      startScanWatch();
+    }
   } catch (e) {
     $("settingsMsg").textContent = "Save failed: " + e.message;
   }
@@ -1817,10 +1922,37 @@ $("filters").addEventListener("click", (e) => {
   renderLibrary();
 });
 
+// Reflects state.sortAsc onto the direction button's glyph/tooltip/a11y state —
+// the RESTORED direction (from localStorage / the per-key default), never the
+// hardcoded markup glyph, since restoreControls() calls this on every load.
+function updateSortDirBtn() {
+  const b = $("sortDirBtn");
+  if (!b) return;
+  b.textContent = state.sortAsc ? "↑" : "↓";
+  const words = state.sort === "title"
+    ? (state.sortAsc ? "A–Z" : "Z–A")
+    : (state.sortAsc ? "Oldest first" : "Newest first");
+  b.title = "Direction: " + words + " — click to flip";
+  b.setAttribute("aria-label", b.title);
+  b.setAttribute("aria-pressed", String(state.sortAsc));
+}
+
 $("sortSel").addEventListener("change", async (e) => {
   state.sort = e.target.value;
-  try { localStorage.setItem("dc.sort", state.sort); } catch (_) {}
+  state.sortAsc = defaultAscFor(state.sort);
+  try {
+    localStorage.setItem("dc.sort", state.sort);
+    localStorage.setItem("dc.sortAsc", state.sortAsc ? "1" : "0");
+  } catch (_) {}
+  updateSortDirBtn();
   if (state.sort === "watched") await ensureWatchedMap();
+  renderLibrary();
+});
+
+$("sortDirBtn").addEventListener("click", () => {
+  state.sortAsc = !state.sortAsc;
+  try { localStorage.setItem("dc.sortAsc", state.sortAsc ? "1" : "0"); } catch (_) {}
+  updateSortDirBtn();
   renderLibrary();
 });
 
@@ -1847,12 +1979,15 @@ function restoreControls() {
     const sec = localStorage.getItem("dc.section");
     if (s) state.sort = s;
     if (g) state.group = g;
+    const dir = localStorage.getItem("dc.sortAsc");
+    state.sortAsc = dir == null ? defaultAscFor(state.sort) : dir === "1";
     if (sec && SECTION_META[sec]) setSection(sec);
     else setSection(state.section);
   } catch (_) { setSection(state.section); }
   const ss = $("sortSel"), gs = $("groupSel");
   if (ss) ss.value = state.sort;
   if (gs) gs.value = state.group;
+  updateSortDirBtn();
 }
 
 async function loadPlaybackSettings() {

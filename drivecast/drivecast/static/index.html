@@ -69,16 +69,18 @@
             </div>
             <label class="ctrl">Sort
               <select id="sortSel">
-                <option value="title">Title (A–Z)</option>
-                <option value="year">Year (newest)</option>
                 <option value="added">Recently added</option>
+                <option value="title" selected>A–Z (title)</option>
+                <option value="year">Year</option>
                 <option value="watched">Recently watched</option>
               </select>
             </label>
+            <button type="button" class="chip" id="sortDirBtn" title="Direction: A–Z — click to flip" aria-label="Direction: A–Z — click to flip" aria-pressed="true">↑</button>
             <label class="ctrl">Group
               <select id="groupSel">
                 <option value="none">None</option>
                 <option value="type">By type</option>
+                <option value="category">By category</option>
                 <option value="drive">By drive</option>
               </select>
             </label>
