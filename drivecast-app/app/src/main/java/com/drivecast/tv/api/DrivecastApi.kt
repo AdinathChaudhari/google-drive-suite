@@ -71,4 +71,14 @@ interface DrivecastApi {
 
     @GET("api/stream/recent")
     suspend fun streamRecent(): StreamRecent
+
+    // ---- library rescan (full walk of every selected drive) ----
+
+    /** POST with no body = full refresh (server treats absent/empty JSON as scope=None).
+     *  Response<> (not the bare DTO) so 503 setup / 400 no_drives error bodies stay readable. */
+    @POST("api/refresh")
+    suspend fun startRefresh(): Response<RefreshStarted>
+
+    @GET("api/refresh/status")
+    suspend fun refreshStatus(): RefreshStatus
 }
