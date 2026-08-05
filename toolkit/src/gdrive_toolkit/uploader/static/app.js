@@ -271,6 +271,30 @@ async function cancelUpload() {
   if (g) await api(`/api/cancel/${g}`, { method: "POST", body: "{}" });
 }
 
+// ---- theme (light / dark) -------------------------------------------------
+// <html data-theme> is already stamped before first paint by the inline script
+// in index.html; this only keeps the button's icon in sync and persists a
+// change. Default is dark. Mirrors drivecast's toggle so the suite's web apps
+// behave identically.
+//
+// Wired at top level rather than inside boot(): boot() awaits /api/drives, and
+// the theme must still be togglable when rclone is slow or the drive list
+// fails outright.
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+}
+function applyTheme(theme) {
+  const light = theme === "light";
+  document.documentElement.setAttribute("data-theme", light ? "light" : "dark");
+  try { localStorage.setItem("theme", light ? "light" : "dark"); } catch (e) { /* private mode */ }
+  const btn = $("#theme-toggle");
+  const icon = btn && btn.querySelector(".theme-icon");
+  if (icon) icon.textContent = light ? "☀️" : "🌙";
+}
+applyTheme(currentTheme());   // sync the icon with the pre-paint choice
+$("#theme-toggle").addEventListener("click", () =>
+  applyTheme(currentTheme() === "light" ? "dark" : "light"));
+
 // ---- boot -----------------------------------------------------------------
 async function boot() {
   const sel = $("#drive-select");
