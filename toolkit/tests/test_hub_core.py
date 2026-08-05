@@ -113,6 +113,38 @@ class TestResolvePort(TmpDirTestCase):
         tool = {"port": {"config": str(cfg_path), "key": "port", "default": 8737}}
         self.assertEqual(hub_core.resolve_port(tool), 8737)
 
+    def test_default_only_spec_needs_no_config_or_key(self):
+        """A fixed-port tool declares just {"default": N}.
+
+        config/key are the *override* half of the spec — a tool whose port is
+        hardcoded in its own source has no config file to read. Requiring them
+        anyway raised KeyError out of status(), which menubar.refresh() catches
+        into a permanently greyed "— error" row: one hand-written
+        hub_tools.json entry silently lost its own menu item.
+        """
+        tool = {"port": {"default": 8749}}
+        self.assertEqual(hub_core.resolve_port(tool), 8749)
+
+    def test_port_spec_without_default_raises_hub_error(self):
+        """'default' is the one required key — say so as a HubError, not a
+        KeyError, so the message names the offending tool."""
+        tool = {"id": "no-default", "port": {"key": "port"}}
+        with self.assertRaises(hub_core.HubError):
+            hub_core.resolve_port(tool)
+
+    def test_default_only_spec_survives_a_status_probe(self):
+        """The KeyError surfaced via status(), not resolve_port directly."""
+        tool = {
+            "id": "fixed-port-tool",
+            "kind": "web",
+            "dir": str(self.tmp),
+            "port": {"default": 8749},
+        }
+        self.assertEqual(
+            hub_core.status(tool, tcp_probe=lambda host, port: True),
+            hub_core.Status.RUNNING,
+        )
+
 
 # ---------------------------------------------------------------------------
 # status
