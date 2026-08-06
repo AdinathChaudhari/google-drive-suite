@@ -56,6 +56,7 @@ than no entry.
 | [D-015](#d-015--on-android-a-cancelled-focus-enter-consumes-the-d-pad-press) | On Android, a cancelled focus-enter *consumes* the D-pad press | Adapted | drivecast-app |
 | [D-016](#d-016--bring-into-view-follows-the-focus-target-not-the-tile) | Bring-into-view follows the focus target, not the tile | Adopted | drivecast-app |
 | [D-017](#d-017--a-tab-less-drive-silently-disabled-per-drive-refresh) | A tab-less drive silently disabled per-drive refresh | Adopted | drivecast |
+| [D-018](#d-018--focusrestorer-over-a-lazy-lane-kills-the-process-not-the-keypress) | `focusRestorer` over a lazy lane kills the process, not the keypress | Adapted | drivecast-app |
 
 ---
 
@@ -528,3 +529,54 @@ than no entry.
 - **Revisit when** — drives get a default tab again. A zero-default tab model is
   what makes "selected but classifies into nothing" reachable at all; restore a
   fallback and this whole failure mode disappears with it.
+
+---
+
+### D-018 — `focusRestorer` over a lazy lane kills the process, not the keypress
+**Status:** Adapted · **When:** 2026-08-06
+
+- **Hit** — on the Fire TV Stick, opening one particular show (call it **show A**,
+  a series whose `seasons[0]` is a Season 0 of specials), stepping LEFT off the
+  episode list onto the season list, and picking Season 1 killed the app every
+  single time. Movies were fine, and so was every other show tried, which made it
+  look like bad metadata for one title. It wasn't: show A's `/api/title` is clean —
+  every season populated, no duplicate `file_id`s, no nulls.
+- **Learned** — `Modifier.focusRestorer` (wrapped as `tvFocusRestorer`) does more
+  than remember a child. When focus *leaves* the lane, `FocusRestorerNode` PINS
+  the focused child through the lazy layout's `PinnableContainer`, and releases
+  that pin again from its own `onDetach`. Tear the pinned lane down while the pin
+  is still live and the pin is released twice — `LazyLayoutPinnableItem.release`
+  does `check(pinsCount > 0)` and throws
+  `IllegalStateException("Release should only be called once")` straight out of
+  the measure/layout pass. That is an uncatchable process kill, a whole different
+  failure class from the swallowed-D-pad-press problem `tvFocusRestorer`'s
+  `onRestoreFailed` was built for (D-015). The R8-obfuscated stack retraced
+  against `mapping.txt` says it exactly:
+  `LazyLayoutPinnableItem.release <- FocusRestorerNode.onDetach <- LayoutNode` detach
+  during `RemoveNode`. The season `Crossfade` is that teardown; stepping LEFT onto
+  the season pills is what leaves the pin live.
+  **Show A is not special — its season *shape* is.** Its Season 0 of specials is
+  `seasons[0]`, so detail opens *on the specials* and the LEFT-then-switch-season
+  detour is the only way to reach Season 1. Every other show opens on the season
+  you wanted, so nobody switched, so nobody pinned. Any show would have crashed
+  the moment you changed season; a season-0 show just makes it unavoidable.
+- **Did** — both of DetailScreen's lazy lanes moved to `tvFocusEnterFallback`,
+  which resolves an enter target from live state and never pins anything, so the
+  double release is structurally impossible rather than merely unlikely. To keep
+  what the restorer was actually good for, the lanes now own explicit per-item
+  `FocusRequester` lists: the season lane enters on the *selected* pill, and the
+  episode lane enters on the last-focused row (reset on season change) falling
+  back to the resume row. `lastFocusedEpisode` is written from a row focus
+  callback and read **only** inside the enter lambda — never during composition —
+  so walking the list still costs zero recompositions. Only the season currently
+  showing attaches its requesters, so nothing is attached to two nodes during the
+  220ms fade.
+- **Where** — `drivecast-app/app/src/main/java/com/drivecast/tv/ui/detail/DetailScreen.kt`
+  § `ShowSeasons` (the requester lists and both lanes' `tvFocusEnterFallback`),
+  `drivecast-app/app/src/main/java/com/drivecast/tv/ui/common/FocusKit.kt`
+  § `tvFocusRestorer` KDoc (the never-on-a-lazy-lane rule).
+- **Revisit when** — Compose foundation is bumped past 1.7. If a later
+  `LazyLayoutPinnableItem.release` becomes idempotent, `focusRestorer` over a lazy
+  lane stops being a crash — but it still restores by a stale layout-node hash
+  after a scroll round-trip (D-015), so `tvFocusEnterFallback` stays the default
+  for recycling lanes regardless.

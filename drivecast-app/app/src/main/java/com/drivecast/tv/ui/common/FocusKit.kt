@@ -33,6 +33,22 @@ import kotlinx.coroutines.launch
  * the key event — the "dead D-pad press". Every lane must pass a fallback
  * (usually a FocusRequester on its first item) so entering the lane always
  * lands somewhere.
+ *
+ * **Never put this on a `Lazy*` layout — use [tvFocusEnterFallback] there.**
+ * [Modifier.focusRestorer] PINS the lane's focused child through the lazy
+ * layout's `PinnableContainer` when focus leaves the lane, and releases that
+ * pin again from its own `onDetach`. Tear a pinned lane down while the pin is
+ * still live — a Crossfade/AnimatedContent swapping the list's contents, a
+ * tab rebuild — and the pin is released twice, which foundation answers with
+ * `IllegalStateException("Release should only be called once")` thrown out of
+ * the measure/layout pass. That is a hard process death, not a dead press:
+ * it killed the app on every "open a show, step LEFT onto the season list,
+ * pick another season" in DetailScreen (retraced stack:
+ * `LazyLayoutPinnableItem.release <- FocusRestorerNode.onDetach`). The lane
+ * being short or rarely recycled is no defence — only the pin's lifetime
+ * matters. The one surviving call site is SettingsScreen's tab list, where
+ * the lane is the screen's only focusable content, so focus never exits it
+ * and no pin is ever taken.
  */
 @OptIn(ExperimentalComposeUiApi::class)
 fun Modifier.tvFocusRestorer(onRestoreFailed: (() -> FocusRequester)? = null): Modifier =
