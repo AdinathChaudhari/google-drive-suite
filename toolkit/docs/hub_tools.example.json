@@ -40,5 +40,15 @@
     "installed_if": ["app.py"],
     "launch": { "argv": ["venv/bin/python", "app.py"] },
     "port": { "config": "~/Library/Application Support/some-other-tool/config.json", "key": "port", "default": 9000 }
+  },
+  {
+    "_comment": "FIXED-PORT tool: 'default' is the only required key in a port spec. 'config'/'key' are the override half — supply them only for a tool that can move its own port via a config file. A tool with the port hardcoded in its source declares just 'default', as here.",
+    "id": "fixed-port-tool",
+    "label": "Fixed Port Tool",
+    "kind": "web",
+    "dir": "~/Documents/Playground/GitHub/fixed-port-tool",
+    "installed_if": ["ui/run_ui.py"],
+    "launch": { "argv": ["~/.venvs/main/bin/python", "ui/run_ui.py"] },
+    "port": { "default": 8749 }
   }
 ]
