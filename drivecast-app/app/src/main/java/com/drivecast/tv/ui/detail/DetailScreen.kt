@@ -71,7 +71,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.animateFloat
-import com.drivecast.tv.ui.common.tvFocusRestorer
+import com.drivecast.tv.ui.common.tvFocusEnterFallback
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -486,12 +486,40 @@ private fun ShowSeasons(
         }
     }
 
+    // Both panes below are lazy layouts, so neither may use Modifier.focusRestorer (our
+    // tvFocusRestorer): FocusRestorerNode PINS the lane's focused child through
+    // PinnableContainer when focus leaves the lane, and releases that pin again in its own
+    // onDetach. Tear the pinned lane down while the pin is still live and the pin is released
+    // twice, which foundation answers with
+    // IllegalStateException("Release should only be called once") thrown straight out of the
+    // measure/layout pass — an instant process death, not a swallowed D-pad press. The season
+    // Crossfade below is exactly that teardown, and stepping LEFT off the episode list onto the
+    // season pills is exactly what leaves the pin live, so "open a show, move to the season list,
+    // pick another season" killed the app every time. It reproduced on the Stick with Blackadder
+    // because its Season 0 of specials is seasons[0], making that LEFT-then-switch-season detour
+    // the ONLY way to reach Season 1 (retraced release stack:
+    // LazyLayoutPinnableItem.release <- FocusRestorerNode.onDetach <- LayoutNode detach).
+    //
+    // tvFocusEnterFallback resolves an enter target from the lane's own live state instead and
+    // never pins anything, so the double release is structurally impossible. These per-item
+    // requester lists are what it aims at. Both are sized off `seasons`, and only the season
+    // currently showing attaches its episode requesters (see the Crossfade below) so a requester
+    // is never attached to two nodes at once during the fade.
+    val seasonFocusers = remember(seasons.size) { List(seasons.size) { FocusRequester() } }
+    val episodeFocusers = remember(seasons) {
+        List(seasons.maxOf { it.episodes.size }) { FocusRequester() }
+    }
+    // Written from EpisodeRow's focus callback and read ONLY inside the enter lambda below — never
+    // during composition — so walking the episode list costs zero recompositions, the same
+    // Stick-GPU discipline the season-pill dwell debounce above exists for. Reset on a season
+    // change, since an index means nothing in a different season's list.
+    val lastFocusedEpisode = remember { mutableIntStateOf(-1) }
+    LaunchedEffect(selected) { lastFocusedEpisode.intValue = -1 }
+
     // Deterministic initial focus: the first not-yet-watched episode in the opening season (the
     // resume point), or its first episode if every one is already watched. Gated to FIRST entry
     // only via a rememberSaveable flag — on a back-nav return the restored saved scroll must win,
-    // and tvFocusRestorer already owns focus restoration for the list.
-    val resumeFocus = remember { FocusRequester() }
-    val seasonFirst = remember { FocusRequester() }
+    // and the episode lane's own enter fallback owns focus placement from then on.
     val resumeIndex = remember(current, progress) {
         current.episodes.indexOfFirst { ep -> ep.fileId?.let { progress[it]?.watched != true } ?: true }
             .takeIf { it >= 0 } ?: 0
@@ -508,12 +536,12 @@ private fun ShowSeasons(
         snapshotFlow { listState.layoutInfo.visibleItemsInfo.any { it.index == resumeIndex } }
             .filter { it }
             .first()
-        runCatching { resumeFocus.requestFocus() }
+        runCatching { episodeFocusers.getOrNull(resumeIndex)?.requestFocus() }
     }
 
     // Split-pane over the (now bare, for shows) hero backdrop: a ~38%-wide left column carrying
     // title/metadata/actions/seasons, and the remaining width for the selected season's episodes.
-    // Side-by-side focusGroups (one per pane, via tvFocusRestorer below) give D-pad LEFT/RIGHT
+    // Side-by-side focusGroups (one per pane, via tvFocusEnterFallback below) give D-pad LEFT/RIGHT
     // pane-to-pane movement for free through ordinary geometric focus search — neither pane wraps
     // itself in anything that would block that search from crossing the gap between them.
     Row(Modifier.fillMaxSize()) {
@@ -576,7 +604,14 @@ private fun ShowSeasons(
             // above (the snapshotFlow+collectLatest LaunchedEffect owns the 250ms debounce
             // unchanged) — only the orientation and item width changed.
             LazyColumn(
-                modifier = Modifier.weight(1f).tvFocusRestorer { seasonFirst },
+                // Enter on the season that's actually showing, not on a remembered node — see the
+                // no-focusRestorer-over-a-lazy-lane note above. `selected` is read inside the
+                // lambda, which the focus system invokes at key-press time, so this costs no
+                // composition-scope read.
+                modifier = Modifier.weight(1f).tvFocusEnterFallback {
+                    seasonFocusers.getOrNull(selected.coerceIn(0, seasons.lastIndex))
+                        ?: FocusRequester.Default
+                },
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 itemsIndexed(seasons) { index, season ->
@@ -587,7 +622,7 @@ private fun ShowSeasons(
                         onFocused = { focusedSeason = index },
                         onSelect = { focusedSeason = index; selected = index },
                         modifier = Modifier.fillMaxWidth().let { m ->
-                            if (index == 0) m.focusRequester(seasonFirst) else m
+                            seasonFocusers.getOrNull(index)?.let { m.focusRequester(it) } ?: m
                         },
                     )
                 }
@@ -609,13 +644,26 @@ private fun ShowSeasons(
             // Only the child matching the current `selected` season gets the saveable `listState`;
             // the outgoing (or any other) child gets a throwaway state so they stop fighting over
             // it and the outgoing list stops jumping mid-fade.
-            val childListState = if (seasonIdx == selected) listState else rememberLazyListState()
+            val isCurrent = seasonIdx == selected
+            val childListState = if (isCurrent) listState else rememberLazyListState()
             LazyColumn(
                 state = childListState,
                 verticalArrangement = Arrangement.spacedBy(8.dp),
-                // Fallback to the resume row (always attached in the selected season's list): a
-                // failed restore lands on the episode you'd play next instead of eating the press.
-                modifier = Modifier.fillMaxWidth().tvFocusRestorer { resumeFocus },
+                // Re-enter on the episode you last had focus on, or the resume row (the episode
+                // you'd play next) when there's nothing to go back to — resolved fresh from live
+                // state on every press rather than restored from a pinned node, which is what used
+                // to kill the app here (see the no-focusRestorer-over-a-lazy-lane note above).
+                // Only the showing season owns the requesters, so the mid-fade outgoing list
+                // declines and lets an ordinary focus search place the press.
+                modifier = Modifier.fillMaxWidth().tvFocusEnterFallback {
+                    if (!isCurrent) {
+                        FocusRequester.Default
+                    } else {
+                        val remembered = lastFocusedEpisode.intValue
+                            .takeIf { it in season.episodes.indices }
+                        episodeFocusers.getOrNull(remembered ?: resumeIndex) ?: FocusRequester.Default
+                    }
+                },
             ) {
                 itemsIndexed(
                     season.episodes,
@@ -628,7 +676,8 @@ private fun ShowSeasons(
                         percent = episode.fileId?.let { progress[it]?.percent } ?: 0.0,
                         episodeWord = vocab?.episode ?: "Episode",
                         onClick = { episode.fileId?.let { onPlay(title.id, it, false, false, 0L) } },
-                        focusRequester = if (seasonIdx == selected && i == resumeIndex) resumeFocus else null,
+                        focusRequester = if (isCurrent) episodeFocusers.getOrNull(i) else null,
+                        onFocused = if (isCurrent) ({ lastFocusedEpisode.intValue = i }) else null,
                     )
                 }
             }
@@ -671,6 +720,9 @@ private fun EpisodeRow(
     episodeWord: String,
     onClick: () -> Unit,
     focusRequester: FocusRequester? = null,
+    // Lets the owning lane remember which row to come back to without any composition-scope read
+    // of that index — see lastFocusedEpisode in ShowSeasons.
+    onFocused: (() -> Unit)? = null,
 ) {
     Button(
         onClick = onClick,
@@ -688,7 +740,8 @@ private fun EpisodeRow(
         ),
         modifier = Modifier
             .fillMaxWidth()
-            .let { m -> focusRequester?.let { m.focusRequester(it) } ?: m },
+            .let { m -> focusRequester?.let { m.focusRequester(it) } ?: m }
+            .let { m -> onFocused?.let { cb -> m.onFocusChanged { if (it.isFocused) cb() } } ?: m },
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
