@@ -29,7 +29,18 @@ button {
 button:hover:not(:disabled) { background: var(--accent2); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
-#refresh { background: var(--panel2); color: var(--text); border: 1px solid var(--line); padding: 6px 10px; }
+#refresh, #theme-toggle {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+  padding: 6px 10px; line-height: 1; flex: none;
+}
+/* These two keep their panel background on hover and accent the BORDER
+   instead. Inheriting the default button:hover (solid --accent2 fill) would
+   leave --text on a saturated blue, which fails contrast in light mode — the
+   theme this toggle exists to make reachable. */
+#refresh:hover:not(:disabled), #theme-toggle:hover:not(:disabled) {
+  background: var(--panel2); border-color: var(--accent);
+}
+.theme-icon { display: inline-block; font-size: 14px; }
 
 main { flex: 1; display: flex; min-height: 0; }
 #tree-panel { flex: 1; overflow: auto; padding: 10px 8px; }

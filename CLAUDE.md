@@ -82,6 +82,28 @@ rather than being rewritten — see the header comment in each app's `app.css`
 the token defaults in the cascade and must not be touched when working on
 theming.
 
+### Light / dark
+
+All three web apps (drivecast, downloader, uploader) share one contract:
+
+- **Dark is the default.** The `:root` tokens *are* the dark theme; light is
+  an override under `[data-theme="light"]`.
+- An inline snippet in each `index.html` `<head>` stamps
+  `<html data-theme>` from `localStorage.theme` **before first paint**. Setting
+  it there rather than from `app.js` is what prevents a light flash.
+- **Stamp the attribute in both directions.** Leaving it off lets the
+  `prefers-color-scheme: light` fallback win, so the app renders light on a
+  light-mode OS even though dark is meant to be the default. The
+  `:root:not([data-theme="dark"])` guard on that media query is what lets an
+  explicit dark choice beat a light-mode OS.
+- `app.js` owns a `currentTheme()` / `applyTheme()` pair, wired to a
+  `#theme-toggle` button (🌙 dark / ☀️ light) and persisted to
+  `localStorage`. In the toolkit apps it's wired at **top level, not inside
+  `boot()`** — `boot()` awaits `/api/drives`, and the theme has to keep
+  working when rclone is slow or the drive list fails.
+- localStorage is per-origin, so each app on its own port remembers its own
+  theme. They do not follow each other.
+
 ## Per-component docs
 
 - [`toolkit/CLAUDE.md`](toolkit/CLAUDE.md) — package layout, extras/entry

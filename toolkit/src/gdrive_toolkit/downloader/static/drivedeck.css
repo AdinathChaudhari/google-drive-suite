@@ -65,8 +65,13 @@
   --dd-warn: #9a6a00;
 }
 
-/* OS-level fallback for apps with no explicit data-theme attribute set
-   (e.g. the toolkit's web UIs, which follow the system theme by default). */
+/* OS-level fallback for apps that set no explicit data-theme attribute.
+   As of the toolkit's theme toggle, no app in the suite relies on this —
+   drivecast, the downloader, and the uploader all stamp data-theme before
+   first paint and default to dark. Kept for any app added later that wants to
+   follow the system instead, and for the window before an app's inline
+   snippet runs. Note the :not([data-theme="dark"]) guard is what lets an
+   explicit dark choice beat a light-mode OS. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     --dd-bg: #f4f5f8;

@@ -4,14 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Drive Uploader</title>
-  <!-- Apply the saved theme before first paint to avoid a flash. Default: dark. -->
+  <!-- Apply the saved theme before first paint to avoid a flash. Default: dark.
+       Stamps data-theme in BOTH directions on purpose: leaving the attribute
+       off would let drivedeck.css's prefers-color-scheme fallback win, so this
+       app would render light on a light-mode OS despite dark being the
+       default. An explicit attribute is what makes the default actually
+       dark — and setting it here rather than from app.js is what stops the
+       page painting light for a frame first. -->
   <script>
     (function () {
-      try {
-        if (localStorage.getItem("theme") === "light") {
-          document.documentElement.setAttribute("data-theme", "light");
-        }
-      } catch (e) { /* private mode / no storage -> default dark */ }
+      var t = null;
+      try { t = localStorage.getItem("theme"); } catch (e) { /* private mode / no storage */ }
+      document.documentElement.setAttribute("data-theme", t === "light" ? "light" : "dark");
     })();
   </script>
   <link rel="stylesheet" href="/static/drivedeck.css">
@@ -20,6 +24,8 @@
 <body>
   <header>
     <h1>Drive Uploader</h1>
+    <button id="theme-toggle" title="Toggle light / dark theme"
+            aria-label="Toggle light / dark theme"><span class="theme-icon">🌙</span></button>
   </header>
 
   <main>
