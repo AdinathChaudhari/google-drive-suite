@@ -84,13 +84,31 @@ def is_installed(tool: dict, *, exists: Callable[[Path], bool] = Path.exists) ->
 # ---------------------------------------------------------------------------
 
 def resolve_port(tool: dict) -> int:
+    """The port to probe for a kind="web" tool.
+
+    Only "default" is required. "config"/"key" are the *override* half of the
+    spec — a tool whose port is hardcoded in its own source has no config file
+    to read and legitimately declares just {"default": N}.
+
+    Treating config/key as required was a real outage: the KeyError escaped
+    through status(), and menubar.refresh() catches any exception there into a
+    permanently greyed "<label> — error" row. So a hand-written hub_tools.json
+    entry lost its menu item with nothing in the log to say why.
+    """
     port_spec = tool.get("port")
     if not port_spec:
         raise HubError("tool %r has no 'port' spec" % tool.get("id"))
 
+    if "default" not in port_spec:
+        raise HubError(
+            "tool %r has a 'port' spec with no 'default'" % tool.get("id"))
     default = port_spec["default"]
-    config_path = Path(port_spec["config"]).expanduser()
-    key = port_spec["key"]
+
+    config = port_spec.get("config")
+    key = port_spec.get("key")
+    if not config or not key:
+        return int(default)
+    config_path = Path(config).expanduser()
 
     try:
         with config_path.open("r") as f:
