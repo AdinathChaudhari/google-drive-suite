@@ -16,6 +16,23 @@ instead (which is what `gdrive-hub`'s Stop action does). Measured proof and the
 respawn-throttle traps that make this easy to verify wrongly: **D-012** in
 `docs/DECISIONS.md`.
 
+## Forgetting is a scrub, never a delete
+
+`decisions.json` is the app's memory, and the display `name` in each record is
+the only personal thing in it. The **Forget history** submenu scrubs those
+names — but `DecisionStore.forget` overwrites `name` with `FORGOTTEN_NAME` and
+sets `handled`/`forgotten` rather than deleting the record, because the record
+is the ONLY thing stopping `poll_once` re-asking about a gid. A kept-local
+torrent is usually still seeding in the engine, so deleting its record pops an
+ask dialog carrying the just-forgotten name on the next 3s tick. The
+`forgotten` flag is checked FIRST in `reupload_candidates` (forget keeps
+`choice`, so a scrubbed kept-local record still matches the "local" clause).
+`FORGOTTEN_NAME` has no SxxEyy marker on purpose: `derive_show_key` returns
+None for it, so the Tier-2 route miner ignores forgotten records rather than
+indexing them under one shared bogus show. Names also land in `app.log` and
+`rename_cache.json`, and the same submenu clears both — see **D-019** in
+`docs/DECISIONS.md`.
+
 ## yt-video
 
 `yt-video` is the SINGLE-video sibling to `yt-show`: download one YouTube video

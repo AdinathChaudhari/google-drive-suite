@@ -91,6 +91,20 @@ INCOMPLETE_SUFFIXES = (".part", ".aria2", ".!qb", ".crdownload", ".download")
 # for this long triggers ONE notification (per app run).
 STUCK_NOTIFY_SECONDS = 30 * 60
 
+# Placeholder written over a forgotten decision's display name. The RECORD
+# itself is kept (see DecisionStore.forget): the gid is the only thing that
+# stops poll_once re-asking about a torrent the engine is still seeding, so
+# deleting the record would make the very name the user just scrubbed pop
+# straight back into the ask dialog on the next tick. Chosen to carry no
+# episode/season marker, so renamer.derive_show_key returns None for it and
+# the decisions.json route miner ignores forgotten records entirely.
+FORGOTTEN_NAME = "(forgotten)"
+
+# Cap on how many names the "Forget history" submenu lists at once. Past this
+# the menu becomes an unusable wall; the bulk "Forget everything" item is the
+# way through it.
+FORGET_MENU_LIMIT = 30
+
 # Failed-upload retry policy. A failed upload is retried (the decision is not
 # consumed), but NOT on every POLL_SECONDS tick: without a cap or backoff a
 # permanent failure (revoked token, deleted remote, create-drive 403, quota)
@@ -761,6 +775,61 @@ class DecisionStore:
                 rec.pop("next_attempt", None)
                 self.save()
 
+    def _forget_locked(self, rec):
+        """Scrub one record in place. Caller holds the lock and saves."""
+        rec["name"] = FORGOTTEN_NAME
+        rec["handled"] = True
+        rec["forgotten"] = True
+        rec.pop("failed", None)
+        rec.pop("failures", None)
+        rec.pop("next_attempt", None)
+
+    def forget(self, gid):
+        """Scrub a remembered item's NAME while keeping the gid remembered.
+
+        The privacy escape hatch for the menus: the display name is the only
+        personal thing in a record (gid and "drive:<Name>" are not), and it is
+        what shows up in "Re-upload to Drive", so overwriting it with
+        FORGOTTEN_NAME is the whole job. The record is deliberately NOT
+        deleted -- poll_once only stays quiet about a torrent because a
+        decision exists for its gid, so a delete would re-ask (and re-display)
+        the scrubbed name on the very next tick for anything still seeding in
+        the engine.
+
+        Also forces the record terminal-clean (handled=True, retry
+        bookkeeping popped) so it can never be re-dispatched or resurface via
+        reupload_candidates -- both of which would put a "(forgotten)" row
+        back in the menu. Irreversible, and it costs the item's continuity
+        hint: renamer's Tier-2 decisions miner can no longer route a later
+        season of that show to the same drive from this record. Returns False
+        for an unknown gid."""
+        with self._lock:
+            rec = self.data.get(gid)
+            if not isinstance(rec, dict):
+                return False
+            self._forget_locked(rec)
+            self.save()
+            return True
+
+    def forget_all(self, gids=None):
+        """Forget many records at once (gids=None -> every remembered item).
+
+        One save() for the whole sweep rather than per record. Already-
+        forgotten records are skipped so the returned count is the number
+        actually scrubbed."""
+        with self._lock:
+            targets = list(self.data) if gids is None else list(gids)
+            n = 0
+            for gid in targets:
+                rec = self.data.get(gid)
+                if not isinstance(rec, dict) or rec.get("forgotten"):
+                    continue
+                self._forget_locked(rec)
+                n += 1
+            if n:
+                self.save()
+            return n
+
     def requeue(self, gid, choice):
         """Redirect a past decision to a drive and re-arm it for upload.
 
@@ -845,15 +914,56 @@ def reupload_candidates(store_data):
     reappears in tell_all, so it would be stuck unhandled permanently. Items
     merely pending with zero failures, already uploaded ("drive:..." +
     handled), or found on a drive ("already:...") stay excluded. Returns
-    [(gid, name), ...] sorted by display name for a stable menu."""
+    [(gid, name), ...] sorted by display name for a stable menu.
+
+    A forgotten record (DecisionStore.forget) is excluded FIRST, before any
+    other clause: forget keeps choice as-is, so a forgotten kept-local item
+    would otherwise match the "local" clause and put a "(forgotten)" row
+    right back into the menu the scrub was meant to clear."""
     out = []
     for gid, rec in store_data.items():
-        if not isinstance(rec, dict):
+        if not isinstance(rec, dict) or rec.get("forgotten"):
             continue
         if (rec.get("choice", "") == "local" or rec.get("failed")
                 or (rec.get("failures", 0) > 0 and not rec.get("handled"))):
             out.append((gid, rec.get("name", gid)))
     return sorted(out, key=lambda t: t[1].lower())
+
+
+def rememberable_items(store_data, exclude=()):
+    """gids whose display name is still on disk and could be forgotten.
+
+    Everything DecisionStore holds a real name for -- kept-local, failed,
+    pending AND already-uploaded records alike, since the point is scrubbing
+    the name rather than recovering the payload. Already-forgotten records
+    drop out (nothing left to scrub), as do gids in `exclude`: the menu
+    passes the in-flight uploads there, because forgetting a record mid-upload
+    would rename the row the progress renderer is drawing and hand
+    upload_done a record whose name no longer matches its notification.
+    Returns [(gid, name), ...] sorted by display name for a stable menu."""
+    skip = set(exclude)
+    out = []
+    for gid, rec in store_data.items():
+        if not isinstance(rec, dict) or rec.get("forgotten") or gid in skip:
+            continue
+        out.append((gid, rec.get("name", gid)))
+    return sorted(out, key=lambda t: t[1].lower())
+
+
+def group_by_name(items):
+    """Collapse [(gid, name), ...] into [(name, [gid, ...]), ...].
+
+    rumps keys a menu row by its TITLE (Menu.add -> __setitem__ with the
+    item's title), so two records sharing a display name -- the same torrent
+    re-added under a fresh gid, or a magnet's [METADATA] stub beside its
+    resolved twin -- would collapse into one row and silently drop the other,
+    leaving a name the user believes they just forgot still on disk. Grouping
+    makes that explicit: one row per distinct name, and picking it forgets
+    every gid carrying that name. Input order (sorted by name) is preserved."""
+    groups = {}
+    for gid, name in items:
+        groups.setdefault(name, []).append(gid)
+    return list(groups.items())
 
 
 class Poller:
@@ -2189,6 +2299,7 @@ def _run_app():
                 self.pause_item,
                 self._speed_menu(),
                 self._reupload_menu(),
+                self._forget_menu(),
                 self._storage_menu(),
                 None,
                 rumps.MenuItem("Open log", callback=self._open_log),
@@ -2300,7 +2411,7 @@ def _run_app():
             self.menu = [self.status_item, None] + dynamic + [
                 None, self.pause_item] + [
                 self._speed_menu(), self._reupload_menu(),
-                self._storage_menu()] + [
+                self._forget_menu(), self._storage_menu()] + [
                 None,
                 rumps.MenuItem("Open log", callback=self._open_log),
                 rumps.MenuItem("Quit", callback=self._quit),
@@ -2352,6 +2463,120 @@ def _run_app():
             self._notify("Queued for upload", name,
                          "-> %s" % choice[len("drive:"):])
             log("REQUEUE menu gid=%s %r -> %s" % (gid, name, choice))
+
+        # ---- forget history (privacy) ----
+        def _confirm(self, msg, ok_label):
+            """Timeout-able yes/no dialog; True only on an explicit OK click.
+
+            Same shape as the gate in _offer_repick: 'display dialog' honours
+            'giving up after', so an unattended Mac closes it instead of
+            wedging the menu callback forever, and a timeout counts as No."""
+            script = (
+                'display dialog "%s" buttons {"Cancel", "%s"} '
+                'default button "Cancel" with title "drive-offload" '
+                'giving up after 60' % (esc(msg), esc(ok_label)))
+            rc, out, _err = _osascript(script)
+            return rc == 0 and "gave up:true" not in out and ok_label in out
+
+        def _forget_menu(self):
+            """Submenu that scrubs remembered NAMES off this Mac.
+
+            Per-item rows forget one name each (DecisionStore.forget keeps the
+            gid, so nothing gets re-asked); the three bulk rows below the
+            separator clear the other two places a name lands -- app.log and
+            rename_cache.json -- so together they are a full local wipe.
+            In-flight uploads are excluded from the rows (see
+            rememberable_items) and the list is capped at FORGET_MENU_LIMIT."""
+            m = rumps.MenuItem("Forget history")
+            with self._lock:
+                busy = set(self.uploads)
+            items = rememberable_items(self.store.data, exclude=busy)
+            if not items:
+                m.add(rumps.MenuItem("Nothing remembered"))
+            else:
+                rows = group_by_name(items)
+                for name, gids in rows[:FORGET_MENU_LIMIT]:
+                    it = rumps.MenuItem(name, callback=self._forget_pick)
+                    it._gids = gids      # stash gids for the callback
+                    m.add(it)
+                if len(rows) > FORGET_MENU_LIMIT:
+                    # No callback -> inert row, just a count.
+                    m.add(rumps.MenuItem(
+                        "…and %d more" % (len(rows) - FORGET_MENU_LIMIT)))
+            m.add(None)
+            m.add(rumps.MenuItem("Forget all names…",
+                                 callback=self._forget_all))
+            m.add(rumps.MenuItem("Clear activity log…",
+                                 callback=self._clear_log))
+            m.add(rumps.MenuItem("Clear show routing…",
+                                 callback=self._clear_routing))
+            return m
+
+        def _forget_pick(self, sender):
+            gids = getattr(sender, "_gids", None)
+            if not gids:
+                return
+            name = sender.title
+            if self.store.forget_all(gids):
+                # Drop it from the Recent strip too -- that list holds the
+                # rendered display name, so the row would otherwise keep
+                # showing what was just scrubbed until five more items push
+                # it off the end.
+                with self._lock:
+                    self.recent = [r for r in self.recent if name not in r]
+                # gids only -- logging the name would defeat the whole point,
+                # and Clear activity log is a separate deliberate action.
+                log("FORGET gids=%s" % ",".join(gids))
+                self._notify("Forgotten", "Removed 1 name from this Mac", "")
+
+        def _forget_all(self, _sender):
+            n_items = len(group_by_name(rememberable_items(self.store.data)))
+            if not n_items:
+                self._notify("Nothing to forget", "No names remembered", "")
+                return
+            if not self._confirm(
+                    "Forget %d remembered name%s? Uploads already on Drive "
+                    "are not touched, and nothing will be re-asked."
+                    % (n_items, "" if n_items == 1 else "s"),
+                    "Forget all"):
+                return
+            n = self.store.forget_all()
+            with self._lock:
+                self.recent = []
+            log("FORGET ALL n=%d" % n)
+            self._notify("Forgotten", "Cleared %d name%s from this Mac"
+                         % (n, "" if n == 1 else "s"), "")
+
+        def _clear_log(self, _sender):
+            if not self._confirm(
+                    "Erase the activity log? Past torrent names and upload "
+                    "history go with it.", "Erase log"):
+                return
+            try:
+                # Truncate rather than unlink: log() appends without ever
+                # recreating a missing file, and Open log expects a path.
+                with open(LOG_FILE, "w"):
+                    pass
+            except OSError as e:
+                self._notify("Could not clear log", str(e), "")
+                return
+            log("LOG CLEARED")
+            self._notify("Log cleared", "activity log erased", "")
+
+        def _clear_routing(self, _sender):
+            if not self._confirm(
+                    "Forget every remembered show and the drive it goes to? "
+                    "New episodes will ask for a drive again.",
+                    "Clear routing"):
+                return
+            try:
+                n = self.rename_cache.clear()
+            except Exception as e:
+                self._notify("Could not clear routing", str(e), "")
+                return
+            log("ROUTING CLEARED n=%d" % n)
+            self._notify("Routing cleared", "%d show%s forgotten"
+                         % (n, "" if n == 1 else "s"), "")
 
         def _offer_repick(self, gid, name, failed_drive, quota):
             """Prompt-on-failure recovery: after an upload fails, offer to pick

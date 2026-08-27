@@ -463,6 +463,132 @@ class TestPollSequence(unittest.TestCase):
         self.assertEqual({g for g, _ in cands},
                          {"g_local", "g_failed", "g_retrying"})
 
+    # ---- forget history (privacy) ----
+
+    def test_forget_scrubs_name_but_keeps_the_record(self):
+        # forget() overwrites the display name and forces the record
+        # terminal-clean, but the gid MUST survive: the record is the only
+        # thing keeping poll_once quiet about a torrent still in the engine.
+        self.store.record("gidP", "personal name", "drive:Films",
+                          handled=False)
+        self.store.data["gidP"]["failures"] = 2
+        self.store.data["gidP"]["next_attempt"] = 9999
+        self.assertTrue(self.store.forget("gidP"))
+        rec = self.store.get("gidP")
+        self.assertEqual(rec["name"], app.FORGOTTEN_NAME)
+        self.assertTrue(rec["handled"])
+        self.assertTrue(rec["forgotten"])
+        self.assertNotIn("failures", rec)
+        self.assertNotIn("next_attempt", rec)
+        # persisted, and the scrubbed name is nowhere in the file
+        self.assertNotIn("personal name",
+                         open(app.DECISIONS_FILE, encoding="utf-8").read())
+        # a fresh store (next app run) sees the same thing
+        store2 = app.DecisionStore(app.DECISIONS_FILE)
+        self.assertEqual(store2.get("gidP")["name"], app.FORGOTTEN_NAME)
+        self.assertFalse(self.store.forget("nosuchgid"))
+
+    def test_forgotten_records_leave_both_menus(self):
+        # Every shape reupload_candidates offers must stop being offered once
+        # forgotten -- forget keeps `choice`, so the "local" clause would
+        # otherwise put a "(forgotten)" row straight back in the menu.
+        self.store.data = {
+            "g_local": {"name": "Kept", "choice": "local", "handled": True},
+            "g_failed": {"name": "Failed", "choice": "drive:Films",
+                         "handled": False, "failed": True},
+            "g_retrying": {"name": "Retrying", "choice": "drive:Films",
+                           "handled": False, "failures": 1},
+        }
+        self.store.save()
+        self.assertEqual(len(app.reupload_candidates(self.store.data)), 3)
+        for gid in ("g_local", "g_failed", "g_retrying"):
+            self.store.forget(gid)
+        self.assertEqual(app.reupload_candidates(self.store.data), [])
+        self.assertEqual(app.rememberable_items(self.store.data), [])
+
+    def test_rememberable_items_covers_uploaded_and_skips_in_flight(self):
+        # The forget menu offers uploaded/pending names too (the point is the
+        # NAME, not the payload), sorted case-insensitively, minus anything
+        # currently uploading.
+        self.store.data = {
+            "g1": {"name": "beta", "choice": "drive:Films", "handled": True},
+            "g2": {"name": "Alpha", "choice": "local", "handled": True},
+            "g3": {"name": "gamma", "choice": "drive:Films",
+                   "handled": False},
+        }
+        self.assertEqual(app.rememberable_items(self.store.data),
+                         [("g2", "Alpha"), ("g1", "beta"), ("g3", "gamma")])
+        self.assertEqual(
+            [g for g, _ in app.rememberable_items(self.store.data,
+                                                  exclude={"g3"})],
+            ["g2", "g1"])
+
+    def test_forget_does_not_re_ask_a_torrent_still_in_the_engine(self):
+        # THE regression this design exists for: deleting the record instead
+        # of scrubbing it would make the ask fire again on the next tick --
+        # putting the just-forgotten name back on screen -- for any torrent
+        # still seeding in the engine.
+        p = self._make_poller({"gidK": "local"})
+        payload = self._payload("keep.mkv")
+        FIXTURE.downloads = [{
+            "gid": "gidK", "status": "active", "totalLength": "100",
+            "completedLength": "100", "downloadSpeed": "0",
+            "dir": self.tmp, "files": [{"path": payload}]}]
+        p.poll_once()
+        self.assertEqual(len(self.asks), 1)
+        self.store.forget("gidK")
+        p.poll_once()                       # torrent still seeding
+        p.poll_once()
+        self.assertEqual(len(self.asks), 1)         # never re-asked
+        self.assertEqual(len(self.uploads), 0)      # and never dispatched
+        self.assertEqual(self.store.get("gidK")["name"], app.FORGOTTEN_NAME)
+
+    def test_forget_all_is_idempotent_and_counts_only_new_scrubs(self):
+        self.store.data = {
+            "g1": {"name": "one", "choice": "local", "handled": True},
+            "g2": {"name": "two", "choice": "drive:Films", "handled": True},
+            "g3": {"name": app.FORGOTTEN_NAME, "choice": "local",
+                   "handled": True, "forgotten": True},
+        }
+        self.store.save()
+        self.assertEqual(self.store.forget_all(), 2)   # g3 already scrubbed
+        self.assertEqual(self.store.forget_all(), 0)
+        self.assertTrue(all(r["name"] == app.FORGOTTEN_NAME
+                            for r in self.store.data.values()))
+        # explicit subset form
+        self.store.record("g4", "four", "local", handled=True)
+        self.store.record("g5", "five", "local", handled=True)
+        self.assertEqual(self.store.forget_all(["g4", "nosuchgid"]), 1)
+        self.assertEqual(self.store.get("g5")["name"], "five")
+
+    def test_same_name_under_two_gids_is_one_row_that_forgets_both(self):
+        # rumps keys a menu row by title, so two records sharing a name would
+        # collapse to one row and leave the twin on disk -- a name the user
+        # believes they forgot. One row, both gids.
+        self.store.data = {
+            "g_meta": {"name": "same name", "choice": "local",
+                       "handled": True},
+            "g_real": {"name": "same name", "choice": "drive:Films",
+                       "handled": True},
+            "g_other": {"name": "other", "choice": "local", "handled": True},
+        }
+        self.store.save()
+        rows = app.group_by_name(app.rememberable_items(self.store.data))
+        self.assertEqual([n for n, _ in rows], ["other", "same name"])
+        gids = dict(rows)["same name"]
+        self.assertEqual(sorted(gids), ["g_meta", "g_real"])
+        self.assertEqual(self.store.forget_all(gids), 2)
+        self.assertEqual(
+            [n for n, _ in
+             app.group_by_name(app.rememberable_items(self.store.data))],
+            ["other"])
+
+    def test_forgotten_name_is_invisible_to_the_route_miner(self):
+        # FORGOTTEN_NAME must carry no season/episode marker, or the Tier-2
+        # decisions miner would index every forgotten record under one bogus
+        # show and route real episodes off it.
+        self.assertIsNone(app.renamer.derive_show_key(app.FORGOTTEN_NAME))
+
     def test_local_then_requeued_uploads_only_after_success(self):
         # A download kept local (the Spider-Man bug) can later be redirected
         # to a drive: requeue re-arms it, poll dispatches the upload, and it
