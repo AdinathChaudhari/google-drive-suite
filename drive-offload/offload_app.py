@@ -2466,17 +2466,31 @@ def _run_app():
 
         # ---- forget history (privacy) ----
         def _confirm(self, msg, ok_label):
-            """Timeout-able yes/no dialog; True only on an explicit OK click.
+            """Yes/no gate for the destructive Forget items. True only on OK.
 
-            Same shape as the gate in _offer_repick: 'display dialog' honours
-            'giving up after', so an unattended Mac closes it instead of
-            wedging the menu callback forever, and a timeout counts as No."""
-            script = (
-                'display dialog "%s" buttons {"Cancel", "%s"} '
-                'default button "Cancel" with title "drive-offload" '
-                'giving up after 60' % (esc(msg), esc(ok_label)))
-            rc, out, _err = _osascript(script)
-            return rc == 0 and "gave up:true" not in out and ok_label in out
+            An app-owned NSAlert (rumps.alert), NOT the osascript
+            'display dialog' the ask flow uses. Those dialogs belong to a
+            child osascript process; from a menu callback that means the
+            confirmation can end up behind whatever is frontmost, and the
+            main thread blocks on a subprocess the user cannot see. An
+            NSAlert is raised by this app, so it fronts with it.
+
+            No 'giving up after' here, unlike _offer_repick's gate: that one
+            fires unattended after an upload failure and must not wedge the
+            app overnight, whereas this one only ever opens because the user
+            just clicked the item, so blocking until they answer is correct.
+
+            Every outcome is logged -- a confirmation that is silently
+            declined and one that never opened at all look identical from
+            the outside otherwise."""
+            try:
+                choice = rumps.alert(title="drive-offload", message=msg,
+                                     ok=ok_label, cancel="Cancel")
+            except Exception as e:
+                log("CONFIRM %r error: %s" % (ok_label, e))
+                return False
+            log("CONFIRM %r -> %s" % (ok_label, choice))
+            return choice == 1
 
         def _forget_menu(self):
             """Submenu that scrubs remembered NAMES off this Mac.
@@ -2513,7 +2527,11 @@ def _run_app():
             return m
 
         def _forget_pick(self, sender):
+            # Logged BEFORE anything can fail: a click that never arrives and
+            # a click that dies inside the handler are indistinguishable in
+            # the log otherwise, and rumps swallows callback exceptions.
             gids = getattr(sender, "_gids", None)
+            log("FORGET click gids=%d" % len(gids or []))
             if not gids:
                 return
             name = sender.title
@@ -2530,6 +2548,7 @@ def _run_app():
                 self._notify("Forgotten", "Removed 1 name from this Mac", "")
 
         def _forget_all(self, _sender):
+            log("FORGET ALL click")
             n_items = len(group_by_name(rememberable_items(self.store.data)))
             if not n_items:
                 self._notify("Nothing to forget", "No names remembered", "")
@@ -2548,6 +2567,7 @@ def _run_app():
                          % (n, "" if n == 1 else "s"), "")
 
         def _clear_log(self, _sender):
+            log("CLEAR LOG click")
             if not self._confirm(
                     "Erase the activity log? Past torrent names and upload "
                     "history go with it.", "Erase log"):
@@ -2564,6 +2584,7 @@ def _run_app():
             self._notify("Log cleared", "activity log erased", "")
 
         def _clear_routing(self, _sender):
+            log("CLEAR ROUTING click")
             if not self._confirm(
                     "Forget every remembered show and the drive it goes to? "
                     "New episodes will ask for a drive again.",

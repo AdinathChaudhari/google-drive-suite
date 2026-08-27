@@ -620,6 +620,18 @@ than no entry.
   `drive-offload/test_offload_app.py` §
   `test_forget_does_not_re_ask_a_torrent_still_in_the_engine` (mutation-checked:
   deleting instead of scrubbing makes the ask fire twice).
+- **Then** (same day) — the shipped menu did nothing when clicked. The store
+  was never written and no line reached the log. The app was verified healthy
+  (one start, stable PID, no traceback) and the dialog script verified working
+  in isolation, which leaves the confirmation itself: an `_osascript`
+  `display dialog` belongs to a child osascript process and can open behind
+  the frontmost window, timing out after 60s into a silent False — the one
+  explanation consistent with all of it. Fixed by using `rumps.alert` — an NSAlert
+  owned by the app, which fronts with it — and by logging every callback entry
+  plus every confirm outcome, since "declined" and "never dispatched" are the
+  same silence otherwise. The timeout was dropped with it: `_offer_repick`'s
+  gate needs `giving up after` because it fires unattended, but a gate that
+  only opens on a click can safely block until answered.
 - **Revisit when** — decisions ever get pruned by age. A reaper that drops old
   records hits exactly the same re-ask trap, and would need the same
   tombstone-shaped answer.
