@@ -11,6 +11,7 @@ No real Motrix/Google/UI: the on-disk work runs against tmp dirs, and the
 engine lifecycle uses the same RecordingClient/Engine fakes as
 test_offload_app. rumps is NOT imported (offload_app's UI import is lazy).
 """
+import io
 import os
 import tempfile
 import unittest
@@ -104,6 +105,22 @@ class TestRenameCache(unittest.TestCase):
         self.assertEqual(rec2["seasons"]["2"]["gid"], "gid-1")
         self.assertEqual(len(rec2["history"]), 1)
         self.assertEqual(rec2["folder_format"], "{show} Season {season}")
+
+    def test_clear_drops_every_show_and_persists(self):
+        # The privacy sweep behind offload_app's "Clear show routing":
+        # a show's display name lives here as well as in decisions.json.
+        c = r.RenameCache(self.path)
+        c.record_show("northbound", display="Northbound", drive="DriveB")
+        c.record_season("northbound", 1, "gid-1", episodes=3, source_pattern="p")
+        c.record_show("southbound", display="Southbound", drive="DriveC")
+        self.assertEqual(c.clear(), 2)
+        self.assertIsNone(c.lookup("northbound"))
+        self.assertEqual(c.data["version"], 1)          # version preserved
+        self.assertNotIn("Northbound",
+                         io.open(self.path, encoding="utf-8").read())
+        # survives a reload, and a second clear is a no-op
+        self.assertEqual(r.RenameCache(self.path).data["shows"], {})
+        self.assertEqual(c.clear(), 0)
 
     def test_record_show_never_clobbers_seasons(self):
         c = r.RenameCache(self.path)
