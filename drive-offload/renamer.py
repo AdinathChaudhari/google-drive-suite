@@ -887,6 +887,21 @@ class RenameCache:
     def _shows(self):
         return self.data.setdefault("shows", {})
 
+    def clear(self):
+        """Drop every remembered show (names, aliases, drives, seasons).
+
+        The rename cache is the second place a show's NAME lives on disk, so
+        offload_app's "Forget history" needs a way to scrub it too. Version
+        is preserved -- only `shows` is emptied. Losing it costs continuity
+        routing, not data: the next episode simply asks for its drive again
+        and re-learns. Returns the number of shows dropped."""
+        with self._lock:
+            n = len(self.data.get("shows", {}))
+            self.data["shows"] = {}
+            if n:
+                self.save()
+            return n
+
     def lookup(self, slug, aliases=None):
         """Return a COPY of the show record whose slug or aliases match `slug`
         or any of `aliases`, else None. Read-only (returns a copy so callers

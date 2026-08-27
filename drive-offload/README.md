@@ -275,6 +275,17 @@ uploads with detail (`⬆ name → DriveName — 42% (3.2 MiB/s, ETA 2m58s)`), a
   fill-% shown) — no waiting out retries against a drive that can't succeed.
   Re-adding the same download won't re-ask, because the per-download decision is
   remembered by its id.
+- **Forget history** — the privacy escape hatch for that list. Pick any
+  remembered item and its **name** is scrubbed off this Mac; the record itself
+  stays (as `(forgotten)`), because that record is what stops the app re-asking
+  about a torrent still seeding in your client — delete it and the name you just
+  forgot would pop back in the next ask dialog. Forgetting is irreversible, and
+  it costs that item's continuity hint. Below the names, three bulk actions
+  (each behind a confirmation) cover the other places a title lands on disk:
+  **Forget all names…** scrubs every record and empties **Recent**, **Clear
+  activity log…** erases `app.log`, and **Clear show routing…** empties
+  `rename_cache.json` so shows ask for a drive again. Files already uploaded to
+  Drive are never touched.
 - **Drive storage** — a monospaced, aligned table of each Shared Drive's
   **content · trash · total · free** (free = headroom against the 100 GB cap,
   `over` for grandfathered drives), listing only non-empty drives. Trashed files

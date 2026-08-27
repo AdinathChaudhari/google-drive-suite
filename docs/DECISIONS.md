@@ -57,6 +57,7 @@ than no entry.
 | [D-016](#d-016--bring-into-view-follows-the-focus-target-not-the-tile) | Bring-into-view follows the focus target, not the tile | Adopted | drivecast-app |
 | [D-017](#d-017--a-tab-less-drive-silently-disabled-per-drive-refresh) | A tab-less drive silently disabled per-drive refresh | Adopted | drivecast |
 | [D-018](#d-018--focusrestorer-over-a-lazy-lane-kills-the-process-not-the-keypress) | `focusRestorer` over a lazy lane kills the process, not the keypress | Adapted | drivecast-app |
+| [D-019](#d-019--forgetting-a-decision-means-scrubbing-it-not-deleting-it) | Forgetting a decision means scrubbing it, not deleting it | Adopted | drive-offload |
 
 ---
 
@@ -580,3 +581,45 @@ than no entry.
   lane stops being a crash — but it still restores by a stale layout-node hash
   after a scroll round-trip (D-015), so `tvFocusEnterFallback` stays the default
   for recycling lanes regardless.
+
+---
+
+### D-019 — Forgetting a decision means scrubbing it, not deleting it
+**Status:** Adopted · **When:** 2026-08-27
+
+- **Hit** — the "Re-upload to Drive" menu lists every item that never reached a
+  shared drive, by name, in a menu bar that is visible over a shared screen.
+  Some of those names are personal. There was no way to take one out of the
+  list, and no way to clear the app's memory at all.
+- **Learned** — the obvious implementation (delete the record from
+  `decisions.json`) puts the name straight back. That record is the ONLY thing
+  making `Poller.poll_once` quiet about a gid: the ask fires for any engine
+  download with no decision, and a torrent that has been kept local is usually
+  still seeding in Motrix/Transmission long after the decision was made. Delete
+  it and the very next 3-second tick pops an ask dialog carrying the name that
+  was just "forgotten" — worse than not offering the feature. A record's
+  personal payload is its `name` alone; the gid and `drive:<Name>` are not
+  identifying.
+- **Did** — `DecisionStore.forget` overwrites `name` with `FORGOTTEN_NAME`
+  ("(forgotten)"), sets `handled=True`, adds `forgotten=True`, and pops the
+  retry bookkeeping — so the gid stays remembered and inert. `forgotten` is
+  checked FIRST in `reupload_candidates`, because forget keeps `choice` and a
+  scrubbed kept-local record would otherwise re-match the "local" clause and
+  return to the same menu as a "(forgotten)" row. The placeholder deliberately
+  carries no season/episode marker, so `renamer.derive_show_key` returns None
+  for it and the Tier-2 route miner skips forgotten records instead of indexing
+  them all under one bogus show. A name reaches disk in two other places, so
+  the submenu also clears them: `app.log` (truncated, not unlinked — `log()`
+  appends and never recreates) and `rename_cache.json` (`RenameCache.clear`).
+  The per-item rows exclude in-flight uploads, whose rows are being redrawn
+  from that same name.
+- **Where** — `drive-offload/offload_app.py` § `FORGOTTEN_NAME` /
+  `DecisionStore.forget` / `forget_all` / `rememberable_items` /
+  `reupload_candidates` / `OffloadApp._forget_menu`,
+  `drive-offload/renamer.py` § `RenameCache.clear`,
+  `drive-offload/test_offload_app.py` §
+  `test_forget_does_not_re_ask_a_torrent_still_in_the_engine` (mutation-checked:
+  deleting instead of scrubbing makes the ask fire twice).
+- **Revisit when** — decisions ever get pruned by age. A reaper that drops old
+  records hits exactly the same re-ask trap, and would need the same
+  tombstone-shaped answer.
