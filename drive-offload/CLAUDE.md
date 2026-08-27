@@ -33,6 +33,17 @@ indexing them under one shared bogus show. Names also land in `app.log` and
 `rename_cache.json`, and the same submenu clears both — see **D-019** in
 `docs/DECISIONS.md`.
 
+The confirmations use **`rumps.alert`**, not the `_osascript` `display dialog`
+the ask flow uses. An osascript dialog belongs to a child process, so from a
+menu callback it can open behind whatever is frontmost while the main thread
+blocks on a subprocess the user cannot see. The first build shipped that way
+and did nothing when clicked — store never written, nothing in the log — which
+an unseen dialog timing out after 60s into a silent False explains exactly.
+An NSAlert is owned by this app and
+fronts with it. Every callback logs on entry and every confirm logs its
+outcome, because a declined confirmation and a click that never arrived are
+otherwise indistinguishable in the log.
+
 ## yt-video
 
 `yt-video` is the SINGLE-video sibling to `yt-show`: download one YouTube video
