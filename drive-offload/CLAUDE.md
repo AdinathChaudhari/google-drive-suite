@@ -56,6 +56,30 @@ asked drive stay there as orphans (final pass targets the routed drive); accepte
 with todrive's split-payload behaviour. Logic is in
 top-level functions because `_run_app` is untestable headless. See **D-020**.
 
+**Folder-level logic (D-021).** A "folder" is a top-level child dir of the torrent
+root; root files are never folders. For a drive-bound partial Transmission torrent
+`Poller._poll_folders` (after `_poll_partial`, same tick) does ONE action per tick, on
+a worker thread via `spawn_cb`, under the same `_uploading` guard as the COPY, so
+copy/free/advance/done never overlap for one gid: (1) **free** a folder whose files
+are all selected and all in `uploaded_files`: `rclone check --one-way` vs
+`<remote>:<top>/<folder>` (`verify_on_drive`, remote from `todrive resolve`, rc 0 only)
+-> `TransmissionClient.set_files_wanted(..., False)` -> `get_files_wanted` must show
+them all unwanted -> `rmtree` iff `safe_child_dir` -> `freed_folders`. Untick BEFORE
+delete is load-bearing (Transmission stops the torrent if selected files vanish). (2)
+**advance** (`partial_auto_advance`): nothing selected-incomplete and no copy owed ->
+tick the first folder with no selected/uploaded files and not freed (season number
+ascending, then natural sort) if `disk_usage.free >= size + partial_free_margin_gb`
+(else one notice per gid+folder), then `torrent-start`. (3) **done**: every file in
+`uploaded_files` -> leftover scan + rclone check, `remove_torrent` (no data), confirm it
+left, mark handled, rmtree the root. Failures back off in `free_*` keys
+(`FREE_FAIL_KEYS`, re-armed on restart). A torrent with `freed_folders` stays
+partial-managed and is never whole-dir moved. Config keys (top-level, default on):
+`partial_free_after_upload`, `partial_auto_advance`, `partial_free_margin_gb`; a bare
+`Poller` has them OFF (only `_run_app` passes `read_partial_config()`), so tests can
+never delete or spawn rclone by accident. With `partial_auto_advance` off the torrent
+just stays partial. Limits: unwanted files in the torrent ROOT are never ticked, so
+such a torrent is never "done"; only `poll_once`'s `status in (complete, active)`.
+
 ## yt-video
 
 `yt-video` is the SINGLE-video sibling to `yt-show`: download one YouTube video
