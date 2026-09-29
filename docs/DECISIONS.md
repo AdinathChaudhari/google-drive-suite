@@ -59,6 +59,7 @@ than no entry.
 | [D-018](#d-018--focusrestorer-over-a-lazy-lane-kills-the-process-not-the-keypress) | `focusRestorer` over a lazy lane kills the process, not the keypress | Adapted | drivecast-app |
 | [D-019](#d-019--forgetting-a-decision-means-scrubbing-it-not-deleting-it) | Forgetting a decision means scrubbing it, not deleting it | Adopted | drive-offload |
 | [D-020](#d-020--a-season-by-season-torrent-is-copied-as-it-finishes-moved-only-at-the-end) | A season-by-season torrent is copied as it finishes, moved only at the end | Adopted | drive-offload |
+| [D-021](#d-021--each-season-folder-is-freed-once-it-is-verifiably-on-the-drive-then-the-next-one-starts) | Each season folder is freed once it is verifiably on the drive, then the next one starts | Adopted | drive-offload |
 
 ---
 
@@ -669,3 +670,57 @@ than no entry.
 - **Revisit when** — a torrent with permanently deselected files (junk the user
   never wants) should still be finished off. Today it is copied and then left
   seeding, because the move only runs once every file is selected.
+
+### D-021 — Each season folder is freed once it is verifiably on the drive, then the next one starts
+**Status:** Adopted · **When:** 2026-09-29
+
+- **Hit** — D-020 made partial mode COPY finished files and keep everything
+  local. On a 460 GB Mac a 179 GB multi-season torrent ("Show (2007) Season
+  1-7") still filled the disk: nothing was ever deleted until every file was
+  selected, which never happens when the disk cannot hold the whole thing.
+- **Learned** — the copy is only safe to delete against once it is *proven*
+  on the drive, and Transmission adds an ordering trap: if SELECTED files
+  disappear it errors and stops the whole torrent. So the delete must come
+  after the files are unticked, and the untick must be confirmed, not assumed.
+  A "folder" is the natural unit (a top-level child dir of the torrent root);
+  files directly in the root are never folders, so never auto-freed or advanced.
+- **Did** — `Poller._poll_folders` runs one action per tick for a
+  drive-bound partial Transmission torrent, all on a worker thread (rclone
+  check and RPC never block the poll timer): **free** a folder whose files are
+  ALL selected and ALL in `uploaded_files` and that still exists —
+  `rclone check --one-way` against `<remote>:<torrent dir>/<folder>` (remote from
+  `todrive resolve`; only rc 0 counts) -> `torrent-set files-unwanted` -> re-read
+  `torrent-get` and require every one of those files `wanted=false` -> `rmtree`
+  only if the folder is a real (non-symlink) direct child of the torrent root ->
+  record it in `freed_folders`. A folder already absent, fully uploaded and fully
+  unwanted is just recorded. **Advance:** once the user's selection has no
+  incomplete file and no copy is owed, tick the first folder (season number
+  ascending, then natural sort) with zero selected files, no uploaded files and
+  not freed — if `disk_usage(root).free >= folder size + margin` (default 5 GB;
+  else one "Not enough space" notice per gid+folder) — then `torrent-start`.
+  Nothing the user ticked is ever changed. **Done:** when every file is in
+  `uploaded_files`, check what is left locally, remove the torrent WITHOUT data,
+  confirm it left the engine, mark handled, delete the root (only if every
+  regular file left is uploaded, ignoring `.part` markers and empty dirs). COPY,
+  free, advance and done share the one `_uploading` in-flight guard per gid, so
+  they can never overlap; their failures back off in `free_*` keys, apart from
+  `partial_*` and `failures`. A torrent with `freed_folders` is never whole-dir
+  moved (freed folders are unwanted, and an explicit guard covers a re-ticked
+  one). Config (top-level keys, default on): `partial_free_after_upload`,
+  `partial_auto_advance`, `partial_free_margin_gb`.
+- **Where** — `drive-offload/offload_app.py` § `Poller._poll_folders` /
+  `_poll_free` / `_free_work` / `_poll_done` / `_done_work` / `_poll_advance`,
+  `partial_folders` / `safe_child_dir` / `rclone_check_argv` / `verify_on_drive`,
+  `TransmissionClient.set_files_wanted` / `get_files_wanted`,
+  `DecisionStore.add_freed_folder` / `record_free_failure`,
+  `drive-offload/test_offload_app.py` § `TestFreeAfterUpload` /
+  `TestAutoAdvance` / `TestPartialDone` / `TestFreedFolderMoveGuard`
+  (mutation-checked: freeing before the untick, ignoring the check result or
+  the untick confirmation, dropping the symlink/direct-child guard, freeing on
+  partial upload, ignoring free space, skipping the leftover scan, and dropping
+  the move guard each fail a test).
+- **Revisit when** — a torrent has permanently unwanted files in its ROOT
+  (never a folder, so never ticked): it is never "done" and stays seeding. Also
+  a re-pick of a different drive keeps `freed_folders` but drops
+  `uploaded_files`, so freed folders are not re-uploaded (their data only exists
+  on the old drive).

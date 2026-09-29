@@ -269,6 +269,21 @@ copies (a drive that fills up mid-way fails instead of splitting the show; pick
 another drive from Re-upload, which re-uploads everything there). A torrent that
 keeps some files deselected forever is copied but never removed.
 
+**Freeing disk as you go.** When a whole season folder (a top-level folder of the
+torrent) is on the drive, the app checks it against the drive with `rclone check`, then
+unticks its files in Transmission, and only then deletes the local folder ("Season
+freed" notification). When the files you ticked are all done and uploaded, it ticks the
+next season folder (lowest season number first) and starts the torrent, provided the
+disk has room for it plus a 5 GB margin; otherwise you get one "Not enough space"
+notice. Anything you ticked yourself is never changed. When every file of the torrent is
+on the drive, the torrent is removed from Transmission (data untouched) and the local
+folder is deleted. Files sitting directly in the torrent's top folder are uploaded but
+never auto-ticked, so a torrent with unwanted files there just stays. Any failure
+(check fails, untick not confirmed) deletes nothing and retries with backoff. Turn it
+off with `config.json` keys (restart the app): `"partial_free_after_upload": false`,
+`"partial_auto_advance": false` (the torrent then stays partial), and
+`"partial_free_margin_gb": 5`.
+
 ### Live upload progress
 
 While an upload runs, the menu-bar **title itself shows the percent** —

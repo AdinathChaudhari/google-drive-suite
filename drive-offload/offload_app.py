@@ -20,6 +20,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -263,6 +264,34 @@ def read_recover_config(path=CONFIG_FILE):
                 if k in r:
                     cfg[k] = bool(r[k])
     except (OSError, ValueError, TypeError):
+        pass
+    return cfg
+
+
+# Folder-level logic for partial torrents (see Poller._poll_folders). Read from
+# config.json's TOP-LEVEL keys, once at startup (a toggle needs a restart, like
+# the other gates). All default ON: without them a 179 GB multi-season torrent
+# fills the disk, because partial mode only COPIES finished files.
+DEFAULT_PARTIAL_CFG = {"partial_free_after_upload": True,
+                       "partial_auto_advance": True,
+                       "partial_free_margin_gb": 5}
+
+
+def read_partial_config(path=CONFIG_FILE):
+    """Read the folder-level partial-torrent keys from config.json, merged
+    over DEFAULT_PARTIAL_CFG. A missing file/key or a wrong-typed value just
+    yields the default. Never written here."""
+    cfg = dict(DEFAULT_PARTIAL_CFG)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        for k in ("partial_free_after_upload", "partial_auto_advance"):
+            if isinstance(data.get(k), bool):
+                cfg[k] = data[k]
+        m = data.get("partial_free_margin_gb")
+        if isinstance(m, (int, float)) and not isinstance(m, bool) and m >= 0:
+            cfg["partial_free_margin_gb"] = m
+    except (OSError, ValueError, TypeError, AttributeError):
         pass
     return cfg
 
@@ -544,6 +573,28 @@ class TransmissionClient:
         except Exception as e:
             log("transmission remove_torrent %s error: %s" % (gid, e))
 
+    def set_files_wanted(self, gid, indices, wanted):
+        """Tick (wanted=True) or untick the files at `indices` (positions in
+        the torrent's file list). Unlike the best-effort calls above this
+        RAISES on failure: folder-level logic must know whether an untick
+        landed before it deletes anything."""
+        h = gid[len(TM_PREFIX):] if gid.startswith(TM_PREFIX) else gid
+        key = "files-wanted" if wanted else "files-unwanted"
+        self._call("torrent-set", {"ids": [h], key: list(indices)})
+
+    def get_files_wanted(self, gid):
+        """Fresh per-file wanted flags (list of bool, file-list order) straight
+        from torrent-get, for confirming an untick. Raises on failure or when
+        the torrent is gone."""
+        h = gid[len(TM_PREFIX):] if gid.startswith(TM_PREFIX) else gid
+        args = self._call("torrent-get", {"ids": [h],
+                                          "fields": ["fileStats"]})
+        ts = args.get("torrents") or []
+        if not ts:
+            raise RuntimeError("torrent %s not found" % gid)
+        return [bool(st.get("wanted", True))
+                for st in (ts[0].get("fileStats") or [])]
+
 
 class MultiClient:
     """Fans out over several download engines (Motrix/aria2, Transmission),
@@ -804,6 +855,157 @@ def final_pass_plan(rec, drive, rename_cfg):
 
 PARTIAL_FAIL_KEYS = ("partial_failed", "partial_failures",
                      "partial_next_attempt")
+# Backoff bookkeeping for the folder-level actions (free / advance / done),
+# separate from partial_* (the COPY) and failed/failures (the final move).
+FREE_FAIL_KEYS = ("free_failed", "free_failures", "free_next_attempt")
+
+
+# --- folder-level logic for partial torrents -------------------------------
+# A "folder" is a top-level child directory of the torrent's root dir. Files
+# directly in the root are never folders: never auto-freed, never advanced.
+
+def partial_folders(dl, top):
+    """{folder: [(file_index, rel, file_dict), ...]} for the torrent's
+    top-level child directories, in engine order. file_index is the position
+    in dl["files"] (== the engine's file index)."""
+    out = {}
+    for i, f in enumerate(dl.get("files") or []):
+        p = f.get("path")
+        if not p:
+            continue
+        rel = os.path.relpath(p, top)
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            continue
+        parts = rel.split(os.sep)
+        if len(parts) < 2:
+            continue
+        out.setdefault(parts[0], []).append((i, rel, f))
+    return out
+
+
+def _file_complete(f):
+    try:
+        return int(f.get("completedLength")) == int(f.get("length"))
+    except (TypeError, ValueError):
+        return False
+
+
+_SEASON_RE = re.compile(r"(?<![a-z])(?:season|series|s)[ ._-]*(\d{1,3})(?!\d)",
+                        re.I)
+
+
+def season_number(folder):
+    """Season number from a folder name ("Season 4", "S04", "Series 4"), else
+    None."""
+    m = _SEASON_RE.search(folder)
+    return int(m.group(1)) if m else None
+
+
+def _natural_key(s):
+    return [int(t) if t.isdigit() else t.lower()
+            for t in re.split(r"(\d+)", s)]
+
+
+def folder_order_key(folder):
+    """Season folders first by season number, then everything else in natural
+    sort ("Extras 2" before "Extras 10")."""
+    n = season_number(folder)
+    if n is not None:
+        return (0, n, _natural_key(folder))
+    return (1, 0, _natural_key(folder))
+
+
+def safe_child_dir(path, parent):
+    """True only when `path` is a real (non-symlink) directory whose resolved
+    location is a DIRECT child of the resolved `parent`. The gate in front of
+    every rmtree here."""
+    if os.path.islink(path):
+        return False
+    rp, rt = os.path.realpath(path), os.path.realpath(parent)
+    return os.path.isdir(rp) and rp != rt and os.path.dirname(rp) == rt
+
+
+def tree_leftovers(root, uploaded):
+    """Regular files under `root` that are NOT accounted for: neither in
+    `uploaded` (relative paths) nor the ".part" marker of one that is. Empty
+    dirs are ignored; a symlink counts as a leftover (it is never deleted
+    blind)."""
+    left = []
+    done = set(uploaded)
+    for dp, _dns, fns in os.walk(root):
+        for fn in fns:
+            rel = os.path.relpath(os.path.join(dp, fn), root)
+            if rel in done or (rel.endswith(".part")
+                               and rel[:-len(".part")] in done):
+                if not os.path.islink(os.path.join(dp, fn)):
+                    continue
+            left.append(rel)
+    return left
+
+
+def rclone_check_argv(local, remote_conn, subpath, excludes=(),
+                      rclone="rclone"):
+    """argv for `rclone check --one-way <local> <remote>:<subpath>` (pure, so
+    it is unit-testable). One-way: every LOCAL file must exist on the drive
+    with matching content; extra files on the drive are fine."""
+    argv = [rclone, "check", "--one-way", local, remote_conn + subpath]
+    for pat in excludes:
+        argv += ["--exclude", pat]
+    return argv
+
+
+def todrive_resolve_argv(drive):
+    return [sys.executable, TODRIVE, "resolve", drive]
+
+
+def _find_rclone():
+    found = shutil.which("rclone")
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/rclone", "/usr/local/bin/rclone",
+                 "/opt/local/bin/rclone"):
+        if os.path.exists(cand):
+            return cand
+    return "rclone"
+
+
+def todrive_resolve(drive, runner=subprocess.run):
+    """rclone connection string for a drive name via `todrive resolve` (no
+    --create), or None on any failure."""
+    env = dict(os.environ)
+    env["TODRIVE_CONFIG"] = CONFIG_FILE
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        p = runner(todrive_resolve_argv(drive), env=env, cwd=SCRIPT_DIR,
+                   capture_output=True, text=True, encoding="utf-8",
+                   errors="replace")
+    except OSError:
+        return None
+    if p.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
+
+
+def verify_on_drive(local, drive, subpath, excludes=(),
+                    resolve=todrive_resolve, runner=subprocess.run):
+    """(ok, detail): does every file under `local` exist on `drive` at
+    <subpath>? Only rclone check rc == 0 counts."""
+    conn = resolve(drive)
+    if not conn:
+        return False, "cannot resolve drive %r" % drive
+    argv = rclone_check_argv(local, conn, subpath, excludes,
+                             rclone=_find_rclone())
+    try:
+        p = runner(argv, capture_output=True, text=True, encoding="utf-8",
+                   errors="replace")
+    except OSError as e:
+        return False, "rclone check could not run: %s" % e
+    if p.returncode == 0:
+        return True, "rclone check ok"
+    tail = " | ".join(((p.stderr or "") + (p.stdout or "")).strip()
+                      .splitlines()[-3:])
+    return False, "rclone check rc=%d %s" % (p.returncode, tail)
 
 
 class DecisionStore:
@@ -842,7 +1044,7 @@ class DecisionStore:
             # state, so load() stays side-effect-free on disk.
             for rec in self.data.values():
                 if isinstance(rec, dict) and not rec.get("handled"):
-                    for k in PARTIAL_FAIL_KEYS:
+                    for k in PARTIAL_FAIL_KEYS + FREE_FAIL_KEYS:
                         rec.pop(k, None)
                     rec.pop("failed", None)
                     rec.pop("failures", None)
@@ -895,6 +1097,8 @@ class DecisionStore:
                 rec.pop("failed", None)
                 rec.pop("failures", None)
                 rec.pop("next_attempt", None)
+                for k in FREE_FAIL_KEYS:
+                    rec.pop(k, None)
                 self.save()
 
     def _forget_locked(self, rec):
@@ -908,6 +1112,9 @@ class DecisionStore:
         # Relative paths carry content names, like "name" does.
         rec.pop("uploaded_files", None)
         rec.pop("partial_drive", None)
+        rec.pop("freed_folders", None)
+        for k in FREE_FAIL_KEYS:
+            rec.pop(k, None)
 
     def forget(self, gid):
         """Scrub a remembered item's NAME while keeping the gid remembered.
@@ -974,7 +1181,7 @@ class DecisionStore:
             rec.pop("failed", None)
             rec.pop("failures", None)
             rec.pop("next_attempt", None)
-            for k in PARTIAL_FAIL_KEYS:
+            for k in PARTIAL_FAIL_KEYS + FREE_FAIL_KEYS:
                 rec.pop(k, None)
             # Partial-torrent state pins the drive: an explicit re-pick of a
             # DIFFERENT drive wins, and the copied-files record is dropped
@@ -1007,6 +1214,43 @@ class DecisionStore:
                 rec.pop(k, None)
             self.save()
             return len(new)
+
+    def add_freed_folder(self, gid, folder):
+        """Record a season folder as verified-on-drive, unticked and deleted
+        locally (idempotent), and clear the free_* failure bookkeeping.
+        Returns True when newly recorded."""
+        with self._lock:
+            rec = self.data.get(gid)
+            if rec is None:
+                return False
+            have = rec.setdefault("freed_folders", [])
+            new = folder not in have
+            if new:
+                have.append(folder)
+            for k in FREE_FAIL_KEYS:
+                rec.pop(k, None)
+            self.save()
+            return new
+
+    def record_free_failure(self, gid, now, max_attempts, base, cap):
+        """Failure bookkeeping for a folder-level action (free / advance /
+        done), kept in free_* keys so it never gates the COPY (partial_*) or
+        spends the final move's attempts (failures). Same backoff shape as
+        record_failure. Returns the count."""
+        with self._lock:
+            rec = self.data.get(gid)
+            if rec is None:
+                return 0
+            n = rec.get("free_failures", 0) + 1
+            rec["free_failures"] = n
+            if n >= max_attempts:
+                rec["free_failed"] = True
+                rec["free_next_attempt"] = 0
+            else:
+                rec["free_next_attempt"] = now + min(
+                    base * (2 ** (n - 1)), cap)
+            self.save()
+            return n
 
     def record_partial_failure(self, gid, now, max_attempts, base, cap,
                                quota=False):
@@ -1162,7 +1406,9 @@ class Poller:
 
     def __init__(self, client, store, ask_cb, upload_cb,
                  notify_cb=None, is_paused_cb=None, now_fn=None,
-                 ask_existing_cb=None, partial_upload_cb=None):
+                 ask_existing_cb=None, partial_upload_cb=None,
+                 partial_cfg=None, verify_cb=None, disk_usage_cb=None,
+                 spawn_cb=None):
         self.client = client
         self.store = store
         self.ask_cb = ask_cb
@@ -1175,6 +1421,22 @@ class Poller:
         # upload a partial selection at all: skipped, never moved.
         self.partial_upload_cb = partial_upload_cb
         self._partial_no_cb = set()
+        # Folder-level logic (free after upload / auto-advance / done). OFF
+        # unless a cfg is passed (the app passes read_partial_config(), whose
+        # defaults are ON), so a bare Poller can never delete files or spawn
+        # rclone by accident.
+        # verify_cb(local, drive, subpath, excludes) -> (ok, detail);
+        # spawn_cb(fn) runs fn off the poll thread (tests run it inline).
+        self.partial_cfg = {"partial_free_after_upload": False,
+                            "partial_auto_advance": False,
+                            "partial_free_margin_gb":
+                            DEFAULT_PARTIAL_CFG["partial_free_margin_gb"]}
+        self.partial_cfg.update(partial_cfg or {})
+        self.verify_cb = verify_cb or verify_on_drive
+        self.disk_usage_cb = disk_usage_cb or shutil.disk_usage
+        self._spawn = spawn_cb or (lambda fn: threading.Thread(
+            target=fn, daemon=True).start())
+        self._space_notified = set()
         self.notify_cb = notify_cb or (lambda *a: None)
         self.is_paused_cb = is_paused_cb or (lambda: False)
         # Injectable clock so the failed-upload backoff is testable without
@@ -1188,6 +1450,9 @@ class Poller:
         # re-asked on the next one.
         self._snoozed = set()
         # gids currently mid-upload, so a fast poll doesn't dispatch twice.
+        # Also the ONE in-flight guard for partial torrents: a COPY, a folder
+        # free, an advance and the completion cleanup all add their gid here
+        # first and drop it last, so they can never overlap for one gid.
         # A decision is only marked handled once its upload succeeds (see
         # upload_done); until then this set — not the persisted handled flag —
         # is what prevents re-dispatch, so a failed/crashed upload is retried.
@@ -1242,12 +1507,18 @@ class Poller:
             # downloading/seeding. It also owns the "complete" case: (c)'s
             # stop + move + remove would destroy the rest of the torrent.
             rec = self.store.get(gid)
+            # A torrent that has freed folders stays partial-managed even if
+            # every remaining file is ticked: its whole-dir move would try to
+            # move a tree with missing folders.
             partial_drive_bound = bool(
-                rec and is_partial_selection(dl)
+                rec and (is_partial_selection(dl)
+                         or (dl.get("engine") == "transmission"
+                             and rec.get("freed_folders")))
                 and not rec.get("handled")
                 and str(rec.get("choice", "")).startswith("drive:"))
             if partial_drive_bound and status in ("complete", "active"):
                 self._poll_partial(dl, gid, name, rec)
+                self._poll_folders(dl, gid, name, rec)
 
             # (c) completed downloads bound for a drive -> upload once
             if status == "complete" and not partial_drive_bound:
@@ -1258,7 +1529,8 @@ class Poller:
                 # upload from re-dispatching rclone and spamming notifications
                 # every POLL_SECONDS tick.
                 if (rec and not rec.get("handled")
-                        and not rec.get("failed")
+                        and not rec.get("freed_folders")   # never move a
+                        and not rec.get("failed")          # gutted tree
                         and gid not in self._uploading
                         and rec.get("next_attempt", 0) <= self._now()):
                     choice = rec.get("choice", "local")
@@ -1340,6 +1612,225 @@ class Poller:
         except Exception as e:
             self._uploading.discard(gid)
             log("PARTIAL dispatch error gid=%s: %s" % (gid, e))
+
+    # ---- folder-level logic (free after upload / auto-advance / done) ----
+    def _poll_folders(self, dl, gid, name, rec):
+        """One folder-level action per tick, gated so it never overlaps a COPY
+        or another folder action for the same gid (all share _uploading) and
+        never runs on the poll thread beyond cheap stat/disk_usage checks: the
+        rclone check / RPC / rmtree work is handed to spawn_cb. Order: free a
+        fully-uploaded folder, else finish the whole torrent, else advance."""
+        cfg = self.partial_cfg
+        if not (cfg["partial_free_after_upload"]
+                or cfg["partial_auto_advance"]):
+            return
+        if (gid in self._uploading or rec.get("free_failed")
+                or rec.get("free_next_attempt", 0) > self._now()):
+            return
+        path = resolve_local_path(dl)
+        if not path:
+            return
+        uploaded = set(rec.get("uploaded_files") or [])
+        drive = rec.get("partial_drive") or rec["choice"][len("drive:"):]
+        if cfg["partial_free_after_upload"]:
+            if self._poll_free(dl, gid, name, rec, path, uploaded, drive):
+                return
+            if self._poll_done(dl, gid, name, path, uploaded, drive):
+                return
+        if cfg["partial_auto_advance"]:
+            self._poll_advance(dl, gid, name, rec, path, uploaded)
+
+    def _dispatch_folder_task(self, gid, name, work):
+        """Run work() -> None|error-string off-thread, with the in-flight
+        guard held from here until the store reflects the outcome."""
+        self._uploading.add(gid)
+
+        def run():
+            try:
+                try:
+                    err = work()
+                except Exception as e:
+                    err = "%s: %s" % (type(e).__name__, e)
+                if err:
+                    n = self.store.record_free_failure(
+                        gid, self._now(), UPLOAD_MAX_ATTEMPTS,
+                        UPLOAD_BACKOFF_BASE, UPLOAD_BACKOFF_CAP)
+                    rec = self.store.get(gid) or {}
+                    log("FOLDER FAILED gid=%s %r (attempt %d)%s: %s" %
+                        (gid, name, n,
+                         " -> terminal until restart"
+                         if rec.get("free_failed") else "", err))
+                    if n == 1 or rec.get("free_failed"):
+                        self.notify_cb(
+                            "Season cleanup failed", name,
+                            "%s — nothing deleted; see app.log" % err)
+            finally:
+                self._uploading.discard(gid)
+        self._spawn(run)
+
+    def _poll_free(self, dl, gid, name, rec, path, uploaded, drive):
+        """Free the first season folder whose files are ALL selected and ALL
+        on the drive. A folder that is already gone, fully unwanted and fully
+        uploaded is just recorded. Returns True when a task was dispatched."""
+        freed = set(rec.get("freed_folders") or [])
+        folders = partial_folders(dl, path)
+        for folder in sorted(folders, key=folder_order_key):
+            ents = folders[folder]
+            if not all(rel in uploaded for _i, rel, _f in ents):
+                continue
+            sel = [_file_selected(f) for _i, _r, f in ents]
+            fpath = os.path.join(path, folder)
+            if not any(sel):
+                if folder not in freed and not os.path.lexists(fpath):
+                    self.store.add_freed_folder(gid, folder)
+                    log("FREE gid=%s %s already absent + uploaded + unticked "
+                        "-> recorded" % (gid, folder))
+                continue
+            if not all(sel) or not os.path.isdir(fpath):
+                continue
+            size = sum(int(f.get("length") or 0) for _i, _r, f in ents)
+            log("FREE start gid=%s %s (%d files, %s)" %
+                (gid, folder, len(ents), human_size(size)))
+            self._dispatch_folder_task(
+                gid, name, lambda folder=folder, ents=ents, size=size:
+                self._free_work(gid, name, path, folder, ents, size, drive))
+            return True
+        return False
+
+    def _free_work(self, gid, name, path, folder, ents, size, drive):
+        """verify on drive -> untick -> confirm -> delete. Returns None on
+        success, else the reason nothing was deleted. The order is
+        load-bearing: Transmission errors and stops the whole torrent if
+        SELECTED files vanish, so the untick must land before the delete."""
+        fpath = os.path.join(path, folder)
+        if not safe_child_dir(fpath, path):
+            return "refusing %r: not a plain direct child dir" % folder
+        ok, detail = self.verify_cb(
+            fpath, drive, "%s/%s" % (os.path.basename(path), folder), ())
+        if not ok:
+            return "verify failed for %r: %s" % (folder, detail)
+        idx = [i for i, _r, _f in ents]
+        eng = self.client.for_gid(gid)
+        eng.set_files_wanted(gid, idx, False)
+        wanted = eng.get_files_wanted(gid)
+        if len(wanted) <= max(idx) or any(wanted[i] for i in idx):
+            return "untick of %r not confirmed by the engine" % folder
+        if not safe_child_dir(fpath, path):   # re-check right before delete
+            return "refusing %r: path changed" % folder
+        shutil.rmtree(fpath)
+        self.store.add_freed_folder(gid, folder)
+        log("FREE gid=%s %s (%d files, %s) verified+unticked+deleted" %
+            (gid, folder, len(ents), human_size(size)))
+        self.notify_cb("Season freed", name,
+                       "%s (%s) is on %s — deleted locally" %
+                       (folder, human_size(size), drive))
+        return None
+
+    def _poll_done(self, dl, gid, name, path, uploaded, drive):
+        """Every file of the torrent is on the drive (all folders freed or
+        uploaded): verify what is left, drop the torrent WITHOUT its data,
+        delete the local root, mark handled. Returns True when dispatched."""
+        files = dl.get("files") or []
+        rels = [os.path.relpath(f["path"], path) for f in files
+                if f.get("path")]
+        if not rels or not all(r in uploaded for r in rels):
+            return False
+        log("DONE start gid=%s %r (%d files all on %s)" %
+            (gid, name, len(rels), drive))
+        self._dispatch_folder_task(
+            gid, name,
+            lambda: self._done_work(gid, name, dl.get("dir") or "", path,
+                                    uploaded, drive))
+        return True
+
+    def _done_work(self, gid, name, dl_dir, path, uploaded, drive):
+        exists = os.path.lexists(path)
+        if exists:
+            if not safe_child_dir(path, dl_dir):
+                return "refusing torrent root: not a plain direct child dir"
+            left = tree_leftovers(path, uploaded)
+            if left:
+                return ("%d local files not on the drive (e.g. %r)" %
+                        (len(left), left[0]))
+            ok, detail = self.verify_cb(path, drive, os.path.basename(path),
+                                        ("*.part",))
+            if not ok:
+                return "verify failed for the torrent root: %s" % detail
+        self.client.for_gid(gid).remove_torrent(gid)   # keeps the data
+        try:
+            still = any(d.get("gid") == gid for d in self.client.tell_all())
+        except Exception as e:
+            return "cannot confirm the torrent was removed: %s" % e
+        if still:
+            return "torrent still in the engine after remove; kept the data"
+        self.store.mark_handled(gid)
+        if exists:
+            try:
+                if safe_child_dir(path, dl_dir):
+                    shutil.rmtree(path)
+            except OSError as e:
+                log("DONE gid=%s: could not delete %s: %s" % (gid, path, e))
+                self.notify_cb("Torrent finished", name,
+                               "On the drive, but the local folder could not "
+                               "be deleted — remove it by hand")
+                return None
+        log("DONE gid=%s %r (verified, torrent removed, local root deleted)"
+            % (gid, name))
+        self.notify_cb("Torrent finished", name,
+                       "Everything is on %s — local copy removed" % drive)
+        return None
+
+    def _poll_advance(self, dl, gid, name, rec, path, uploaded):
+        """Start the next season folder once the user's current selection is
+        finished and on the drive. Never unticks or changes anything the user
+        selected; only ticks a folder with zero selected files."""
+        files = dl.get("files") or []
+        if any(_file_selected(f) and not _file_complete(f) for f in files):
+            return
+        if pending_partial_files(dl, path, uploaded):
+            return                       # a COPY is still owed (or failing)
+        freed = set(rec.get("freed_folders") or [])
+        folders = partial_folders(dl, path)
+        pick = None
+        for folder in sorted(folders, key=folder_order_key):
+            ents = folders[folder]
+            if (folder in freed
+                    or any(_file_selected(f) for _i, _r, f in ents)
+                    or any(rel in uploaded for _i, rel, _f in ents)):
+                continue
+            pick = (folder, ents)
+            break
+        if pick is None:
+            return
+        folder, ents = pick
+        size = sum(int(f.get("length") or 0) for _i, _r, f in ents)
+        margin = int(self.partial_cfg["partial_free_margin_gb"] * 1024 ** 3)
+        try:
+            root = path if os.path.isdir(path) else (dl.get("dir") or path)
+            free = self.disk_usage_cb(root).free
+        except OSError as e:
+            log("ADVANCE gid=%s: disk_usage failed: %s" % (gid, e))
+            return
+        if free < size + margin:
+            if (gid, folder) not in self._space_notified:
+                self._space_notified.add((gid, folder))
+                msg = ("Not enough space to start %s (need %s, have %s)" %
+                       (folder, human_size(size + margin), human_size(free)))
+                log("ADVANCE gid=%s: %s" % (gid, msg))
+                self.notify_cb("Next season waiting", name, msg)
+            return
+        idx = [i for i, _r, _f in ents]
+
+        def work():
+            eng = self.client.for_gid(gid)
+            eng.set_files_wanted(gid, idx, True)
+            eng.start_torrent(gid)
+            log("ADVANCE gid=%s -> %s (%d files, %s)" %
+                (gid, folder, len(ents), human_size(size)))
+            self.notify_cb("Next season started", name,
+                           "%s (%s)" % (folder, human_size(size)))
+            return None
+        self._dispatch_folder_task(gid, name, work)
 
     def upload_partial_done(self, gid, success, rels=(), final_drive=None,
                             quota=False):
@@ -2537,6 +3028,7 @@ def _run_app():
                 ask_existing_cb=self._ask_existing,
                 upload_cb=self._start_upload,
                 partial_upload_cb=self._start_partial_upload,
+                partial_cfg=read_partial_config(),
                 notify_cb=self._notify,
                 is_paused_cb=lambda: self.state.paused,
             )
