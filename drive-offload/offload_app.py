@@ -487,15 +487,25 @@ class TransmissionClient:
         files = []
         for i, f in enumerate(t.get("files") or []):
             wanted = stats[i].get("wanted", True) if i < len(stats) else True
-            files.append({"path": os.path.join(d, f.get("name") or ""),
-                          "length": f.get("length") or 0,
-                          "selected": "true" if wanted else "false"})
+            entry = {"path": os.path.join(d, f.get("name") or ""),
+                     "length": f.get("length") or 0,
+                     "selected": "true" if wanted else "false"}
+            # Per-file progress for partial-torrent mode. Left OUT when
+            # Transmission gave none, so an unknown file is never mistaken for
+            # a complete one (see pending_partial_files).
+            done = f.get("bytesCompleted")
+            if done is None and i < len(stats):
+                done = stats[i].get("bytesCompleted")
+            if done is not None:
+                entry["completedLength"] = done
+            files.append(entry)
         try:
             speed = int(t.get("rateDownload") or 0)
         except (TypeError, ValueError):
             speed = 0
         return {
             "gid": TM_PREFIX + (t.get("hashString") or ""),
+            "engine": "transmission",
             "status": _tm_status(t),
             "dir": d,
             "bittorrent": {"info": {"name": t.get("name") or ""}},
@@ -686,6 +696,116 @@ def resolve_local_path(dl):
     return d or None
 
 
+def _file_selected(f):
+    return str(f.get("selected", "true")).lower() != "false"
+
+
+def is_partial_selection(dl):
+    """True for a multi-file download with at least one file NOT selected.
+
+    That is a season-by-season torrent: the user ticks one season's files at a
+    time, so "complete" only means the selection finished, not the torrent. A
+    whole-dir move would stop it, trip todrive on the unselected "<name>.part"
+    files, and (had it worked) delete the still-downloading remainder. Single
+    files and fully-selected torrents are never partial.
+
+    Transmission only: it keeps "<name>.part" for unfinished files, which is
+    what makes a whole-dir move unsafe. aria2/Motrix torrents with deselected
+    extras (samples, nfo) are fully done when "complete" and keep the old
+    whole-dir move path, so they are never partial."""
+    if dl.get("engine") != "transmission":
+        return False
+    files = dl.get("files") or []
+    return len(files) >= 2 and any(not _file_selected(f) for f in files)
+
+
+def _incomplete_marker_for(p):
+    """Case-insensitive probe for an in-progress marker of ONE file: scan
+    the parent dir by name (not os.path.exists, which would miss ".PART"
+    on a case-sensitive FS) for "<basename>+suffix", file OR dir (Safari's
+    .download is a bundle). Returns the marker path, or None -- including
+    when the parent dir itself is gone (no marker can exist there)."""
+    d, base = os.path.split(p)
+    want = {(base + suf).lower() for suf in INCOMPLETE_SUFFIXES}
+    try:
+        names = os.listdir(d or ".")
+    except OSError:
+        return None
+    for n in names:
+        if n.lower() in want:
+            return os.path.join(d, n)
+    return None
+
+
+def pending_partial_files(dl, top, uploaded=()):
+    """Relative paths (from `top`) of a partial download's files that are safe
+    to COPY to the drive now, in engine order.
+
+    A file qualifies only when ALL hold: selected; completedLength == length
+    (a file with no completedLength never qualifies); present on disk under
+    its final name at >= length bytes (Transmission keeps "<name>.part" until
+    a file finishes); no incomplete-marker sibling; not already in `uploaded`.
+    Names rclone's --files-from would mangle (leading "#"/";", edge
+    whitespace) are left for the final whole-dir pass, which handles them."""
+    done = set(uploaded or ())
+    out = []
+    for f in (dl.get("files") or []):
+        p = f.get("path")
+        if not p or not _file_selected(f):
+            continue
+        try:
+            length = int(f.get("length"))
+            got = int(f.get("completedLength"))
+        except (TypeError, ValueError):
+            continue
+        if got != length:
+            continue
+        rel = os.path.relpath(p, top)
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep) or rel in done:
+            continue
+        if rel != rel.strip() or rel[:1] in ("#", ";") or "\n" in rel:
+            continue
+        if os.path.basename(p).lower().endswith(INCOMPLETE_SUFFIXES):
+            continue
+        try:
+            if not os.path.isfile(p) or os.path.getsize(p) < length:
+                continue
+        except OSError:
+            continue
+        if _incomplete_marker_for(p) is not None:
+            continue
+        out.append(rel)
+    return out
+
+
+def parse_routed_drive(output, default):
+    """Drive a todrive run actually landed on: the last "ROUTED: <src> ->
+    <final>" line (printed only when overflow rerouted it), else `default`."""
+    final = default
+    for line in (output or "").splitlines():
+        if line.startswith("ROUTED: "):
+            final = line.rsplit(" -> ", 1)[-1].strip()
+    return final
+
+
+def final_pass_plan(rec, drive, rename_cfg):
+    """(drive, rename_cfg, no_overflow) for the whole-dir MOVE of a torrent.
+
+    Once partial uploads have COPIED files, the final pass must use the same
+    names (no rename hook: renaming would change the dir/episode names, so the
+    move would not dedup against what is already there) and the same drive
+    (pinned with --no-overflow, else overflow routing could pick another).
+    Torrents that never had a partial upload are unchanged."""
+    if rec and rec.get("uploaded_files"):
+        return rec.get("partial_drive") or drive, None, bool(
+            rec.get("partial_drive"))
+    return drive, rename_cfg, False
+
+
+PARTIAL_FAIL_KEYS = ("partial_failed", "partial_failures",
+                     "partial_next_attempt")
+
+
 class DecisionStore:
     """Persists per-gid decisions to decisions.json.
 
@@ -722,6 +842,8 @@ class DecisionStore:
             # state, so load() stays side-effect-free on disk.
             for rec in self.data.values():
                 if isinstance(rec, dict) and not rec.get("handled"):
+                    for k in PARTIAL_FAIL_KEYS:
+                        rec.pop(k, None)
                     rec.pop("failed", None)
                     rec.pop("failures", None)
                     rec.pop("next_attempt", None)
@@ -783,6 +905,9 @@ class DecisionStore:
         rec.pop("failed", None)
         rec.pop("failures", None)
         rec.pop("next_attempt", None)
+        # Relative paths carry content names, like "name" does.
+        rec.pop("uploaded_files", None)
+        rec.pop("partial_drive", None)
 
     def forget(self, gid):
         """Scrub a remembered item's NAME while keeping the gid remembered.
@@ -849,8 +974,60 @@ class DecisionStore:
             rec.pop("failed", None)
             rec.pop("failures", None)
             rec.pop("next_attempt", None)
+            for k in PARTIAL_FAIL_KEYS:
+                rec.pop(k, None)
+            # Partial-torrent state pins the drive: an explicit re-pick of a
+            # DIFFERENT drive wins, and the copied-files record is dropped
+            # with it (they stay behind on the old drive; the next pass
+            # re-uploads everything to the new one). Same drive keeps it.
+            if rec.get("partial_drive") != choice[len("drive:"):]:
+                rec.pop("uploaded_files", None)
+                rec.pop("partial_drive", None)
             self.save()
             return True
+
+    def add_partial_upload(self, gid, rels, drive=None):
+        """Record files COPIED by a partial upload (handled stays False).
+
+        Appends `rels` (deduped, order kept) to uploaded_files, remembers the
+        drive they landed on as partial_drive, and clears failure bookkeeping
+        so an earlier failed attempt doesn't leave the record stuck. One save,
+        called only after rclone reported success. Returns the number of
+        files newly recorded (0 for an unknown gid)."""
+        with self._lock:
+            rec = self.data.get(gid)
+            if rec is None:
+                return 0
+            have = rec.setdefault("uploaded_files", [])
+            new = [r for r in rels if r not in have]
+            have.extend(new)
+            if drive:
+                rec["partial_drive"] = drive
+            for k in PARTIAL_FAIL_KEYS:
+                rec.pop(k, None)
+            self.save()
+            return len(new)
+
+    def record_partial_failure(self, gid, now, max_attempts, base, cap,
+                               quota=False):
+        """Failure bookkeeping for a partial COPY, kept in partial_* keys so
+        it never gates or spends the attempts of the final whole-dir move
+        (which reads failed/failures/next_attempt). Same backoff shape as
+        record_failure; quota goes terminal at once. Returns the count."""
+        with self._lock:
+            rec = self.data.get(gid)
+            if rec is None:
+                return 0
+            n = rec.get("partial_failures", 0) + 1
+            rec["partial_failures"] = n
+            if quota or n >= max_attempts:
+                rec["partial_failed"] = True
+                rec["partial_next_attempt"] = 0
+            else:
+                rec["partial_next_attempt"] = now + min(
+                    base * (2 ** (n - 1)), cap)
+            self.save()
+            return n
 
     def record_failure(self, gid, now, max_attempts, base, cap):
         """Note one failed upload attempt and schedule (or give up on) a retry.
@@ -925,6 +1102,7 @@ def reupload_candidates(store_data):
         if not isinstance(rec, dict) or rec.get("forgotten"):
             continue
         if (rec.get("choice", "") == "local" or rec.get("failed")
+                or rec.get("partial_failed")
                 or (rec.get("failures", 0) > 0 and not rec.get("handled"))):
             out.append((gid, rec.get("name", gid)))
     return sorted(out, key=lambda t: t[1].lower())
@@ -974,6 +1152,8 @@ class Poller:
       - store:       DecisionStore
       - ask_cb(gid, name) -> choice string ("local" or "drive:<Name>")
       - upload_cb(path, drive_name, gid, display_name)  # runs the upload
+      - partial_upload_cb(path, drive_name, gid, display_name, rels, pinned)
+                       # optional: COPIES a partial torrent's finished files
       - notify_cb(title, subtitle, message)             # optional
       - is_paused_cb() -> bool  (auto-keep-local when True)
 
@@ -982,7 +1162,7 @@ class Poller:
 
     def __init__(self, client, store, ask_cb, upload_cb,
                  notify_cb=None, is_paused_cb=None, now_fn=None,
-                 ask_existing_cb=None):
+                 ask_existing_cb=None, partial_upload_cb=None):
         self.client = client
         self.store = store
         self.ask_cb = ask_cb
@@ -991,6 +1171,10 @@ class Poller:
         # without it those fall back to the plain ask_cb, as before.
         self.ask_existing_cb = ask_existing_cb
         self.upload_cb = upload_cb
+        # Partial-torrent mode (season-by-season downloads). None = never
+        # upload a partial selection at all: skipped, never moved.
+        self.partial_upload_cb = partial_upload_cb
+        self._partial_no_cb = set()
         self.notify_cb = notify_cb or (lambda *a: None)
         self.is_paused_cb = is_paused_cb or (lambda: False)
         # Injectable clock so the failed-upload backoff is testable without
@@ -1053,8 +1237,20 @@ class Poller:
                     self._ask_new(gid, name,
                                   already_complete=(status == "complete"))
 
+            # (b2) partial torrent (some files unselected) bound for a drive:
+            # COPY finished files, never move -- the torrent keeps
+            # downloading/seeding. It also owns the "complete" case: (c)'s
+            # stop + move + remove would destroy the rest of the torrent.
+            rec = self.store.get(gid)
+            partial_drive_bound = bool(
+                rec and is_partial_selection(dl)
+                and not rec.get("handled")
+                and str(rec.get("choice", "")).startswith("drive:"))
+            if partial_drive_bound and status in ("complete", "active"):
+                self._poll_partial(dl, gid, name, rec)
+
             # (c) completed downloads bound for a drive -> upload once
-            if status == "complete":
+            if status == "complete" and not partial_drive_bound:
                 rec = self.store.get(gid)
                 # Skip: already handled, in flight, given up on (terminal
                 # failed), or still inside its post-failure backoff window.
@@ -1067,7 +1263,10 @@ class Poller:
                         and rec.get("next_attempt", 0) <= self._now()):
                     choice = rec.get("choice", "local")
                     if choice.startswith("drive:"):
-                        drive = choice[len("drive:"):]
+                        # After partial uploads the drive is pinned to where
+                        # those files went (final_pass_plan's other half).
+                        drive = (rec.get("partial_drive")
+                                 or choice[len("drive:"):])
                         path = resolve_local_path(dl)
                         if path:
                             # On-disk readiness gate: the engine saying
@@ -1107,6 +1306,70 @@ class Poller:
             "recent": self.last_status.get("recent", []),
         }
         return self.last_status
+
+    def _poll_partial(self, dl, gid, name, rec):
+        """Dispatch a COPY of the partial torrent's finished, not-yet-uploaded
+        files. Same gates as (c) -- not failed, not in backoff, not in flight
+        -- but no payload_ready and no engine calls: per-file completeness is
+        checked in pending_partial_files. Nothing pending = do nothing (the
+        record is never marked handled here; only the final whole-dir pass,
+        once every file is selected, consumes it)."""
+        if (rec.get("partial_failed") or gid in self._uploading
+                or rec.get("partial_next_attempt", 0) > self._now()):
+            return
+        if self.partial_upload_cb is None:
+            if gid not in self._partial_no_cb:
+                self._partial_no_cb.add(gid)
+                log("PARTIAL skipped gid=%s %r: no partial uploader wired "
+                    "(leaving it alone, never moving a partial)" % (gid, name))
+            return
+        path = resolve_local_path(dl)
+        if not path or not os.path.isdir(path):
+            return
+        pending = pending_partial_files(dl, path,
+                                        rec.get("uploaded_files") or [])
+        if not pending:
+            return
+        pinned = bool(rec.get("partial_drive"))
+        drive = rec.get("partial_drive") or rec["choice"][len("drive:"):]
+        self._uploading.add(gid)
+        log("PARTIAL dispatch gid=%s %r -> %s (%d files, copy%s)" %
+            (gid, name, drive, len(pending), ", pinned" if pinned else ""))
+        try:
+            self.partial_upload_cb(path, drive, gid, name, pending, pinned)
+        except Exception as e:
+            self._uploading.discard(gid)
+            log("PARTIAL dispatch error gid=%s: %s" % (gid, e))
+
+    def upload_partial_done(self, gid, success, rels=(), final_drive=None,
+                            quota=False):
+        """Outcome of a partial COPY. Success records the files (and the drive
+        they landed on) but never marks the decision handled -- the torrent is
+        still downloading/seeding and the final move pass is still to come.
+        Failure has upload_done's backoff/quota semantics. As there, the store
+        is updated BEFORE the gid leaves _uploading, or a poll would dispatch
+        the same files again."""
+        if success:
+            n = self.store.add_partial_upload(gid, rels, final_drive)
+            rec = self.store.get(gid) or {}
+            log("PARTIAL ok gid=%s: %d files copied (total %d) -> %s" %
+                (gid, n, len(rec.get("uploaded_files") or []), final_drive))
+            self.notify_cb("Partial upload", rec.get("name", gid),
+                           "Uploaded %d files — kept local, still seeding" % n)
+        else:
+            n = self.store.record_partial_failure(
+                gid, self._now(), UPLOAD_MAX_ATTEMPTS,
+                UPLOAD_BACKOFF_BASE, UPLOAD_BACKOFF_CAP, quota=quota)
+            rec = self.store.get(gid) or {}
+            log("PARTIAL failed gid=%s (attempt %d%s)%s" %
+                (gid, n, ", quota" if quota else "",
+                 " -> terminal until restart/re-pick"
+                 if rec.get("partial_failed") else ""))
+            if rec.get("partial_failed") and not quota:
+                self.notify_cb("Partial upload gave up", rec.get("name", gid),
+                               "Failed %d times — will retry on next app "
+                               "restart" % n)
+        self._uploading.discard(gid)
 
     def _ask_new(self, gid, name, already_complete=False):
         """Ask the user where a download should go, then persist.
@@ -1173,7 +1436,13 @@ class Poller:
         again."""
         if success:
             self.store.mark_handled(gid)
-        elif quota:
+        else:
+            self._record_upload_failure(gid, quota)
+        self._uploading.discard(gid)
+
+    def _record_upload_failure(self, gid, quota):
+        """Failure bookkeeping shared by upload_done and upload_partial_done."""
+        if quota:
             self.store.mark_failed(gid)
             log("UPLOAD quota-full gid=%s -> terminal failed immediately "
                 "(won't retry the full drive); re-pick a drive from "
@@ -1195,7 +1464,6 @@ class Poller:
                 self.notify_cb(
                     "Upload gave up", name,
                     "Failed %d times — will retry on next app restart" % n)
-        self._uploading.discard(gid)
 
     def requeue_for_upload(self, gid, choice):
         """Re-arm a kept-local / failed decision for a drive upload.
@@ -1767,22 +2035,7 @@ def payload_ready(dl, path):
     def _selected(f):
         return str(f.get("selected", "true")).lower() != "false"
 
-    def _marker_for(p):
-        # Case-insensitive probe for an in-progress marker of ONE file: scan
-        # the parent dir by name (not os.path.exists, which would miss ".PART"
-        # on a case-sensitive FS) for "<basename>+suffix", file OR dir (Safari's
-        # .download is a bundle). Returns the marker path, or None -- including
-        # when the parent dir itself is gone (no marker can exist there).
-        d, base = os.path.split(p)
-        want = {(base + suf).lower() for suf in INCOMPLETE_SUFFIXES}
-        try:
-            names = os.listdir(d or ".")
-        except OSError:
-            return None
-        for n in names:
-            if n.lower() in want:
-                return os.path.join(d, n)
-        return None
+    _marker_for = _incomplete_marker_for
 
     # (1) every selected file must be on disk under its final name, OR be
     # verifiably absent. Absent + a marker for it = the rename race (BLOCK);
@@ -1903,7 +2156,8 @@ _PROGRESS_NOISE_RE = re.compile(
 
 
 def run_todrive_up(path, drive_name, bwlimit="", cwd=SCRIPT_DIR,
-                   progress_cb=None):
+                   progress_cb=None, keep=False, files_from=None,
+                   no_overflow=False):
     """Run `todrive up <path> <drive_name>`, honoring an RCLONE_BWLIMIT env.
 
     Streams the child's output as it runs: each rclone `-P` stats line is
@@ -1925,6 +2179,13 @@ def run_todrive_up(path, drive_name, bwlimit="", cwd=SCRIPT_DIR,
     # base_remote (frozen, todrive's SCRIPT_DIR ships no config.json).
     env["TODRIVE_CONFIG"] = CONFIG_FILE
     cmd = [sys.executable, "-u", TODRIVE, "up", path, drive_name]
+    # Partial-torrent mode: copy only the listed files / pin the drive.
+    if keep:
+        cmd.append("--keep")
+    if files_from:
+        cmd += ["--files-from", files_from]
+    if no_overflow:
+        cmd.append("--no-overflow")
     # errors="replace": a stray non-UTF-8 byte in a filename must not blow
     # up the read loop mid-upload.
     proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE,
@@ -2105,7 +2366,7 @@ def _apply_rename_hook(path, gid, name, drive, rename_cfg, cache, confirm_cb,
 def perform_upload(client, path, drive, gid, bwlimit="",
                    todrive_up=run_todrive_up, progress_cb=None,
                    name=None, rename_cfg=None, cache=None, confirm_cb=None,
-                   support_dir=SUPPORT_DIR):
+                   support_dir=SUPPORT_DIR, no_overflow=False):
     """Offload one completed download, with the owning engine's lifecycle
     wrapped around the upload. Returns (returncode, combined_output).
 
@@ -2132,8 +2393,10 @@ def perform_upload(client, path, drive, gid, bwlimit="",
     hook = _apply_rename_hook(path, gid, name, drive, rename_cfg, cache,
                               confirm_cb, support_dir=support_dir)
 
+    # Only passed when set, so a plain upload calls todrive_up exactly as before.
+    extra = {"no_overflow": True} if no_overflow else {}
     rc, output = todrive_up(hook["upload_path"], drive, bwlimit,
-                            progress_cb=progress_cb)
+                            progress_cb=progress_cb, **extra)
 
     if rc == 0:
         if eng is not None:
@@ -2154,6 +2417,33 @@ def perform_upload(client, path, drive, gid, bwlimit="",
             log("ENGINE resume after failed upload gid=%s" % gid)
             eng.start_torrent(gid)
     return rc, output
+
+
+def perform_partial_upload(path, drive, rels, bwlimit="",
+                           todrive_up=run_todrive_up, progress_cb=None,
+                           pinned=False):
+    """COPY the listed files (relative to the torrent dir `path`) to the drive.
+    Returns (returncode, combined_output).
+
+    Deliberately NOT perform_upload: no engine stop/remove/resume, no rename
+    hook, nothing deleted locally -- the torrent keeps downloading and seeding.
+    The files land at <drive>/<dirname>/<rel>, where the final whole-dir move
+    would put them, so that move dedups them. `pinned` (the drive is already
+    known from an earlier batch) adds --no-overflow so every batch and the
+    final pass share one drive."""
+    import tempfile
+    fd, list_path = tempfile.mkstemp(prefix="partial-files-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(rels) + "\n")
+        extra = {"no_overflow": True} if pinned else {}
+        return todrive_up(path, drive, bwlimit, progress_cb=progress_cb,
+                          keep=True, files_from=list_path, **extra)
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
 
 
 # ==========================================================================
@@ -2246,6 +2536,7 @@ def _run_app():
                 ask_cb=self._ask_destination,
                 ask_existing_cb=self._ask_existing,
                 upload_cb=self._start_upload,
+                partial_upload_cb=self._start_partial_upload,
                 notify_cb=self._notify,
                 is_paused_cb=lambda: self.state.paused,
             )
@@ -2734,11 +3025,15 @@ def _run_app():
             quota = False
             try:
                 size_before = tree_size(path)
+                # After partial (copy) uploads: same names, same drive.
+                drive, rename_cfg, pin = final_pass_plan(
+                    self.poller.store.get(gid), drive, self.rename_cfg)
                 rc, output = perform_upload(
                     self.client, path, drive, gid, self.state.bwlimit,
                     progress_cb=lambda p: self._set_upload_progress(gid, p),
-                    name=display_name, rename_cfg=self.rename_cfg,
-                    cache=self.rename_cache, confirm_cb=confirm_new_show)
+                    name=display_name, rename_cfg=rename_cfg,
+                    cache=self.rename_cache, confirm_cb=confirm_new_show,
+                    no_overflow=pin)
                 for line in output.splitlines():
                     log("  todrive: %s" % line)
                 if rc == 0:
@@ -2818,6 +3113,58 @@ def _run_app():
                 # run) so the user isn't left hunting the menu; the store
                 # already reflects the failure by now. quota=True excludes the
                 # full drive.
+                if not success:
+                    self._offer_repick(gid, display_name, drive, quota)
+
+        def _start_partial_upload(self, path, drive, gid, display_name, rels,
+                                  pinned):
+            with self._lock:
+                self.uploads[gid] = {"name": display_name, "drive": drive,
+                                     "pct": None, "speed": "", "eta": ""}
+            log("PARTIAL start gid=%s %r -> %s (%d files)" %
+                (gid, display_name, drive, len(rels)))
+            threading.Thread(target=self._partial_upload_worker,
+                             args=(path, drive, gid, display_name, rels,
+                                   pinned), daemon=True).start()
+
+        def _partial_upload_worker(self, path, drive, gid, display_name, rels,
+                                   pinned):
+            """Thin UI wrapper: the logic is perform_partial_upload and
+            Poller.upload_partial_done. Never touches the engine or the
+            decision's choice."""
+            success = False
+            quota = False
+            final_drive = drive
+            try:
+                rc, output = perform_partial_upload(
+                    path, drive, rels, self.state.bwlimit,
+                    progress_cb=lambda p: self._set_upload_progress(gid, p),
+                    pinned=pinned)
+                for line in output.splitlines():
+                    log("  todrive: %s" % line)
+                if rc == 0:
+                    success = True
+                    final_drive = parse_routed_drive(output, drive)
+                    self._push_recent("📤 %s: %d files → %s" %
+                                      (display_name, len(rels), final_drive))
+                else:
+                    quota = is_quota_failure(output)
+                    self._notify("Partial upload failed", display_name,
+                                 "'%s' is out of space" % drive if quota
+                                 else "rc=%d — see app.log" % rc)
+                    log("PARTIAL FAILED rc=%d gid=%s %r" %
+                        (rc, gid, display_name))
+                    self._push_recent("❌ %s (partial failed)" % display_name)
+            except Exception as e:
+                self._notify("Partial upload failed", display_name,
+                             "%s — see app.log" % e)
+                log("PARTIAL exception gid=%s: %s" % (gid, e))
+            finally:
+                self.poller.upload_partial_done(
+                    gid, success, rels, final_drive, quota=quota)
+                with self._lock:
+                    self.uploads.pop(gid, None)
+                self._usage_wake.set()
                 if not success:
                     self._offer_repick(gid, display_name, drive, quota)
 

@@ -3161,5 +3161,616 @@ class TestFormatStorageTable(unittest.TestCase):
         self.assertTrue(rows[0].startswith("A"))
 
 
+# --- partial-torrent mode (season-by-season downloads) ----------------------
+#
+# A multi-season torrent where the user ticks one season at a time: the
+# selected files finish and the torrent reads "complete" although other files
+# are wanted=false. Those must be COPIED to the drive as they finish (never
+# moved, torrent untouched); only the final all-selected pass moves.
+
+class PartialFakeClient:
+    """Minimal Transmission-shaped client: tell_all returns adapted torrents."""
+    def __init__(self, engine):
+        self.dls = []
+        self.engine = engine
+
+    def is_up(self):
+        return True
+
+    def tell_all(self):
+        return list(self.dls)
+
+    def for_gid(self, gid):
+        return self.engine
+
+
+_PT_FILES = ["S1/e1.mkv", "S1/e2.mkv", "S2/e1.mkv", "S2/e2.mkv",
+             "S3/e1.mkv", "S3/e2.mkv"]
+_PT_TOP = "Show (2007)"
+
+
+class PartialBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._old_log = app.LOG_FILE
+        app.LOG_FILE = os.path.join(self.tmp, "app.log")
+        self.addCleanup(setattr, app, "LOG_FILE", self._old_log)
+        self.dpath = os.path.join(self.tmp, "decisions.json")
+        self.store = app.DecisionStore(self.dpath)
+        self.calls = []
+        self.client = PartialFakeClient(RecordingEngine(self.calls))
+        self.now = [1000.0]
+        self.moves = []      # 4-arg whole-dir upload_cb dispatches
+        self.partials = []   # partial_upload_cb dispatches
+        self.notes = []
+        self.poller = self._poller()
+        self.store.record("tm-pt1", _PT_TOP, "drive:Films")
+
+    def _poller(self, store=None, with_partial_cb=True):
+        return app.Poller(
+            self.client, store or self.store,
+            ask_cb=lambda g, n: "local",
+            upload_cb=lambda *a: self.moves.append(a),
+            notify_cb=lambda *a: self.notes.append(a),
+            now_fn=lambda: self.now[0],
+            partial_upload_cb=((lambda *a: self.partials.append(a))
+                               if with_partial_cb else None))
+
+    def top(self):
+        return os.path.join(self.tmp, _PT_TOP)
+
+    def write(self, rel, size=10, part=False):
+        p = os.path.join(self.top(), rel + (".part" if part else ""))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(b"x" * size)
+        return p
+
+    def torrent(self, wanted, done, status=4, left=None):
+        """wanted/done: sets of files. Done files also get real bytes on disk;
+        a wanted-but-unfinished file only gets a '.part' (Transmission style)."""
+        files, stats = [], []
+        for rel in _PT_FILES:
+            files.append({"name": "%s/%s" % (_PT_TOP, rel), "length": 10,
+                          "bytesCompleted": 10 if rel in done else 3})
+            stats.append({"wanted": rel in wanted})
+        if left is None:
+            left = 10 * len([r for r in wanted if r not in done])
+        return _torrent(hashString="pt1", name=_PT_TOP, status=status,
+                        downloadDir=self.tmp, files=files, fileStats=stats,
+                        totalSize=60, sizeWhenDone=10 * len(wanted),
+                        leftUntilDone=left,
+                        percentDone=1.0 if left == 0 else 0.5)
+
+    def set_state(self, wanted, done, **kw):
+        for rel in _PT_FILES:
+            if rel in done:
+                self.write(rel)
+                try:
+                    os.remove(os.path.join(self.top(), rel + ".part"))
+                except OSError:
+                    pass
+            elif rel in wanted:
+                self.write(rel, size=3, part=True)
+        self.client.dls = [app.TransmissionClient._adapt(
+            self.torrent(set(wanted), set(done), **kw))]
+
+    def finish_partial(self, success=True, quota=False):
+        """Play the worker: report the last dispatched batch's outcome."""
+        _path, drive, gid, _name, rels, _pinned = self.partials[-1]
+        final = app.parse_routed_drive("", drive)
+        self.poller.upload_partial_done(gid, success, rels, final, quota=quota)
+
+
+S1 = {"S1/e1.mkv", "S1/e2.mkv"}
+S2 = {"S2/e1.mkv", "S2/e2.mkv"}
+S3 = {"S3/e1.mkv", "S3/e2.mkv"}
+
+
+class TestPartialDetection(unittest.TestCase):
+    def test_is_partial_selection(self):
+        f = lambda sel: {"path": "/x", "selected": sel}  # noqa: E731
+        tm = lambda *fs: {"engine": "transmission", "files": list(fs)}  # noqa: E731
+        self.assertTrue(app.is_partial_selection(tm(f("true"), f("false"))))
+        self.assertFalse(app.is_partial_selection(tm(f("true"), f("true"))))
+        self.assertFalse(app.is_partial_selection(tm(f("false"))))
+        self.assertFalse(app.is_partial_selection(tm(f("true"))))
+        self.assertFalse(app.is_partial_selection({}))
+
+    def test_aria2_shape_is_never_partial(self):
+        # aria2/Motrix: deselected extras are normal; whole-dir move applies.
+        f = lambda sel: {"path": "/x", "selected": sel}  # noqa: E731
+        self.assertFalse(app.is_partial_selection(
+            {"files": [f("true"), f("false")]}))
+
+    def test_adapt_tags_engine(self):
+        self.assertEqual(app.TransmissionClient._adapt(_torrent())["engine"],
+                         "transmission")
+
+    def test_adapt_carries_per_file_completed_length(self):
+        dl = app.TransmissionClient._adapt(_torrent(
+            files=[{"name": "a/x", "length": 9, "bytesCompleted": 4},
+                   {"name": "a/y", "length": 9}],
+            fileStats=[{"wanted": True}, {"wanted": True, "bytesCompleted": 9}]))
+        self.assertEqual(dl["files"][0]["completedLength"], 4)
+        self.assertEqual(dl["files"][1]["completedLength"], 9)  # fileStats
+        dl = app.TransmissionClient._adapt(_torrent())
+        self.assertNotIn("completedLength", dl["files"][0])  # unknown != done
+
+
+class TestPendingPartialFiles(PartialBase):
+    def _pending(self, wanted, done, uploaded=()):
+        self.set_state(wanted, done)
+        dl = self.client.dls[0]
+        return app.pending_partial_files(dl, self.top(), uploaded)
+
+    def test_only_selected_complete_files(self):
+        self.assertEqual(self._pending(S1 | S3, S1),
+                         ["S1/e1.mkv", "S1/e2.mkv"])
+
+    def test_part_sibling_excludes_file(self):
+        self.set_state(S1, S1)
+        self.write("S1/e2.mkv", part=True)   # marker next to a "complete" file
+        dl = self.client.dls[0]
+        self.assertEqual(app.pending_partial_files(dl, self.top()),
+                         ["S1/e1.mkv"])
+
+    def test_incomplete_bytes_exclude_file(self):
+        self.set_state(S1, S1)
+        dl = self.client.dls[0]
+        dl["files"][1]["completedLength"] = 5     # engine says 5 of 10
+        self.assertEqual(app.pending_partial_files(dl, self.top()),
+                         ["S1/e1.mkv"])
+
+    def test_unknown_progress_or_missing_file_excluded(self):
+        self.set_state(S1, S1)
+        dl = self.client.dls[0]
+        del dl["files"][0]["completedLength"]
+        os.remove(os.path.join(self.top(), "S1/e2.mkv"))
+        self.assertEqual(app.pending_partial_files(dl, self.top()), [])
+
+    def test_truncated_file_on_disk_excluded(self):
+        self.set_state(S1, S1)
+        self.write("S1/e2.mkv", size=4)   # engine says 10/10, disk has 4
+        self.assertEqual(app.pending_partial_files(
+            self.client.dls[0], self.top()), ["S1/e1.mkv"])
+
+    def test_rclone_mangled_names_deferred(self):
+        # names --files-from would mangle are left to the final pass
+        for name in ("#x.mkv", ";x.mkv", " x.mkv"):
+            dl = {"files": [
+                {"path": os.path.join(self.top(), name), "length": 10,
+                 "completedLength": 10, "selected": "true"},
+                {"path": os.path.join(self.top(), "ok.mkv"), "length": 10,
+                 "completedLength": 10, "selected": "true"}]}
+            self.write(name)
+            self.write("ok.mkv")
+            self.assertEqual(app.pending_partial_files(dl, self.top()),
+                             ["ok.mkv"], name)
+
+    def test_file_named_like_incomplete_marker_excluded(self):
+        for name in ("x.mkv.part", "x.mkv.!qB"):
+            dl = {"files": [
+                {"path": os.path.join(self.top(), name), "length": 10,
+                 "completedLength": 10, "selected": "true"},
+                {"path": os.path.join(self.top(), "ok.mkv"), "length": 10,
+                 "completedLength": 10, "selected": "true"}]}
+            self.write(name)
+            self.write("ok.mkv")
+            self.assertEqual(app.pending_partial_files(dl, self.top()),
+                             ["ok.mkv"], name)
+
+    def test_dotdot_prefixed_name_is_not_an_escape(self):
+        dl = {"files": [
+            {"path": os.path.join(self.top(), "..hidden.mkv"), "length": 10,
+             "completedLength": 10, "selected": "true"}]}
+        self.write("..hidden.mkv")
+        self.assertEqual(app.pending_partial_files(dl, self.top()),
+                         ["..hidden.mkv"])
+        dl["files"][0]["path"] = os.path.join(self.tmp, "elsewhere.mkv")
+        self.assertEqual(app.pending_partial_files(dl, self.top()), [])
+
+    def test_already_uploaded_excluded(self):
+        self.assertEqual(self._pending(S1 | S2, S1 | S2, uploaded=S1),
+                         ["S2/e1.mkv", "S2/e2.mkv"])
+
+
+class TestPartialPoll(PartialBase):
+    def test_s1_done_while_s3_downloading_copies_only_s1(self):
+        # S1 finished, S3 still downloading (status active), S2 unselected.
+        self.set_state(S1 | S3, S1, status=4)
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 1)
+        path, drive, gid, _name, rels, pinned = self.partials[0]
+        self.assertEqual(path, self.top())
+        self.assertEqual((drive, gid, pinned), ("Films", "tm-pt1", False))
+        self.assertEqual(sorted(rels), ["S1/e1.mkv", "S1/e2.mkv"])
+        # copy, never move: no whole-dir dispatch, no engine stop/remove
+        self.assertEqual(self.moves, [])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.store.get("tm-pt1")["handled"])
+
+    def test_complete_status_also_copies_not_moves(self):
+        # The reported bug: selection finished -> "complete" -> whole-dir move.
+        self.set_state(S1, S1, status=6, left=0)
+        self.assertEqual(self.client.dls[0]["status"], "complete")
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 1)
+        self.assertEqual(self.moves, [])
+        self.assertEqual(self.calls, [])
+
+    def test_in_flight_then_done_does_not_reupload(self):
+        self.set_state(S1 | S3, S1)
+        self.poller.poll_once()
+        self.poller.poll_once()               # still mid-upload
+        self.assertEqual(len(self.partials), 1)
+        self.finish_partial()
+        self.assertEqual(sorted(self.store.get("tm-pt1")["uploaded_files"]),
+                         ["S1/e1.mkv", "S1/e2.mkv"])
+        self.assertEqual(self.store.get("tm-pt1")["partial_drive"], "Films")
+        self.poller.poll_once()
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 1)   # nothing new -> nothing
+        self.assertFalse(self.store.get("tm-pt1")["handled"])
+        self.assertEqual([n[0] for n in self.notes], ["Partial upload"])
+        self.assertIn("kept local", self.notes[0][2])
+
+    def test_second_season_uploads_only_season_two(self):
+        self.set_state(S1 | S3, S1)
+        self.poller.poll_once()
+        self.finish_partial()
+        # user now selects S2 (S3 deselected); S2 finishes
+        self.set_state(S1 | S2, S1 | S2, status=6, left=0)
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 2)
+        rels, pinned = self.partials[1][4], self.partials[1][5]
+        self.assertEqual(sorted(rels), ["S2/e1.mkv", "S2/e2.mkv"])
+        self.assertTrue(pinned)               # drive pinned after batch 1
+        self.finish_partial()
+        self.assertEqual(len(self.store.get("tm-pt1")["uploaded_files"]), 4)
+        self.assertEqual(self.moves, [])
+        self.assertEqual(self.calls, [])
+
+    def test_later_batches_target_the_drive_batch_one_landed_on(self):
+        self.set_state(S1 | S3, S1)
+        self.poller.poll_once()
+        _p, _d, gid, _n, rels, _pin = self.partials[0]
+        self.poller.upload_partial_done(gid, True, rels, "Films 2")  # routed
+        self.set_state(S1 | S2, S1 | S2)
+        self.poller.poll_once()
+        self.assertEqual(self.partials[1][1], "Films 2")   # not the choice
+        self.assertTrue(self.partials[1][5])                # pinned
+
+    def test_nothing_pending_does_nothing_and_not_handled(self):
+        self.set_state(S1, set(), status=4)      # nothing finished yet
+        self.poller.poll_once()
+        self.assertEqual(self.partials, [])
+        self.assertFalse(self.store.get("tm-pt1")["handled"])
+        self.assertEqual(self.poller._uploading, set())
+
+    def test_verifying_torrent_never_uploads(self):
+        self.set_state(S1, S1, status=2)          # verifying -> "waiting"
+        self.poller.poll_once()
+        self.assertEqual(self.partials, [])
+        self.assertEqual(self.moves, [])
+
+    def test_local_choice_and_no_callback_never_move(self):
+        self.set_state(S1, S1, status=6, left=0)
+        p2 = self._poller(with_partial_cb=False)
+        p2.poll_once()
+        self.assertEqual((self.moves, self.partials), ([], []))
+        self.assertFalse(self.store.get("tm-pt1")["handled"])
+
+    def test_partial_uploader_error_releases_guard(self):
+        self.set_state(S1, S1)
+        def boom(*a):
+            raise RuntimeError("x")
+        self.poller.partial_upload_cb = boom
+        self.poller.poll_once()
+        self.assertEqual(self.poller._uploading, set())
+
+    def test_final_pass_all_selected_moves_same_drive_no_rename(self):
+        # batch 1 lands on an overflow drive
+        self.set_state(S1 | S3, S1)
+        self.poller.poll_once()
+        _p, _d, gid, _n, rels, _pin = self.partials[0]
+        self.poller.upload_partial_done(gid, True, rels, "Films 2")
+        self.assertEqual(self.store.get(gid)["partial_drive"], "Films 2")
+        # everything selected and complete -> not partial anymore
+        everything = set(_PT_FILES)
+        self.set_state(everything, everything, status=6, left=0)
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 1)     # no more copies
+        self.assertEqual(len(self.moves), 1)        # the existing move path
+        path, drive, mgid, _name = self.moves[0]
+        self.assertEqual((path, mgid), (self.top(), gid))
+        self.assertEqual(drive, "Films 2")          # pinned to the copy drive
+        # worker-side plan: skip the rename hook, pin the drive
+        rename_cfg = {"enabled": True, "dry_run": False}
+        plan = app.final_pass_plan(self.store.get(gid), drive, rename_cfg)
+        self.assertEqual(plan, ("Films 2", None, True))
+        # ...and perform_upload really does the whole-dir move with the pin
+        seen = {}
+
+        def fake_up(p, d, bw, progress_cb=None, **kw):
+            seen.update(path=p, drive=d, kw=kw)
+            return 0, ""
+        rc, _ = app.perform_upload(
+            self.client, path, plan[0], gid, todrive_up=fake_up,
+            rename_cfg=plan[1], cache=None, no_overflow=plan[2])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["path"], self.top())   # as-is, not renamed
+        self.assertEqual(seen["kw"], {"no_overflow": True})
+        self.assertEqual(self.calls, [("stop", gid), ("remove", gid)])
+
+    def test_final_plan_unchanged_without_partial_uploads(self):
+        cfg = {"enabled": True}
+        self.assertEqual(app.final_pass_plan({"choice": "drive:A"}, "A", cfg),
+                         ("A", cfg, False))
+        self.assertEqual(app.final_pass_plan(None, "A", cfg), ("A", cfg, False))
+
+    def test_non_partial_complete_behaves_as_before(self):
+        everything = set(_PT_FILES)
+        self.set_state(everything, everything, status=6, left=0)
+        self.poller.poll_once()
+        self.assertEqual(self.partials, [])
+        self.assertEqual(len(self.moves), 1)
+        self.assertEqual(self.moves[0][1], "Films")
+
+    def test_failure_backoff_then_retry(self):
+        self.set_state(S1 | S3, S1)
+        self.poller.poll_once()
+        self.finish_partial(success=False)
+        rec = self.store.get("tm-pt1")
+        self.assertEqual(rec["partial_failures"], 1)
+        self.assertNotIn("uploaded_files", rec)     # written only on success
+        self.assertGreater(rec["partial_next_attempt"], self.now[0])
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 1)     # inside backoff window
+        self.now[0] += app.UPLOAD_BACKOFF_BASE + 1
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 2)     # retried
+        self.finish_partial()                        # success resets state
+        rec = self.store.get("tm-pt1")
+        self.assertNotIn("partial_failures", rec)
+        self.assertNotIn("partial_next_attempt", rec)
+
+    def test_quota_failure_is_terminal_and_gives_up_after_max(self):
+        self.set_state(S1, S1)
+        self.poller.poll_once()
+        self.finish_partial(success=False, quota=True)
+        self.assertTrue(self.store.get("tm-pt1")["partial_failed"])
+        self.poller.poll_once()
+        self.assertEqual(len(self.partials), 1)
+        # partial failure state is separate: it must NOT gate the final move
+        rec = self.store.get("tm-pt1")
+        self.assertTrue(rec["partial_failed"])
+        self.assertNotIn("failed", rec)
+        self.assertNotIn("failures", rec)
+        everything = set(_PT_FILES)
+        self.set_state(everything, everything, status=6, left=0)
+        self.poller.poll_once()
+        self.assertEqual(len(self.moves), 1)
+
+    def test_partial_failures_do_not_spend_final_move_attempts(self):
+        self.set_state(S1 | S3, S1)
+        for _ in range(3):
+            self.poller.poll_once()
+            self.finish_partial(success=False)
+            self.now[0] += 10 * app.UPLOAD_BACKOFF_CAP
+        rec = self.store.get("tm-pt1")
+        self.assertEqual(rec["partial_failures"], 3)
+        self.assertNotIn("failures", rec)
+
+    def test_aria2_deselected_files_still_moved(self):
+        # Regression: aria2/Motrix torrents with deselected extras keep the
+        # old whole-dir move (no engine tag -> never partial).
+        self.set_state(S1, S1, status=6, left=0)
+        for dl in self.client.dls:
+            dl.pop("engine")
+        self.poller.poll_once()
+        self.assertEqual(self.partials, [])
+        self.assertEqual(len(self.moves), 1)
+
+    def test_restart_persists_uploaded_files_and_drive(self):
+        self.set_state(S1 | S3, S1)
+        self.poller.poll_once()
+        self.finish_partial()
+        store2 = app.DecisionStore(self.dpath)      # app restart
+        rec = store2.get("tm-pt1")
+        self.assertEqual(sorted(rec["uploaded_files"]),
+                         ["S1/e1.mkv", "S1/e2.mkv"])
+        self.assertEqual(rec["partial_drive"], "Films")
+        self.partials.clear()
+        p2 = self._poller(store=store2)
+        p2.poll_once()
+        self.assertEqual(self.partials, [])          # S1 not re-uploaded
+        self.set_state(S1 | S2, S1 | S2)
+        p2.poll_once()
+        self.assertEqual(sorted(self.partials[0][4]),
+                         ["S2/e1.mkv", "S2/e2.mkv"])
+
+    def test_restart_rearms_failed_but_keeps_partial_state(self):
+        self.set_state(S1, S1)
+        self.poller.poll_once()
+        self.finish_partial()
+        self.store.mark_failed("tm-pt1")
+        self.store.record_partial_failure("tm-pt1", 0, 5, 1, 1, quota=True)
+        rec = app.DecisionStore(self.dpath).get("tm-pt1")
+        self.assertNotIn("failed", rec)              # load()'s reset intact
+        self.assertNotIn("partial_failed", rec)
+        self.assertEqual(len(rec["uploaded_files"]), 2)
+
+    def test_old_decisions_json_without_partial_keys_loads(self):
+        with open(self.dpath, "w") as f:
+            json.dump({"tm-pt1": {"name": "n", "choice": "drive:Films",
+                                  "handled": False}}, f)
+        store2 = app.DecisionStore(self.dpath)
+        self.set_state(S1, S1)
+        self._poller(store=store2).poll_once()
+        self.assertEqual(len(self.partials), 1)
+
+    def test_forget_scrubs_and_requeue_repick_clears_pin(self):
+        self.store.add_partial_upload("tm-pt1", ["S1/e1.mkv"], "Films 2")
+        self.assertTrue(self.store.requeue("tm-pt1", "drive:Films 2"))
+        self.assertEqual(self.store.get("tm-pt1")["uploaded_files"],
+                         ["S1/e1.mkv"])              # same drive keeps it
+        self.assertTrue(self.store.requeue("tm-pt1", "drive:Other"))
+        self.assertNotIn("uploaded_files", self.store.get("tm-pt1"))
+        self.assertNotIn("partial_drive", self.store.get("tm-pt1"))
+        self.store.add_partial_upload("tm-pt1", ["S1/e1.mkv"], "Films")
+        self.store.forget("tm-pt1")
+        self.assertNotIn("uploaded_files", self.store.get("tm-pt1"))
+
+
+class TestPerformPartialUpload(unittest.TestCase):
+    def test_copy_only_with_list_file_and_no_engine(self):
+        seen = {}
+
+        def fake_up(path, drive, bw, progress_cb=None, **kw):
+            with open(kw["files_from"], encoding="utf-8") as f:
+                seen["list"] = f.read().splitlines()
+            seen.update(path=path, drive=drive, kw=kw)
+            return 0, "ok"
+        rc, out = app.perform_partial_upload(
+            "/dl/Show", "Films", ["S1/e1.mkv", "S1/e2.mkv"],
+            todrive_up=fake_up)
+        self.assertEqual((rc, out), (0, "ok"))
+        self.assertEqual(seen["list"], ["S1/e1.mkv", "S1/e2.mkv"])
+        self.assertTrue(seen["kw"]["keep"])
+        self.assertNotIn("no_overflow", seen["kw"])
+        self.assertFalse(os.path.exists(seen["kw"]["files_from"]))  # cleaned
+        app.perform_partial_upload("/dl/Show", "Films", ["a"],
+                                   todrive_up=fake_up, pinned=True)
+        self.assertTrue(seen["kw"]["no_overflow"])
+
+    def test_parse_routed_drive(self):
+        self.assertEqual(app.parse_routed_drive("x\nOK: y", "A"), "A")
+        self.assertEqual(app.parse_routed_drive(
+            "ROUTED: /p -> A 2\nROUTED: /p -> A 3", "A"), "A 3")
+
+    def test_run_todrive_up_argv_extras(self):
+        cmds = []
+
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                cmds.append(cmd)
+                self.stdout = mock.MagicMock()
+                self.stdout.__iter__.return_value = iter(())
+
+            def wait(self):
+                return 0
+        with mock.patch.object(app.subprocess, "Popen", FakeProc):
+            app.run_todrive_up("/p", "D")
+            app.run_todrive_up("/p", "D", keep=True, files_from="/l",
+                               no_overflow=True)
+        self.assertEqual(cmds[0][-3:], ["up", "/p", "D"])   # unchanged
+        self.assertIn("--keep", cmds[1])
+        self.assertEqual(cmds[1][cmds[1].index("--files-from") + 1], "/l")
+        self.assertIn("--no-overflow", cmds[1])
+
+
+class TestTodriveFilesFrom(unittest.TestCase):
+    def setUp(self):
+        import argparse
+        self.argparse = argparse
+        self.mod = _load_todrive()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = dict(self.mod.DEFAULT_CONFIG)
+        self.src = os.path.join(self.tmp, "Show (2007)")
+        os.makedirs(os.path.join(self.src, "S1"))
+        with open(os.path.join(self.src, "S1", "e1.mkv"), "wb") as f:
+            f.write(b"x" * 10)
+        # an unselected file's leftover .part must NOT block a partial copy
+        with open(os.path.join(self.src, "S2e1.mkv.part"), "wb") as f:
+            f.write(b"x" * 5)
+        self.lst = os.path.join(self.tmp, "list.txt")
+        with open(self.lst, "w") as f:
+            f.write("S1/e1.mkv\n")
+
+    def _args(self, paths, **kw):
+        d = dict(paths=paths, keep=True, allow_partial=False,
+                 no_overflow=True, files_from=self.lst)
+        d.update(kw)
+        return self.argparse.Namespace(**d)
+
+    def _run(self, args, popen_rc=0):
+        import contextlib
+        import io
+        cmds = []
+
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                cmds.append(cmd)
+                self.stderr = iter(())
+
+            def wait(self):
+                return popen_rc
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(self.mod, "resolve_id", return_value="D1"), \
+                mock.patch.object(self.mod.subprocess, "Popen", FakeProc), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = self.mod.cmd_up(self.cfg, args)
+        return rc, cmds, err.getvalue()
+
+    def test_builds_rclone_copy_with_files_from(self):
+        rc, cmds, _ = self._run(self._args([self.src, "Films"]))
+        self.assertEqual(rc, 0)
+        c = cmds[0]
+        self.assertEqual(c[1], "copy")               # never move
+        self.assertEqual(c[2], self.src)
+        self.assertTrue(c[3].endswith("Show (2007)/"))  # same dest as a move
+        self.assertEqual(c[c.index("--files-from") + 1], self.lst)
+        self.assertNotIn("--delete-empty-src-dirs", c)
+        self.assertTrue(os.path.exists(os.path.join(self.src, "S1", "e1.mkv")))
+
+    def test_unlisted_part_file_does_not_block_but_listed_marker_does(self):
+        rc, cmds, _ = self._run(self._args([self.src, "Films"]))
+        self.assertEqual(rc, 0)                      # S2e1.mkv.part ignored
+        open(os.path.join(self.src, "S1", "e1.mkv.part"), "w").close()
+        rc, cmds, err = self._run(self._args([self.src, "Films"]))
+        self.assertEqual(rc, 1)
+        self.assertEqual(cmds, [])
+        self.assertIn("e1.mkv.part", err)
+        # without --files-from the whole-tree scan blocks on the unlisted .part
+        rc, cmds, _ = self._run(self._args([self.src, "Films"],
+                                           files_from=None, keep=True))
+        self.assertEqual(rc, 1)
+
+    def test_requires_keep_and_single_dir(self):
+        self.assertEqual(self._run(self._args([self.src, "Films"],
+                                              keep=False))[0], 2)
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        self.assertEqual(self._run(self._args([self.src, other, "Films"]))[0],
+                         2)
+        f = os.path.join(self.src, "S1", "e1.mkv")
+        self.assertEqual(self._run(self._args([f, "Films"]))[0], 2)
+
+    def test_overflow_sizing_counts_only_listed_files(self):
+        sizes = []
+
+        def fake_pick(cfg, name, payload_bytes, usage_cache):
+            sizes.append(payload_bytes)
+            return name, "D1"
+        with mock.patch.object(self.mod, "pick_destination", fake_pick):
+            rc, _c, _e = self._run(self._args([self.src, "Films"],
+                                              no_overflow=False))
+        self.assertEqual(rc, 0)
+        self.assertEqual(sizes, [10])                # not 15 (.part excluded)
+
+    def test_build_up_argv_pure(self):
+        c = self.mod.build_up_argv("move", "/s", "r:/d/", ["--x"], True)
+        self.assertEqual(c[1:4], ["move", "/s", "r:/d/"])
+        self.assertIn("--delete-empty-src-dirs", c)
+        self.assertNotIn("--files-from", c)
+        c = self.mod.build_up_argv("copy", "/s", "r:/d/", [], True, "/l")
+        self.assertEqual(c[-3:-1], ["--files-from", "/l"])
+        self.assertEqual(c[-1], "-P")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -33,6 +33,29 @@ indexing them under one shared bogus show. Names also land in `app.log` and
 `rename_cache.json`, and the same submenu clears both — see **D-019** in
 `docs/DECISIONS.md`.
 
+## Partial torrents (season-by-season)
+
+A multi-file torrent with some files unselected (`is_partial_selection`) is
+never moved. Transmission reads it "complete" once the SELECTED files finish, and
+a whole-dir `todrive up` would stop it, fail on the unselected `.part` files, and
+(if it succeeded) delete the still-downloading rest. Instead `Poller._poll_partial`
+COPIES files that are selected + byte-complete + on disk with no marker sibling +
+not in the record's `uploaded_files`, while the torrent is "complete" OR "active"
+(never verifying). Copy = `todrive up --keep --files-from FILE`, landing at
+`<drive>/<top dir>/<rel>` so the final move dedups. No engine stop/remove, no
+rename hook, `handled` stays False. The first successful batch stores
+`partial_drive` (from the last `ROUTED:` line, else the asked drive); later
+batches and the final pass use `--no-overflow` on it. The final pass (all files
+selected) is the normal move, but skips the rename hook when `uploaded_files` is
+set (`final_pass_plan`). `uploaded_files`/`partial_drive` live in `decisions.json`
+(scrubbed by forget; a re-pick of a different drive clears them). Transmission only (engine tag from `_adapt`): aria2/Motrix keep the whole-dir move.
+Partial-copy failures use separate `partial_failed/partial_failures/partial_next_attempt`
+keys so they never block or spend the final move's attempts. Known limit: if the
+FIRST unpinned batch is rerouted mid-upload by overflow, files already copied to the
+asked drive stay there as orphans (final pass targets the routed drive); accepted, as
+with todrive's split-payload behaviour. Logic is in
+top-level functions because `_run_app` is untestable headless. See **D-020**.
+
 ## yt-video
 
 `yt-video` is the SINGLE-video sibling to `yt-show`: download one YouTube video

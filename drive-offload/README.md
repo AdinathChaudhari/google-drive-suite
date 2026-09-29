@@ -252,6 +252,23 @@ byte-verified upload.
 > work whether the app is launched from a terminal or automatically at login.
 > (Earlier versions failed here with `rclone not found on PATH`.)
 
+### Partial torrents (season-by-season)
+
+If you download a multi-season torrent one season at a time (select Season 1,
+wait, then select Season 2, ...), the app does **not** move it when the selected
+files finish. It **copies** each finished file to the drive you picked
+(`<drive>/<torrent folder>/<path>`), leaves the torrent downloading/seeding and
+the local files in place, and remembers what it uploaded so nothing is sent
+twice. A notification says "Uploaded N files — kept local, still seeding". This
+also runs while a later season is still downloading.
+
+Once **all** files are selected and finished, the normal upload-and-remove runs.
+The files already copied are skipped as identical, the rename step is skipped so
+names match what is already there, and the upload goes to the same drive as the
+copies (a drive that fills up mid-way fails instead of splitting the show; pick
+another drive from Re-upload, which re-uploads everything there). A torrent that
+keeps some files deselected forever is copied but never removed.
+
 ### Live upload progress
 
 While an upload runs, the menu-bar **title itself shows the percent** —
