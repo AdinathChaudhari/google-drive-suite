@@ -58,6 +58,7 @@ than no entry.
 | [D-017](#d-017--a-tab-less-drive-silently-disabled-per-drive-refresh) | A tab-less drive silently disabled per-drive refresh | Adopted | drivecast |
 | [D-018](#d-018--focusrestorer-over-a-lazy-lane-kills-the-process-not-the-keypress) | `focusRestorer` over a lazy lane kills the process, not the keypress | Adapted | drivecast-app |
 | [D-019](#d-019--forgetting-a-decision-means-scrubbing-it-not-deleting-it) | Forgetting a decision means scrubbing it, not deleting it | Adopted | drive-offload |
+| [D-020](#d-020--a-season-by-season-torrent-is-copied-as-it-finishes-moved-only-at-the-end) | A season-by-season torrent is copied as it finishes, moved only at the end | Adopted | drive-offload |
 
 ---
 
@@ -623,3 +624,48 @@ than no entry.
 - **Revisit when** — decisions ever get pruned by age. A reaper that drops old
   records hits exactly the same re-ask trap, and would need the same
   tombstone-shaped answer.
+
+---
+
+### D-020 — A season-by-season torrent is copied as it finishes, moved only at the end
+**Status:** Adopted · **When:** 2026-09-29
+
+- **Hit** — a multi-season torrent downloaded one season at a time (tick one
+  season's files, wait, tick the next; the rest stay `wanted=false`). When the
+  ticked files finished, Transmission read "complete", so `poll_once` handed the
+  WHOLE directory to `todrive up` — a move. That stopped the torrent, then
+  `todrive` refused because the unselected files leave `<name>.part` behind, and
+  the gid burned 5 attempts into a terminal failed state. Had it worked, the
+  move would have deleted local data and removed the torrent mid-download.
+- **Learned** — "complete" describes the *selection*, not the torrent
+  (`sizeWhenDone` counts selected bytes only). A destructive move is only right
+  when nothing is left to download, i.e. every file is selected. Until then the
+  safe primitive is a COPY of exactly the files that are finished.
+- **Did** — `is_partial_selection` (multi-file, at least one file unselected)
+  routes a drive-bound torrent to a copy path: `pending_partial_files` picks the
+  files that are selected, byte-complete, on disk under their final name with no
+  marker sibling, and not already in the record's `uploaded_files`. It runs while
+  the torrent is "complete" or "active" (never verifying), so an early season
+  uploads while a later one still downloads. `todrive up --keep --files-from`
+  copies them to `<drive>/<top dir>/<rel>`, exactly where the final whole-dir
+  move would put them, so that move dedups. Nothing local is touched: no stop, no
+  remove, no rename hook. Once all files are selected the existing move path
+  runs unchanged, except it skips the rename hook (renaming would change the
+  names the copies already have) and reuses the drive. **Overflow:** `todrive`
+  picks a drive by sizing the payload against the 100 GB cap and reports a reroute
+  only in a `ROUTED:` line, so two passes could land on different drives. The
+  first successful batch records the drive it actually used as `partial_drive`;
+  every later batch and the final pass pass `--no-overflow` to that drive. Cost:
+  if the pinned drive fills, that upload fails as quota (terminal until a manual
+  re-pick, which clears the pin and re-uploads to the new drive).
+- **Where** — `drive-offload/offload_app.py` § `is_partial_selection` /
+  `pending_partial_files` / `final_pass_plan` / `Poller._poll_partial` /
+  `Poller.upload_partial_done` / `DecisionStore.add_partial_upload` /
+  `perform_partial_upload`, `drive-offload/todrive` § `cmd_up` (`--files-from`) /
+  `build_up_argv` / `find_incomplete_markers_listed`,
+  `drive-offload/test_offload_app.py` § `TestPartialPoll` (mutation-checked:
+  dropping the `uploaded_files` filter, the marker-sibling check, the drive pin,
+  or the rename skip each fails a test).
+- **Revisit when** — a torrent with permanently deselected files (junk the user
+  never wants) should still be finished off. Today it is copied and then left
+  seeding, because the move only runs once every file is selected.
