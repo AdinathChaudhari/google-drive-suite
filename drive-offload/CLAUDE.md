@@ -43,17 +43,23 @@ COPIES files that are selected + byte-complete + on disk with no marker sibling 
 not in the record's `uploaded_files`, while the torrent is "complete" OR "active"
 (never verifying). Copy = `todrive up --keep --files-from FILE`, landing at
 `<drive>/<top dir>/<rel>` so the final move dedups. No engine stop/remove, no
-rename hook, `handled` stays False. The first successful batch stores
-`partial_drive` (from the last `ROUTED:` line, else the asked drive); later
-batches and the final pass use `--no-overflow` on it. The final pass (all files
-selected) is the normal move, but skips the rename hook when `uploaded_files` is
-set (`final_pass_plan`). `uploaded_files`/`partial_drive` live in `decisions.json`
-(scrubbed by forget; a re-pick of a different drive clears them). Transmission only (engine tag from `_adapt`): aria2/Motrix keep the whole-dir move.
+rename hook, `handled` stays False. **Nothing is pinned to a drive (D-022):** every
+batch asks the CHOICE drive with NO `--no-overflow`, so todrive routes to the first
+chain member with room (a 179 GB torrent vs ~100 GB drives). Each successful batch maps
+every rel in it to the drive it landed on (last `ROUTED:` line, else the asked drive)
+in `file_drives` ({rel: drive}, persisted); legacy rels without an entry resolve to
+`partial_drive`, else the choice drive. `partial_drive` is still written (last landing
+drive) but pins nothing. The final pass (all files selected) is the normal move to the
+choice drive, but skips the rename hook when `uploaded_files` is set
+(`final_pass_plan`). `uploaded_files`/`file_drives`/`partial_drive` live in
+`decisions.json` (scrubbed by forget; a re-pick of a different drive clears them).
+Transmission only (engine tag from `_adapt`): aria2/Motrix keep the whole-dir move.
 Partial-copy failures use separate `partial_failed/partial_failures/partial_next_attempt`
-keys so they never block or spend the final move's attempts. Known limit: if the
-FIRST unpinned batch is rerouted mid-upload by overflow, files already copied to the
-asked drive stay there as orphans (final pass targets the routed drive); accepted, as
-with todrive's split-payload behaviour. Logic is in
+keys so they never block or spend the final move's attempts. Known limits: if a
+batch is rerouted mid-upload by overflow, files already copied to the asked drive stay
+there as orphans (accepted, as with todrive's split-payload behaviour); the final
+whole-dir move (only reached when nothing was freed) dedups only against the drive it is
+routed to, so files copied to another drive can be re-sent. Logic is in
 top-level functions because `_run_app` is untestable headless. See **D-020**.
 
 **Folder-level logic (D-021).** A "folder" is a top-level child dir of the torrent
@@ -61,16 +67,15 @@ root; root files are never folders. For a drive-bound partial Transmission torre
 `Poller._poll_folders` (after `_poll_partial`, same tick) does ONE action per tick, on
 a worker thread via `spawn_cb`, under the same `_uploading` guard as the COPY, so
 copy/free/advance/done never overlap for one gid: (1) **free** a folder whose files
-are all selected and all in `uploaded_files`: `rclone check --one-way` vs
-`<remote>:<top>/<folder>` (`verify_on_drive`, remote from `todrive resolve`, rc 0 only)
--> `TransmissionClient.set_files_wanted(..., False)` -> `get_files_wanted` must show
+are all selected and all in `uploaded_files`: **location-agnostic content verify**
+(`verify_files_on_drives`, D-022) -> `TransmissionClient.set_files_wanted(..., False)` -> `get_files_wanted` must show
 them all unwanted -> `rmtree` iff `safe_child_dir` -> `freed_folders`. Untick BEFORE
 delete is load-bearing (Transmission stops the torrent if selected files vanish). (2)
 **advance** (`partial_auto_advance`): nothing selected-incomplete and no copy owed ->
 tick the first folder with no selected/uploaded files and not freed (season number
 ascending, then natural sort) if `disk_usage.free >= size + partial_free_margin_gb`
 (else one notice per gid+folder), then `torrent-start`. (3) **done**: every file in
-`uploaded_files` -> leftover scan + rclone check, `remove_torrent` (no data), confirm it
+`uploaded_files` -> leftover scan + the same content verify, `remove_torrent` (no data), confirm it
 left, mark handled, rmtree the root. Failures back off in `free_*` keys
 (`FREE_FAIL_KEYS`, re-armed on restart). A torrent with `freed_folders` stays
 partial-managed and is never whole-dir moved. Config keys (top-level, default on):
@@ -79,6 +84,19 @@ partial-managed and is never whole-dir moved. Config keys (top-level, default on
 never delete or spawn rclone by accident. With `partial_auto_advance` off the torrent
 just stays partial. Limits: unwanted files in the torrent ROOT are never ticked, so
 such a torrent is never "done"; only `poll_once`'s `status in (complete, active)`.
+
+**Verify is by content, anywhere on the drive (D-022).** An external tool may move or
+rename uploaded files on the drive (`<torrent dir>/Season N/x` -> `<Show (Year)>/Season
+N/x`), so `rclone check` against the expected path can never pass. `verify_files_on_drives(local_root,
+[(rel, drive)], lister, hasher)` groups by each file's own drive (`file_drive`), lists
+each drive ONCE (`rclone lsjson -R --files-only --hash --hash-type md5`, conn from
+`todrive resolve`), indexes by basename, and requires a remote entry with the same
+basename, size AND md5 (local md5 in 8 MiB chunks). A listing failure, an unreadable
+local file, or a same-name same-size remote with no md5 = not ok: never delete on
+doubt. Injectable as `Poller(verify_cb=fn(local_root, items), list_cb=fn(drive, hashes))`.
+The free step also refuses a folder holding a local file that is not one of the torrent's
+files. `_untick_absent_work` (nothing local to delete) is size-only: same basename +
+exact size on that file's drive.
 
 ## yt-video
 
