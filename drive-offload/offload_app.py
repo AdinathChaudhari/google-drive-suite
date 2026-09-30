@@ -1008,6 +1008,24 @@ def verify_on_drive(local, drive, subpath, excludes=(),
     return False, "rclone check rc=%d %s" % (p.returncode, tail)
 
 
+def remote_sizes(drive, subpath, resolve=todrive_resolve,
+                 runner=subprocess.run):
+    """{relative path: size} of every file under <drive>:<subpath> via
+    `rclone lsjson -R --files-only`, or None on any failure."""
+    conn = resolve(drive)
+    if not conn:
+        return None
+    argv = [_find_rclone(), "lsjson", "-R", "--files-only", conn + subpath]
+    try:
+        p = runner(argv, capture_output=True, text=True, encoding="utf-8",
+                   errors="replace")
+        if p.returncode != 0:
+            return None
+        return {e["Path"]: int(e["Size"]) for e in json.loads(p.stdout or "[]")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 class DecisionStore:
     """Persists per-gid decisions to decisions.json.
 
@@ -1408,7 +1426,7 @@ class Poller:
                  notify_cb=None, is_paused_cb=None, now_fn=None,
                  ask_existing_cb=None, partial_upload_cb=None,
                  partial_cfg=None, verify_cb=None, disk_usage_cb=None,
-                 spawn_cb=None):
+                 spawn_cb=None, remote_sizes_cb=None):
         self.client = client
         self.store = store
         self.ask_cb = ask_cb
@@ -1433,6 +1451,8 @@ class Poller:
                             DEFAULT_PARTIAL_CFG["partial_free_margin_gb"]}
         self.partial_cfg.update(partial_cfg or {})
         self.verify_cb = verify_cb or verify_on_drive
+        # remote_sizes_cb(drive, subpath) -> {relpath: bytes} | None
+        self.remote_sizes_cb = remote_sizes_cb or remote_sizes
         self.disk_usage_cb = disk_usage_cb or shutil.disk_usage
         self._spawn = spawn_cb or (lambda fn: threading.Thread(
             target=fn, daemon=True).start())
@@ -1686,6 +1706,18 @@ class Poller:
                     log("FREE gid=%s %s already absent + uploaded + unticked "
                         "-> recorded" % (gid, folder))
                 continue
+            if all(sel) and not os.path.lexists(fpath):
+                # Deleted by hand while still ticked: nothing local to verify
+                # or delete, but Transmission would error the whole torrent
+                # the moment it seeds those files. Check the drive copy by
+                # size, then untick.
+                log("FREE start gid=%s %s (already gone locally; untick "
+                    "only)" % (gid, folder))
+                self._dispatch_folder_task(
+                    gid, name, lambda folder=folder, ents=ents:
+                    self._untick_absent_work(gid, name, path, folder, ents,
+                                             drive))
+                return True
             if not all(sel) or not os.path.isdir(fpath):
                 continue
             size = sum(int(f.get("length") or 0) for _i, _r, f in ents)
@@ -1724,6 +1756,34 @@ class Poller:
         self.notify_cb("Season freed", name,
                        "%s (%s) is on %s — deleted locally" %
                        (folder, human_size(size), drive))
+        return None
+
+    def _untick_absent_work(self, gid, name, path, folder, ents, drive):
+        """A ticked, fully-uploaded folder the user already deleted: confirm
+        every file is on the drive at its exact size -> untick -> confirm ->
+        record freed. Deletes nothing. None on success, else the reason."""
+        sizes = self.remote_sizes_cb(
+            drive, "%s/%s" % (os.path.basename(path), folder))
+        if sizes is None:
+            return "cannot list %r on %s" % (folder, drive)
+        prefix = folder + "/"
+        missing = [rel for _i, rel, f in ents
+                   if sizes.get(rel[len(prefix):]) != int(f.get("length") or 0)]
+        if missing:
+            return ("%d of %r's files missing or wrong size on %s (e.g. %r)"
+                    % (len(missing), folder, drive, missing[0]))
+        idx = [i for i, _r, _f in ents]
+        eng = self.client.for_gid(gid)
+        eng.set_files_wanted(gid, idx, False)
+        wanted = eng.get_files_wanted(gid)
+        if len(wanted) <= max(idx) or any(wanted[i] for i in idx):
+            return "untick of %r not confirmed by the engine" % folder
+        self.store.add_freed_folder(gid, folder)
+        log("FREE gid=%s %s (%d files) already deleted locally; on drive, "
+            "unticked" % (gid, folder, len(ents)))
+        self.notify_cb("Season freed", name,
+                       "%s was already deleted locally — it is on %s, "
+                       "unticked" % (folder, drive))
         return None
 
     def _poll_done(self, dl, gid, name, path, uploaded, drive):
