@@ -49,6 +49,17 @@ OPTIONS = {
         # Menu-bar agent: no Dock icon / app-switcher clutter. Still launchable
         # from Spotlight and /Applications.
         "LSUIElement": True,
+        # The tools this hub launches run from the repo's venv under
+        # ~/Documents and read ~/Downloads / external drives. macOS charges
+        # that access to this app (the responsible process), and WITHOUT these
+        # strings TCC denies it silently — no prompt, just EPERM on the child's
+        # pyvenv.cfg. Ad-hoc signing means every rebuild re-asks once.
+        "NSDocumentsFolderUsageDescription":
+            "Drivedeck launches its Drive tools from your Documents folder.",
+        "NSDownloadsFolderUsageDescription":
+            "Drivedeck's Drive tools upload and download files in Downloads.",
+        "NSRemovableVolumesUsageDescription":
+            "Drivedeck's Drive tools can upload from external drives.",
     },
 }
 
