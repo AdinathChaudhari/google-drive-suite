@@ -4007,6 +4007,64 @@ class TestFreeAfterUpload(FolderBase):
         self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
                          ["Season 3"])
 
+    def _absent_ticked_s3(self, remote):
+        # Season 3 ticked + complete + uploaded, then deleted by hand.
+        self.set_state(S3F | S4F, S3F, uploaded=S3F)
+        shutil.rmtree(os.path.join(self.top(), "Season 3"))
+        self.listed = []
+
+        def sizes(drive, subpath):
+            self.listed.append((drive, subpath))
+            return remote
+        self.poller.remote_sizes_cb = sizes
+
+    def test_ticked_folder_deleted_by_hand_is_unticked(self):
+        self._absent_ticked_s3({"e1.mkv": 10, "e2.mkv": 10})
+        self.poller.poll_once()
+        self.assertEqual(self.listed, [("Films", "%s/Season 3" % _FL_TOP)])
+        self.assertEqual([e[0] for e in self.events], ["untick", "confirm"])
+        self.assertEqual(self.events[0][1], sorted(S3F))
+        self.assertTrue(S3F.isdisjoint(self.wanted))
+        self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
+                         ["Season 3"])
+        self.assertTrue(os.path.isdir(os.path.join(self.top(), "Season 4")))
+        self.assertEqual(len(self.notified("Season freed")), 1)
+
+    def test_deleted_by_hand_but_not_on_drive_stays_ticked(self):
+        self._absent_ticked_s3({"e1.mkv": 10, "e2.mkv": 7})   # e2 short
+        self.poller.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertTrue(S3F <= self.wanted)
+        self.assertNotIn("freed_folders", self.store.get("tm-pt1"))
+        self.assertEqual(self.store.get("tm-pt1")["free_failures"], 1)
+
+    def test_deleted_by_hand_listing_fails_stays_ticked(self):
+        self._absent_ticked_s3(None)
+        self.poller.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertNotIn("freed_folders", self.store.get("tm-pt1"))
+
+    def test_deleted_by_hand_untick_not_confirmed(self):
+        self._absent_ticked_s3({"e1.mkv": 10, "e2.mkv": 10})
+        self.engine.ignore_untick = True
+        self.poller.poll_once()
+        self.assertEqual([e[0] for e in self.events], ["untick", "confirm"])
+        self.assertNotIn("freed_folders", self.store.get("tm-pt1"))
+
+    def test_remote_sizes_parses_lsjson(self):
+        run = mock.Mock(return_value=mock.Mock(
+            returncode=0, stdout='[{"Path":"a/e1.mkv","Size":5}]'))
+        got = app.remote_sizes("D", "Top/S", resolve=lambda d: "r:",
+                               runner=run)
+        self.assertEqual(got, {"a/e1.mkv": 5})
+        self.assertEqual(run.call_args[0][0][1:],
+                         ["lsjson", "-R", "--files-only", "r:Top/S"])
+        run.return_value = mock.Mock(returncode=3, stdout="")
+        self.assertIsNone(app.remote_sizes("D", "x", resolve=lambda d: "r:",
+                                           runner=run))
+        self.assertIsNone(app.remote_sizes("D", "x", resolve=lambda d: None,
+                                           runner=run))
+
     def test_freed_folders_survive_restart(self):
         self.set_state(S3F | S4F, S3F, uploaded=S3F)   # Season 4 downloading
         self.poller.poll_once()
