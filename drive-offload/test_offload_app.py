@@ -4209,6 +4209,214 @@ class TestFreeAfterUpload(FolderBase):
                          ["Season 3"])
 
 
+class TestFreePerFile(FolderBase):
+    """D-023: each uploaded file is verified, unticked and deleted as soon as
+    it is on the drive, while the rest of the season keeps downloading."""
+    cfg = {"partial_free_after_upload": True, "partial_auto_advance": False,
+           "partial_free_margin_gb": 5, "partial_free_mode": "file"}
+    E1, E2 = "Season 3/e1.mkv", "Season 3/e2.mkv"
+
+    def _path(self, rel):
+        return os.path.join(self.top(), rel)
+
+    def _ep1_done_ep2_downloading(self):
+        self.set_state(S3F | S4F, {self.E1}, uploaded={self.E1})
+
+    def test_ep1_freed_while_ep2_downloads(self):
+        self._ep1_done_ep2_downloading()
+        self.poller.poll_once()
+        self.assertEqual(self.verifies,
+                         [(self.top(), [(self.E1, "Films")])])
+        self.assertEqual([e[0] for e in self.events],
+                         ["verify", "untick", "confirm"])
+        self.assertEqual(self.events[1][1], [self.E1])
+        self.assertEqual(self.events[1][2], [True])   # untick BEFORE delete
+        self.assertFalse(os.path.exists(self._path(self.E1)))
+        # ep2 untouched: still selected, its .part still there
+        self.assertIn(self.E2, self.wanted)
+        self.assertTrue(os.path.exists(self._path(self.E2 + ".part")))
+        self.assertTrue(os.path.isdir(self._path("Season 3")))  # not empty
+        notes = self.notified("Files freed")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Freed 1 files", notes[0][2])
+        self.assertIn("Films", notes[0][2])
+        self.assertNotIn("freed_folders", self.store.get("tm-pt1"))
+        self.assertNotIn("tm-pt1", self.poller._uploading)
+        self.poller.poll_once()                       # nothing more to do
+        self.assertEqual(len(self.verifies), 1)
+
+    def test_verify_failure_deletes_and_unticks_nothing(self):
+        self._ep1_done_ep2_downloading()
+        self.verify_result = (False, "md5 mismatch")
+        self.poller.poll_once()
+        self.assertEqual([e[0] for e in self.events], ["verify"])
+        self.assertTrue(os.path.exists(self._path(self.E1)))
+        self.assertIn(self.E1, self.wanted)
+        self.assertEqual(self.store.get("tm-pt1")["free_failures"], 1)
+
+    def test_untick_not_confirmed_deletes_nothing(self):
+        self._ep1_done_ep2_downloading()
+        self.engine.ignore_untick = True
+        self.poller.poll_once()
+        self.assertEqual([e[0] for e in self.events],
+                         ["verify", "untick", "confirm"])
+        self.assertTrue(os.path.exists(self._path(self.E1)))
+        self.assertEqual(self.notified("Files freed"), [])
+
+    def test_symlinked_file_is_not_deleted(self):
+        self._ep1_done_ep2_downloading()
+        outside = os.path.join(self.tmp, "outside.mkv")
+        with open(outside, "wb") as f:
+            f.write(b"x" * 10)
+        os.remove(self._path(self.E1))
+        os.symlink(outside, self._path(self.E1))
+        self.poller.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertTrue(os.path.exists(outside))
+        self.assertTrue(os.path.islink(self._path(self.E1)))
+
+    def test_symlink_to_a_file_inside_the_root_is_not_deleted(self):
+        # realpath stays inside the root, so only the islink guard stops it
+        self._ep1_done_ep2_downloading()
+        os.remove(self._path(self.E1))
+        os.symlink(self._path("Season 4/e1.mkv.part"), self._path(self.E1))
+        self.assertTrue(os.path.isfile(self._path(self.E1)))
+        self.poller.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertTrue(os.path.islink(self._path(self.E1)))
+
+    def test_file_escaping_root_via_symlinked_dir_is_not_deleted(self):
+        self._ep1_done_ep2_downloading()
+        outside = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "e1.mkv"), "wb") as f:
+            f.write(b"x" * 10)
+        shutil.rmtree(self._path("Season 3"))
+        os.symlink(outside, self._path("Season 3"))
+        self.poller.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertTrue(os.path.exists(os.path.join(outside, "e1.mkv")))
+
+    def test_plain_file_inside_helper(self):
+        self.write("a/x.mkv")
+        self.assertTrue(app._plain_file_inside(self._path("a/x.mkv"),
+                                               self.top()))
+        self.assertFalse(app._plain_file_inside(self._path("a"), self.top()))
+        self.assertFalse(app._plain_file_inside(self._path("a/nope"),
+                                                self.top()))
+        self.assertFalse(app._plain_file_inside(
+            self._path("a/../../%s" % os.path.basename(self.dpath)),
+            self.top()))
+
+    def test_emptied_folder_dir_removed_but_root_kept(self):
+        self.set_state(S3F | S4F, S3F, uploaded=S3F)
+        self.poller.poll_once()
+        self.assertEqual(self.verifies[0][1],
+                         [(self.E1, "Films"), (self.E2, "Films")])
+        self.assertFalse(os.path.exists(self._path("Season 3")))
+        self.assertTrue(os.path.isdir(self._path("Season 4")))
+        self.assertTrue(os.path.isdir(self.top()))
+        self.assertEqual(len(self.notified("Files freed")), 1)
+        # the existing absent path then records the folder as freed
+        self.poller.poll_once()
+        self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
+                         ["Season 3"])
+
+    def test_root_level_file_is_freed_root_is_not(self):
+        self.set_state({"readme.txt"} | S4F, {"readme.txt"},
+                       uploaded={"readme.txt"})
+        self.poller.poll_once()
+        self.assertFalse(os.path.exists(self._path("readme.txt")))
+        self.assertTrue(os.path.isdir(self.top()))
+
+    def test_unselected_uploaded_file_is_left_alone(self):
+        self.set_state(S4F, {self.E1}, uploaded={self.E1})
+        self.poller.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertTrue(os.path.exists(self._path(self.E1)))
+
+    def test_folder_mode_never_deletes_single_files(self):
+        p = self._fl_poller(self.store, lambda fn: fn(), cfg=dict(
+            self.cfg, partial_free_mode="folder"))
+        self._ep1_done_ep2_downloading()
+        p.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertTrue(os.path.exists(self._path(self.E1)))
+
+    def test_config_default_is_file_and_parses(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "config.json")
+        self.assertEqual(app.read_partial_config(path)["partial_free_mode"],
+                         "file")
+        for val, want in (("folder", "folder"), ("nope", "file"), (3, "file")):
+            with open(path, "w") as f:
+                json.dump({"partial_free_mode": val}, f)
+            self.assertEqual(
+                app.read_partial_config(path)["partial_free_mode"], want)
+        self.assertEqual(app.Poller(None, None, None, None)
+                         .partial_cfg["partial_free_mode"], "folder")
+
+    def test_free_off_means_no_file_frees_even_in_file_mode(self):
+        p = self._fl_poller(self.store, lambda fn: fn(), cfg=dict(
+            self.cfg, partial_free_after_upload=False))
+        self._ep1_done_ep2_downloading()
+        p.poll_once()
+        self.assertEqual(self.events, [])
+
+    def test_done_completes_after_file_level_frees_with_boundary_part(self):
+        # one file stays unticked (never downloaded): still a partial torrent
+        live = set(_FL_FILES) - {"Featurettes/f1.mkv"}
+        self.set_state(live, live, uploaded=set(_FL_FILES))
+        self.poller.poll_once()                       # everything, one batch
+        self.assertEqual(len(self.verifies[0][1]), len(live))
+        self.assertEqual(self.wanted, set())
+        self.assertEqual(os.listdir(self.top()), [])
+        # Transmission recreates a small .part for a boundary piece
+        self.write(self.E1, size=2, part=True)
+        for _ in range(4):
+            self.poller.poll_once()
+        self.assertEqual(len(self.ops("remove")), 1)
+        rec = self.store.get("tm-pt1")
+        self.assertTrue(rec["handled"])
+        self.assertFalse(os.path.exists(self.top()))
+        self.assertEqual(len(self.notified("Torrent finished")), 1)
+
+
+class TestFreePerFileAdvance(FolderBase):
+    cfg = {"partial_free_after_upload": True, "partial_auto_advance": True,
+           "partial_free_margin_gb": 5, "partial_free_mode": "file"}
+
+    def test_next_season_advances_after_last_episode_freed(self):
+        self.store.add_freed_folder("tm-pt1", "Season 1")
+        self.set_state(S3F, S3F, uploaded=S1F | S3F)
+        self.poller.poll_once()                       # frees both episodes
+        self.assertFalse(os.path.exists(os.path.join(self.top(), "Season 3")))
+        self.assertEqual(self.ops("tick"), [])
+        self.poller.poll_once()                       # folder recorded+advance
+        self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
+                         ["Season 1", "Season 3"])
+        self.assertEqual(self.ops("tick")[0][:2], ("tick", sorted(S4F)))
+        self.assertEqual(self.wanted, S4F)
+
+    def test_advance_and_freeing_wait_for_the_running_episode(self):
+        self.store.add_freed_folder("tm-pt1", "Season 1")
+        self.set_state(S3F, {"Season 3/e1.mkv"},
+                       uploaded=S1F | {"Season 3/e1.mkv"})
+        self.poller.poll_once()                       # e1 freed
+        self.poller.poll_once()
+        self.assertEqual(self.ops("tick"), [])        # e2 still downloading
+
+    def test_advance_works_when_boundary_part_recreates_folder_dir(self):
+        self.store.add_freed_folder("tm-pt1", "Season 1")
+        self.set_state(S3F, S3F, uploaded=S1F | S3F)
+        self.poller.poll_once()                       # frees both
+        self.write("Season 3/e2.mkv", size=2, part=True)   # dir is back
+        self.poller.poll_once()
+        self.assertEqual(self.ops("tick")[0][:2], ("tick", sorted(S4F)))
+        self.assertEqual(self.wanted, S4F)
+
+
 class TestAutoAdvance(FolderBase):
     cfg = {"partial_free_after_upload": False, "partial_auto_advance": True,
            "partial_free_margin_gb": 5}
@@ -4672,7 +4880,8 @@ class TestFolderHelpers(unittest.TestCase):
         self.assertEqual(app.read_partial_config(path),
                          {"partial_free_after_upload": True,
                           "partial_auto_advance": True,
-                          "partial_free_margin_gb": 5})
+                          "partial_free_margin_gb": 5,
+                          "partial_free_mode": "file"})
         with open(path, "w") as f:
             json.dump({"partial_free_after_upload": False,
                        "partial_auto_advance": "no",     # wrong type: default
@@ -4680,7 +4889,8 @@ class TestFolderHelpers(unittest.TestCase):
         self.assertEqual(app.read_partial_config(path),
                          {"partial_free_after_upload": False,
                           "partial_auto_advance": True,
-                          "partial_free_margin_gb": 12.5})
+                          "partial_free_margin_gb": 12.5,
+                          "partial_free_mode": "file"})
 
     def test_bare_poller_has_folder_logic_off(self):
         p = app.Poller(None, None, None, None)

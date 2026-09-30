@@ -288,6 +288,14 @@ off with `config.json` keys (restart the app): `"partial_free_after_upload": fal
 `"partial_auto_advance": false` (the torrent then stays partial), and
 `"partial_free_margin_gb": 5`.
 
+**Free each episode as soon as it is uploaded.** By default (`"partial_free_mode": "file"`)
+space is freed per file, not per season: as soon as finished files are on the drive the app
+verifies them by content, unticks them in Transmission, confirms the untick, and deletes just
+those files (plus any folder that became empty), while the rest of the season keeps
+downloading. One "Freed N files" notification per batch. The next season still starts only
+when your current selection is done, but the space is already free by then. Set
+`"partial_free_mode": "folder"` for the older whole-season-folder behaviour.
+
 ### Live upload progress
 
 While an upload runs, the menu-bar **title itself shows the percent** —
