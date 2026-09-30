@@ -1887,3 +1887,183 @@ def test_migrate_library_v1_stamps_custom_tab_key(tmp_path, monkeypatch):
     lib = library.Library(path=str(p), drive_sections={"drv1": "my-flix"})
     rec = lib.get("movieA")
     assert rec["section"] == "my-flix"
+
+
+# ------------------------------------- cross-drive merge of the same show -----
+
+_PACK = "Show (2007) Season 1-7 S01-S07 (1080p BluRay x265 HEVC 10bit AAC 5.1 Silence)"
+
+
+def _ep(fid, season, ep, size=1000, name=None):
+    return rawfile(fid, name or "Show (2007) - S%02dE%02d - Title.mkv" % (season, ep),
+                   size=size)
+
+
+def _cross_tree(dupe=False, pack_name=_PACK, pack_year_first=False):
+    """drive dA: clean nested show, seasons 1-2. drive dB: torrent-named nested
+    pack with seasons 2(+dupe)-3."""
+    tree = {
+        "dA": [rawfolder("aShow", "Show (2007)")],
+        "aShow": [rawfolder("aS1", "Season 1"), rawfolder("aS2", "Season 2")],
+        "aS1": [_ep("a11", 1, 1), _ep("a12", 1, 2)],
+        "aS2": [_ep("a21", 2, 1, size=2001)],
+        "dB": [rawfolder("bShow", pack_name)],
+        "bShow": [rawfolder("bS2", "Season 2"), rawfolder("bS3", "Season 3")],
+        "bS2": [_ep("b22", 2, 2, size=2002)] + (
+            [_ep("b21", 2, 1, size=2001, name="Show.2007.S02E01.1080p.mkv")] if dupe else []),
+        "bS3": [_ep("b31", 3, 1)],
+    }
+    return tree
+
+
+def _scan(tmp_path, tree, drives=("dA", "dB"), sections_map=None, scope=None,
+          scanner=None, lib=None):
+    lib = lib or library.Library(path=str(tmp_path / "library.json"))
+    scanner = scanner or library.Scanner(_FakeScanAPI(tree), _DisabledTMDB(), lib,
+                                         throttle=0, cache=_cache(tmp_path))
+    kw = {} if scope is None else {"scope": scope}
+    asyncio.run(scanner.scan(list(drives),
+                             drive_sections=sections_map or _ent(*drives), **kw))
+    return lib, scanner
+
+
+def _season_map(rec):
+    return {s["season"]: [e["file_id"] for e in s["episodes"]]
+            for s in rec["seasons"] if not s.get("extras")}
+
+
+def test_same_show_on_two_drives_merges_to_one_tile(tmp_path):
+    lib, _ = _scan(tmp_path, _cross_tree())
+    recs = lib.titles_list()
+    assert len(recs) == 1
+    r = recs[0]
+    assert r["id"].startswith("grp:") and r["type"] == "show"
+    assert r["title"] == "Show" and r["year"] == 2007
+    assert sorted(r["source_drives"]) == ["dA", "dB"]
+    assert _season_map(r) == {1: ["a11", "a12"], 2: ["a21", "b22"], 3: ["b31"]}
+    assert "_member_ids" not in r
+
+
+def test_merged_id_is_stable_hash_of_key_and_year(tmp_path):
+    import hashlib
+    lib, _ = _scan(tmp_path, _cross_tree())
+    want = "grp:" + hashlib.sha1(b"show|show|2007").hexdigest()[:16]
+    assert lib.titles_list()[0]["id"] == want
+
+
+def test_different_years_stay_two_tiles(tmp_path):
+    tree = _cross_tree(pack_name=_PACK.replace("2007", "2019"))
+    lib, _ = _scan(tmp_path, tree)
+    assert sorted(r["year"] for r in lib.titles_list()) == [2007, 2019]
+
+
+def test_movie_with_same_title_not_merged(tmp_path):
+    tree = _cross_tree()
+    tree["dB"].append(rawfolder("mv", "Show (2007)"))
+    tree["mv"] = [rawfile("mvfile", "Show.2007.1080p.mkv", size=9)]
+    lib, _ = _scan(tmp_path, tree)
+    types = sorted(r["type"] for r in lib.titles_list())
+    assert types == ["movie", "show"]
+
+
+def test_same_show_in_two_tabs_not_merged(tmp_path):
+    sections.set_tabs([_tab("taba", "entertainment"), _tab("tabb", "entertainment")])
+    lib, _ = _scan(tmp_path, _cross_tree(), sections_map={"dA": "taba", "dB": "tabb"})
+    recs = lib.titles_list()
+    assert len(recs) == 2
+    assert {r["section"] for r in recs} == {"taba", "tabb"}
+    assert len({r["id"] for r in recs}) == 2
+
+
+def test_duplicate_episode_deduped_distinct_files_kept(tmp_path):
+    lib, _ = _scan(tmp_path, _cross_tree(dupe=True))
+    r = lib.titles_list()[0]
+    # b21 duplicates a21 (same S02E01, same size) -> dropped; b22 is distinct.
+    assert _season_map(r)[2] == ["a21", "b22"]
+
+
+def test_same_episode_number_different_file_kept():
+    a = {"id": "a", "type": "show", "title": "Show", "year": 2007, "drive_id": "dA",
+         "seasons": [{"season": 1, "episodes": [
+             {"episode": 1, "file_id": "x", "name": "one.mkv", "size": 10}]}]}
+    b = {"id": "b", "type": "show", "title": "Show", "year": 2007, "drive_id": "dB",
+         "seasons": [{"season": 1, "episodes": [
+             {"episode": 1, "file_id": "y", "name": "other.mkv", "size": 99}]}]}
+    out = library.merge_shows_across_drives([a, b])
+    assert len(out) == 1
+    assert [e["file_id"] for e in out[0]["seasons"][0]["episodes"]] == ["x", "y"]
+
+
+def test_scoped_refresh_keeps_merged_show_intact(tmp_path):
+    tree = _cross_tree()
+    lib, scanner = _scan(tmp_path, tree)
+    before = lib.titles_list()[0]["id"]
+    tree["bS3"].append(_ep("b32", 3, 2))
+    _scan(tmp_path, tree, scope=["dB"], scanner=scanner, lib=lib)
+    recs = lib.titles_list()
+    assert len(recs) == 1 and recs[0]["id"] == before
+    assert _season_map(recs[0]) == {1: ["a11", "a12"], 2: ["a21", "b22"],
+                                    3: ["b31", "b32"]}
+    assert sorted(recs[0]["source_drives"]) == ["dA", "dB"]
+    # cache-only rebuild too
+    _scan(tmp_path, tree, scope=[], scanner=scanner, lib=lib)
+    assert len(lib.titles_list()) == 1
+
+
+def test_yearless_merges_only_with_single_candidate_year():
+    def show(i, title, year, drive):
+        return {"id": i, "type": "show", "title": title, "year": year,
+                "drive_id": drive, "seasons": []}
+    # one dated candidate -> the yearless record joins it
+    out = library.merge_shows_across_drives(
+        [show("a", "Show", 2007, "d1"), show("b", "Show S01-s07", None, "d2")])
+    assert len(out) == 1 and out[0]["year"] == 2007
+    # two dated candidates -> ambiguous, nothing merges
+    out = library.merge_shows_across_drives(
+        [show("a", "Show", 2007, "d1"), show("c", "Show", 2019, "d3"),
+         show("b", "Show", None, "d2")])
+    assert len(out) == 3
+    # no years anywhere -> title match merges
+    out = library.merge_shows_across_drives(
+        [show("a", "Show", None, "d1"), show("b", "Show Complete Series", None, "d2")])
+    assert len(out) == 1
+
+
+def test_two_drive_is_the_show_records_never_merge_each_other():
+    def drive_show(drive):
+        import hashlib
+        return {"id": "grp:" + hashlib.sha1(("drive:" + drive).encode()).hexdigest()[:16],
+                "type": "show", "title": "Show", "year": None, "drive_id": drive,
+                "seasons": []}
+    out = library.merge_shows_across_drives([drive_show("d1"), drive_show("d2")])
+    assert len(out) == 2
+
+
+def test_metadata_carried_to_merged_show_from_member_ids(tmp_path):
+    tree = _cross_tree()
+    lib, scanner = _scan(tmp_path, tree)
+    merged_id = lib.titles_list()[0]["id"]
+    # Simulate the pre-merge library: two tiles keyed by their old ids, the
+    # nested clean one already posterised and stamped.
+    old = {
+        "aShow": {"id": "aShow", "type": "show", "title": "Show", "year": 2007,
+                  "section": "entertainment", "poster": "p.jpg", "tmdb_id": 7,
+                  "category": "show", "added_at": 111.0, "seasons": []},
+        "bShow": {"id": "bShow", "type": "show", "title": "Show Season 1-7 S01-s07",
+                  "year": 2007, "section": "entertainment", "poster": None,
+                  "added_at": 222.0, "seasons": []},
+    }
+    lib.replace(old)
+    _scan(tmp_path, tree, scope=[], scanner=scanner, lib=lib)
+    r = lib.get(merged_id)
+    assert r["poster"] == "p.jpg" and r["tmdb_id"] == 7 and r["category"] == "show"
+    assert r["added_at"] == 111.0
+
+
+def test_metadata_not_carried_across_tab_or_different_show():
+    new = {"n": {"id": "n", "title": "Show", "section": "taba", "poster": None,
+                 "_member_ids": ["o1", "o2"]}}
+    old = {"o1": {"id": "o1", "title": "Show", "section": "tabb", "poster": "x.jpg"},
+           "o2": {"id": "o2", "title": "Other Show", "section": "taba", "poster": "y.jpg"}}
+    library.merge_existing_metadata(old, new)
+    assert not new["n"]["poster"]
