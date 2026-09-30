@@ -669,6 +669,59 @@ def find_incomplete_markers(path, limit=5):
     return found[:limit]
 
 
+def read_files_from(list_path):
+    """Relative paths listed in a --files-from file (one per line, blanks
+    dropped). Mirrors what rclone's --files-from reads, so the marker check and
+    size pre-flight inspect exactly the files rclone will send."""
+    with open(list_path, encoding="utf-8") as f:
+        return [ln.rstrip("\r\n") for ln in f if ln.strip()]
+
+
+def find_incomplete_markers_listed(src, rels, limit=5):
+    """`--files-from` variant of find_incomplete_markers: only the LISTED files
+    are inspected (a name that itself ends in a marker suffix, or a
+    "<file>+suffix" sibling, case-insensitively). A torrent with unselected
+    files keeps a "<name>.part" for each of them forever, so the whole-tree scan
+    would refuse every partial upload; the caller has already verified the
+    listed files are complete."""
+    found = []
+    for rel in rels:
+        fp = os.path.join(src, rel)
+        d, base = os.path.split(fp)
+        if base.lower().endswith(INCOMPLETE_SUFFIXES):
+            found.append(fp)
+        else:
+            want = {(base + suf).lower() for suf in INCOMPLETE_SUFFIXES}
+            try:
+                names = os.listdir(d or ".")
+            except OSError:
+                names = []
+            found.extend(os.path.join(d, n) for n in names
+                         if n.lower() in want)
+        if len(found) >= limit:
+            break
+    return found[:limit]
+
+
+def build_up_argv(action, src, target, flags, is_dir, files_from=None):
+    """The rclone argv for one `up` src (pure, so it is unit-testable).
+
+    A dir MOVE also prunes the emptied source tree. `files_from` (copy only)
+    restricts the transfer to the paths listed in that file, relative to src."""
+    c = [RCLONE, action, src, target]
+    c += list(flags)
+    # A dir move leaves the (now-empty) source directory tree behind;
+    # ask rclone to prune it (harmless redundancy -- cmd_up's own walk is
+    # the real guarantee, since rclone leaves the top-level src dir
+    # regardless).
+    if is_dir and action == "move":
+        c += ["--delete-empty-src-dirs"]
+    if files_from:
+        c += ["--files-from", files_from]
+    c += ["-P"]
+    return c
+
+
 def local_size(path):
     """Total bytes at path (recursive for a dir, just getsize for a file).
     Equivalent of offload_app.tree_size: 0-tolerant on OSError per entry, so
@@ -778,6 +831,23 @@ def cmd_up(cfg, args):
     action = "copy" if args.keep else "move"
     no_overflow = getattr(args, "no_overflow", False)
 
+    # --files-from: upload only the listed files of ONE directory, as a COPY.
+    # It exists for offload_app's partial-torrent mode (season-by-season
+    # downloads): the files land at <drive>/<dirname>/<rel>, exactly where a
+    # later whole-dir move would put them, so that move dedups them.
+    files_from = getattr(args, "files_from", None)
+    listed = None
+    if files_from:
+        if not args.keep or len(srcs) != 1 or not os.path.isdir(srcs[0]):
+            err("Error: --files-from needs --keep and exactly one directory "
+                "path.")
+            return 2
+        try:
+            listed = read_files_from(files_from)
+        except OSError as e:
+            err("Error: cannot read --files-from %s: %s" % (files_from, e))
+            return 1
+
     # --no-overflow: today's exact one-time resolve, kept byte-identical to
     # legacy (pre-overflow-routing) behavior -- one fixed destination for
     # every src, no cap check, no rerouting.
@@ -801,7 +871,8 @@ def cmd_up(cfg, args):
         # deleted the local copy. Applies to copy too: copying a truncated
         # .part still pollutes the drive. --allow-partial is the escape hatch.
         if not getattr(args, "allow_partial", False):
-            markers = find_incomplete_markers(src)
+            markers = (find_incomplete_markers_listed(src, listed)
+                       if listed is not None else find_incomplete_markers(src))
             if markers:
                 err("Error: %s looks like an incomplete download (found %s); "
                     "skipping. Re-run with --allow-partial to force." %
@@ -812,7 +883,13 @@ def cmd_up(cfg, args):
         if no_overflow:
             target_name = name
         else:
-            payload_bytes = local_size(src)
+            if listed is not None:
+                # Size only what will be sent, or a big unselected remainder
+                # would mis-route the upload to an overflow drive.
+                payload_bytes = sum(local_size(os.path.join(src, r))
+                                    for r in listed)
+            else:
+                payload_bytes = local_size(src)
             try:
                 target_name, drive_id = pick_destination(
                     cfg, name, payload_bytes, usage_cache)
@@ -838,16 +915,8 @@ def cmd_up(cfg, args):
             return d
 
         def cmd_for(t):
-            c = [RCLONE, action, src, t]
-            c += list(cfg["rclone_flags"])
-            # A dir move leaves the (now-empty) source directory tree behind;
-            # ask rclone to prune it (harmless redundancy — the walk below is
-            # the real guarantee, since rclone leaves the top-level src dir
-            # regardless).
-            if is_dir and action == "move":
-                c += ["--delete-empty-src-dirs"]
-            c += ["-P"]
-            return c
+            return build_up_argv(action, src, t, cfg["rclone_flags"], is_dir,
+                                 files_from)
 
         target = target_for(dest)
         cmd = cmd_for(target)
@@ -963,6 +1032,11 @@ def main():
     p_up.add_argument("--no-overflow", action="store_true",
                       help="disable 100 GB overflow routing; upload straight "
                            "to the named drive exactly as before this feature")
+
+    p_up.add_argument("--files-from", metavar="FILE", default=None,
+                      help="upload only the files listed in FILE (paths "
+                           "relative to the single directory argument); "
+                           "requires --keep")
 
     args = parser.parse_args()
     cfg = load_config()
