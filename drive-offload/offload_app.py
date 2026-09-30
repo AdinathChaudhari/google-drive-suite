@@ -275,7 +275,10 @@ def read_recover_config(path=CONFIG_FILE):
 # fills the disk, because partial mode only COPIES finished files.
 DEFAULT_PARTIAL_CFG = {"partial_free_after_upload": True,
                        "partial_auto_advance": True,
-                       "partial_free_margin_gb": 5}
+                       "partial_free_margin_gb": 5,
+                       # "file": free each uploaded file as soon as it is
+                       # verified (D-023); "folder": only whole season folders.
+                       "partial_free_mode": "file"}
 
 
 def read_partial_config(path=CONFIG_FILE):
@@ -292,6 +295,8 @@ def read_partial_config(path=CONFIG_FILE):
         m = data.get("partial_free_margin_gb")
         if isinstance(m, (int, float)) and not isinstance(m, bool) and m >= 0:
             cfg["partial_free_margin_gb"] = m
+        if data.get("partial_free_mode") in ("file", "folder"):
+            cfg["partial_free_mode"] = data["partial_free_mode"]
     except (OSError, ValueError, TypeError, AttributeError):
         pass
     return cfg
@@ -934,6 +939,19 @@ def safe_child_dir(path, parent):
     return os.path.isdir(rp) and rp != rt and os.path.dirname(rp) == rt
 
 
+def _plain_file_inside(fp, root):
+    """True only for a regular, non-symlink file whose resolved location is
+    strictly inside the resolved `root`. The gate in front of every per-file
+    delete."""
+    try:
+        if os.path.islink(fp) or not os.path.isfile(fp):
+            return False
+        rp, rt = os.path.realpath(fp), os.path.realpath(root)
+    except OSError:
+        return False
+    return rp.startswith(rt + os.sep)
+
+
 def tree_leftovers(root, uploaded):
     """Regular files under `root` that are NOT accounted for: neither in
     `uploaded` (relative paths) nor the ".part" marker of one that is. Empty
@@ -1517,7 +1535,10 @@ class Poller:
         self.partial_cfg = {"partial_free_after_upload": False,
                             "partial_auto_advance": False,
                             "partial_free_margin_gb":
-                            DEFAULT_PARTIAL_CFG["partial_free_margin_gb"]}
+                            DEFAULT_PARTIAL_CFG["partial_free_margin_gb"],
+                            # bare Poller = old folder-only behaviour; the app
+                            # passes read_partial_config() (default "file")
+                            "partial_free_mode": "folder"}
         self.partial_cfg.update(partial_cfg or {})
         # list_cb(drive, hashes) -> lsjson entries of the WHOLE drive | None
         self.list_cb = list_cb or list_drive_files
@@ -1724,6 +1745,10 @@ class Poller:
         uploaded = set(rec.get("uploaded_files") or [])
         drive = rec["choice"][len("drive:"):]
         if cfg["partial_free_after_upload"]:
+            if (cfg["partial_free_mode"] == "file"
+                    and self._poll_free_files(dl, gid, name, rec, path,
+                                              uploaded, drive)):
+                return
             if self._poll_free(dl, gid, name, rec, path, uploaded, drive):
                 return
             if self._poll_done(dl, gid, name, path, uploaded, drive):
@@ -1758,6 +1783,80 @@ class Poller:
             finally:
                 self._uploading.discard(gid)
         self._spawn(run)
+
+    def _poll_free_files(self, dl, gid, name, rec, path, uploaded, drive):
+        """Per-file freeing (D-023): every file that is selected, complete, in
+        `uploaded` and present locally as a plain file inside the torrent
+        root is verified, unticked and deleted in ONE task. Runs before the
+        folder step so space frees continuously. True when dispatched."""
+        ents = []
+        for i, f in enumerate(dl.get("files") or []):
+            p = f.get("path")
+            if not p or not _file_selected(f) or not _file_complete(f):
+                continue
+            rel = os.path.relpath(p, path)
+            if (rel == os.pardir or rel.startswith(os.pardir + os.sep)
+                    or rel not in uploaded):
+                continue
+            if _plain_file_inside(os.path.join(path, rel), path):
+                ents.append((i, rel, f))
+        if not ents:
+            return False
+        size = sum(int(f.get("length") or 0) for _i, _r, f in ents)
+        log("FREE files start gid=%s %d files (%s)" %
+            (gid, len(ents), human_size(size)))
+        self._dispatch_folder_task(
+            gid, name, lambda: self._free_files_work(gid, name, path, ents,
+                                                     size, drive))
+        return True
+
+    def _free_files_work(self, gid, name, path, ents, size, drive):
+        """verify on drive -> untick -> confirm -> delete each file -> rmdir
+        emptied parents. None on success, else why nothing (more) was
+        deleted. Untick BEFORE delete: Transmission stops the torrent when
+        selected files vanish."""
+        rec = self.store.get(gid) or {}
+        items = [(rel, file_drive(rec, rel, drive)) for _i, rel, _f in ents]
+        ok, detail = self.verify_cb(path, items)
+        if not ok:
+            return "verify failed for %d files: %s" % (len(ents), detail)
+        idx = [i for i, _r, _f in ents]
+        eng = self.client.for_gid(gid)
+        eng.set_files_wanted(gid, idx, False)
+        wanted = eng.get_files_wanted(gid)
+        if len(wanted) <= max(idx) or any(wanted[i] for i in idx):
+            return "untick of %d files not confirmed by the engine" % len(ents)
+        deleted, freed_size, errs = 0, 0, []
+        for _i, rel, f in ents:
+            fp = os.path.join(path, rel)
+            if not _plain_file_inside(fp, path):   # re-check right before
+                errs.append("%r: path changed" % rel)
+                continue
+            try:
+                os.remove(fp)
+            except OSError as e:
+                errs.append("%r: %s" % (rel, e))
+                continue
+            deleted += 1
+            freed_size += int(f.get("length") or 0)
+            d = os.path.dirname(fp)
+            while d != path and d.startswith(path + os.sep):
+                try:
+                    os.rmdir(d)            # only ever an EMPTY dir
+                except OSError:
+                    break
+                d = os.path.dirname(d)
+        if deleted:
+            drives = sorted({d for _r, d in items})
+            log("FREE files gid=%s %d files (%s) verified+unticked+deleted" %
+                (gid, deleted, human_size(freed_size)))
+            self.notify_cb("Files freed", name,
+                           "Freed %d files (%s) — on %s" %
+                           (deleted, human_size(freed_size),
+                            ", ".join(drives)))
+        if errs:
+            return "could not delete %d files (e.g. %s)" % (len(errs), errs[0])
+        return None
 
     def _poll_free(self, dl, gid, name, rec, path, uploaded, drive):
         """Free the first season folder whose files are ALL selected and ALL

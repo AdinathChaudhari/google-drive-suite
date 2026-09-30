@@ -98,6 +98,24 @@ The free step also refuses a folder holding a local file that is not one of the 
 files. `_untick_absent_work` (nothing local to delete) is size-only: same basename +
 exact size on that file's drive.
 
+**Per-file freeing (D-023, `partial_free_mode`: `"file"` default | `"folder"`).** With
+`partial_free_after_upload` on and mode `"file"`, `_poll_folders` runs `_poll_free_files`
+BEFORE the folder free step: every file that is selected, complete, in `uploaded_files` and
+present as a regular non-symlink file whose realpath is strictly inside the torrent root
+(`_plain_file_inside`; root-level files included, the root itself never deleted) goes into
+ONE task (same `_dispatch_folder_task` / `_uploading` guard): content verify of the whole
+set (`file_drive` per file) -> `set_files_wanted(False)` -> `get_files_wanted` must show all
+unwanted -> per file re-check `_plain_file_inside` then `os.remove` -> `os.rmdir` (never
+rmtree) up the emptied parents, stopping at the root. Notifies once per batch ("Files
+freed"). Any failure = `record_free_failure`, and a failed verify/untick deletes nothing.
+The folder logic sits on top unchanged: a folder whose files are all uploaded + unticked +
+absent is recorded freed by the absent path; if Transmission recreates a boundary
+`<name>.part` the dir exists again, and advance (skips folders with uploaded files) and
+done (`tree_leftovers` accepts `.part` of uploaded files) still work. Advance is still
+sequential (selection complete, no copy owed) but now fires right after the last episode
+is freed. A bare `Poller` defaults to `"folder"` (so old tests/callers are unchanged);
+`read_partial_config()` (the app) defaults to `"file"`. Folder mode = pre-D-023 behaviour.
+
 ## yt-video
 
 `yt-video` is the SINGLE-video sibling to `yt-show`: download one YouTube video

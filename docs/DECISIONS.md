@@ -61,6 +61,7 @@ than no entry.
 | [D-020](#d-020--a-season-by-season-torrent-is-copied-as-it-finishes-moved-only-at-the-end) | A season-by-season torrent is copied as it finishes, moved only at the end | Adopted | drive-offload |
 | [D-021](#d-021--each-season-folder-is-freed-once-it-is-verifiably-on-the-drive-then-the-next-one-starts) | Each season folder is freed once it is verifiably on the drive, then the next one starts | Adopted | drive-offload |
 | [D-022](#d-022--partial-batches-overflow-across-drives-and-verification-is-by-content-not-path) | Partial batches overflow across drives, and verification is by content, not path | Adopted | drive-offload |
+| [D-023](#d-023--files-are-freed-one-by-one-as-soon-as-they-are-verifiably-on-the-drive) | Files are freed one by one as soon as they are verifiably on the drive | Adopted | drive-offload |
 
 ---
 
@@ -782,3 +783,39 @@ than no entry.
   freed) should learn about files on other drives: it dedups only against the
   drive todrive routes it to, so files copied elsewhere can be re-sent. Also if
   a drive grows large enough that a whole-drive listing per attempt is slow.
+
+### D-023 — Files are freed one by one as soon as they are verifiably on the drive
+**Status:** Adopted · **When:** 2026-09-30
+
+- **Hit** — D-021 frees a season only when its whole folder is uploaded. While one
+  episode of a season is still downloading, every finished, uploaded episode of
+  that season keeps occupying local disk, so the disk fills before the folder
+  can be freed and sequential downloading stalls.
+- **Learned** — the safety argument of D-021 (verify on the drive, untick and
+  confirm before delete, only delete what is inside the torrent root) does not
+  depend on the folder being the unit; it applies to any set of files that are
+  all uploaded. Unticking a file whose data is already complete does not
+  disturb the rest of the torrent.
+- **Did** — new config key `partial_free_mode` (`"file"` default, `"folder"` =
+  D-021 only; needs `partial_free_after_upload`). In `"file"` mode
+  `_poll_folders` first collects every file that is selected, complete, in
+  `uploaded_files` and a regular non-symlink file whose realpath is strictly
+  inside the torrent root (root-level files allowed, the root never deleted),
+  and dispatches ONE task under the usual `_uploading` guard: location-agnostic
+  content verify of the whole set, `set_files_wanted(False)` with
+  `get_files_wanted` confirmation, then per file a fresh inside-root check,
+  `os.remove`, and `os.rmdir` (never rmtree) of emptied parents up to the root.
+  One notification per batch. Any failure deletes nothing further and backs off
+  in the `free_*` keys. The folder free/absent/done/advance steps are untouched:
+  a folder with all files uploaded, unticked and absent is recorded freed by the
+  absent path, and a recreated boundary `.part` is tolerated by advance (skips
+  folders with uploaded files) and done (`tree_leftovers` accepts the `.part` of
+  an uploaded file). A bare `Poller` defaults to `"folder"`, the app to `"file"`.
+- **Where** — `drive-offload/offload_app.py` § `read_partial_config` /
+  `Poller._poll_free_files` / `_free_files_work` / `_plain_file_inside`;
+  `drive-offload/test_offload_app.py` § `TestFreePerFile` /
+  `TestFreePerFileAdvance` (mutation-checked: skipping the verify, the untick
+  confirmation, the inside-root check, the symlink check, unticking after the
+  delete, and rmdir->rmtree each fails a test).
+- **Revisit when** — many small files make a per-batch whole-drive listing
+  (one per drive per batch) too slow, or a batch should be capped in size.
