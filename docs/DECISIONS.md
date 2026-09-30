@@ -60,6 +60,7 @@ than no entry.
 | [D-019](#d-019--forgetting-a-decision-means-scrubbing-it-not-deleting-it) | Forgetting a decision means scrubbing it, not deleting it | Adopted | drive-offload |
 | [D-020](#d-020--a-season-by-season-torrent-is-copied-as-it-finishes-moved-only-at-the-end) | A season-by-season torrent is copied as it finishes, moved only at the end | Adopted | drive-offload |
 | [D-021](#d-021--each-season-folder-is-freed-once-it-is-verifiably-on-the-drive-then-the-next-one-starts) | Each season folder is freed once it is verifiably on the drive, then the next one starts | Adopted | drive-offload |
+| [D-022](#d-022--partial-batches-overflow-across-drives-and-verification-is-by-content-not-path) | Partial batches overflow across drives, and verification is by content, not path | Adopted | drive-offload |
 
 ---
 
@@ -659,6 +660,7 @@ than no entry.
   every later batch and the final pass pass `--no-overflow` to that drive. Cost:
   if the pinned drive fills, that upload fails as quota (terminal until a manual
   re-pick, which clears the pin and re-uploads to the new drive).
+  **Superseded by D-022:** the pin was dropped; batches now overflow.
 - **Where** — `drive-offload/offload_app.py` § `is_partial_selection` /
   `pending_partial_files` / `final_pass_plan` / `Poller._poll_partial` /
   `Poller.upload_partial_done` / `DecisionStore.add_partial_upload` /
@@ -724,3 +726,59 @@ than no entry.
   a re-pick of a different drive keeps `freed_folders` but drops
   `uploaded_files`, so freed folders are not re-uploaded (their data only exists
   on the old drive).
+
+### D-022 — Partial batches overflow across drives, and verification is by content, not path
+**Status:** Adopted · **When:** 2026-09-30
+
+- **Hit** — two failures of the live app on the 179 GB torrent ("Show (2007)")
+  going to shared drives capped at ~100 GB. (A) D-020 pinned every batch after
+  the first to the drive the first batch landed on, with `--no-overflow`. Once
+  that drive filled, Google returned `storageQuotaExceeded`, the batch went
+  terminal, and the torrent was stuck: a torrent larger than one drive can
+  never fit under a pin. (B) Something outside the app moved uploaded files on
+  the drive from `<torrent dir>/Season N/<file>` into a renamed folder such as
+  `<Show (2007)>/Season N/<file>` on the SAME drive. D-021's `rclone check
+  --one-way <local folder> <remote>:<torrent dir>/<folder>` then failed forever
+  ("file not in Google drive root") although the file was on the drive with
+  identical content; the untick-absent size check on the torrent-dir path failed
+  the same way.
+- **Learned** — a drive is a capacity bucket, not an identity: one torrent
+  legitimately spans several, so "which drive" is a per-FILE fact, not a
+  per-torrent one. And a path is not evidence of content: anything else that
+  touches the drive (a renamer, the user) invalidates every path-based check,
+  while name + size + md5 survive a move. Verification must therefore answer
+  "does an identical file exist on this file's drive", never "does it exist
+  where I put it".
+- **Did** — (A) partial batches always ask the CHOICE drive with no
+  `--no-overflow`; todrive routes to the first of `[X, "X overflow", ...]` with
+  room. The decision record gains `file_drives` {rel: drive}: each successful
+  batch maps every rel in it to the drive it landed on (`ROUTED:` line, else the
+  asked drive). Legacy rels with no entry resolve to `partial_drive`, else the
+  choice drive (and a new batch backfills them before `partial_drive` moves on).
+  `partial_drive` is still written but pins nothing; the final whole-dir pass
+  also asks the choice drive unpinned. A quota failure is still terminal, but
+  overflow should prevent it. (B) `verify_files_on_drives` replaces `rclone
+  check` for both the free step and the done step: per drive, ONE whole-drive
+  `rclone lsjson -R --files-only --hash --hash-type md5`, indexed by basename;
+  each local file needs a same-basename remote entry with identical size AND
+  md5. Listing failure, unreadable local file, or a same-name same-size remote
+  with no md5 = not ok (never delete on doubt). The free step additionally
+  refuses a folder containing a local file that is not one of the torrent's
+  files (rclone check used to cover that). `_untick_absent_work` deletes nothing,
+  so it is size-only: same basename and exact size on the file's drive.
+  Cost: a whole-drive listing per drive per free/done attempt (metadata only),
+  and two different files with the same name, size and content are
+  interchangeable by design.
+- **Where** — `drive-offload/offload_app.py:857` `file_drive`,
+  `:988` `list_drive_files`, `:1039` `verify_files_on_drives`,
+  `:1270` `DecisionStore.add_partial_upload`, `:1672` `Poller._poll_partial`,
+  `:1803` `_free_work`, `:1840` `_untick_absent_work`, `:1894` `_done_work`,
+  `:3068` `perform_partial_upload`; `drive-offload/test_offload_app.py` §
+  `TestPartialPoll` / `TestLocationAgnosticVerify` / `TestVerifyFilesOnDrives`
+  (mutation-checked: skipping the md5 compare, the size compare, the per-file
+  drive, the listing-failure guard, the untick-absent size check, the legacy
+  backfill, or re-adding `--no-overflow` each fails a test).
+- **Revisit when** — the whole-dir final move (reached only when nothing was
+  freed) should learn about files on other drives: it dedups only against the
+  drive todrive routes it to, so files copied elsewhere can be re-sent. Also if
+  a drive grows large enough that a whole-drive listing per attempt is slow.

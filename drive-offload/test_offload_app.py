@@ -7,6 +7,7 @@ imported by importing offload_app — the UI import is lazy inside _run_app):
     .venv/bin/python3 test_offload_app.py
 """
 import email.message
+import hashlib
 import json
 import os
 import shutil
@@ -3258,7 +3259,7 @@ class PartialBase(unittest.TestCase):
 
     def finish_partial(self, success=True, quota=False):
         """Play the worker: report the last dispatched batch's outcome."""
-        _path, drive, gid, _name, rels, _pinned = self.partials[-1]
+        _path, drive, gid, _name, rels = self.partials[-1]
         final = app.parse_routed_drive("", drive)
         self.poller.upload_partial_done(gid, success, rels, final, quota=quota)
 
@@ -3382,9 +3383,9 @@ class TestPartialPoll(PartialBase):
         self.set_state(S1 | S3, S1, status=4)
         self.poller.poll_once()
         self.assertEqual(len(self.partials), 1)
-        path, drive, gid, _name, rels, pinned = self.partials[0]
+        path, drive, gid, _name, rels = self.partials[0]
         self.assertEqual(path, self.top())
-        self.assertEqual((drive, gid, pinned), ("Films", "tm-pt1", False))
+        self.assertEqual((drive, gid), ("Films", "tm-pt1"))
         self.assertEqual(sorted(rels), ["S1/e1.mkv", "S1/e2.mkv"])
         # copy, never move: no whole-dir dispatch, no engine stop/remove
         self.assertEqual(self.moves, [])
@@ -3424,23 +3425,72 @@ class TestPartialPoll(PartialBase):
         self.set_state(S1 | S2, S1 | S2, status=6, left=0)
         self.poller.poll_once()
         self.assertEqual(len(self.partials), 2)
-        rels, pinned = self.partials[1][4], self.partials[1][5]
+        rels = self.partials[1][4]
         self.assertEqual(sorted(rels), ["S2/e1.mkv", "S2/e2.mkv"])
-        self.assertTrue(pinned)               # drive pinned after batch 1
         self.finish_partial()
         self.assertEqual(len(self.store.get("tm-pt1")["uploaded_files"]), 4)
         self.assertEqual(self.moves, [])
         self.assertEqual(self.calls, [])
 
-    def test_later_batches_target_the_drive_batch_one_landed_on(self):
+    def test_later_batch_after_overflow_is_not_pinned(self):
+        # D-022: batch 1 overflowed to "Films overflow"; batch 2 still asks the
+        # CHOICE drive (todrive routes it) and never passes --no-overflow.
         self.set_state(S1 | S3, S1)
         self.poller.poll_once()
-        _p, _d, gid, _n, rels, _pin = self.partials[0]
-        self.poller.upload_partial_done(gid, True, rels, "Films 2")  # routed
+        _p, _d, gid, _n, rels = self.partials[0]
+        self.poller.upload_partial_done(gid, True, rels, "Films overflow")
         self.set_state(S1 | S2, S1 | S2)
         self.poller.poll_once()
-        self.assertEqual(self.partials[1][1], "Films 2")   # not the choice
-        self.assertTrue(self.partials[1][5])                # pinned
+        self.assertEqual(len(self.partials[1]), 5)          # no pinned flag
+        self.assertEqual(self.partials[1][1], "Films")      # the choice drive
+        seen = {}
+
+        def fake_up(p, d, bw, progress_cb=None, **kw):
+            seen.update(drive=d, kw=kw)
+            return 0, ""
+        app.perform_partial_upload(self.top(), self.partials[1][1],
+                                   self.partials[1][4], todrive_up=fake_up)
+        self.assertEqual(seen["drive"], "Films")
+        self.assertNotIn("no_overflow", seen["kw"])
+
+    def test_overflow_batch_records_the_routed_drive_per_file(self):
+        self.set_state(S1 | S3, S1)
+        self.poller.poll_once()
+        _p, drive, gid, _n, rels = self.partials[0]
+        routed = app.parse_routed_drive(
+            "ROUTED: %s -> Films overflow\nOK" % self.top(), drive)
+        self.poller.upload_partial_done(gid, True, rels, routed)
+        rec = self.store.get(gid)
+        self.assertEqual(rec["file_drives"],
+                         {"S1/e1.mkv": "Films overflow",
+                          "S1/e2.mkv": "Films overflow"})
+        self.assertEqual(rec["partial_drive"], "Films overflow")   # compat
+        self.assertIn("Films overflow", self.notes[-1][2])         # names it
+        # batch 2 lands on the first drive again: per-file map keeps both
+        self.set_state(S1 | S2, S1 | S2)
+        self.poller.poll_once()
+        _p, _d, gid, _n, rels2 = self.partials[1]
+        self.poller.upload_partial_done(gid, True, rels2, "Films")
+        fd = self.store.get(gid)["file_drives"]
+        self.assertEqual(fd["S1/e1.mkv"], "Films overflow")
+        self.assertEqual(fd["S2/e1.mkv"], "Films")
+        # persisted
+        self.assertEqual(app.DecisionStore(self.dpath).get(gid)["file_drives"],
+                         fd)
+
+    def test_legacy_record_resolves_to_partial_drive_then_choice(self):
+        rec = {"choice": "drive:Films", "partial_drive": "Films 2",
+               "uploaded_files": ["a"], "file_drives": {"b": "Films 3"}}
+        self.assertEqual(app.file_drive(rec, "a", "Films"), "Films 2")
+        self.assertEqual(app.file_drive(rec, "b", "Films"), "Films 3")
+        self.assertEqual(app.file_drive({"uploaded_files": ["a"]}, "a",
+                                        "Films"), "Films")
+        # a new overflow batch must not re-home legacy rels
+        self.store.get("tm-pt1").update(uploaded_files=["a"],
+                                        partial_drive="Films")
+        self.store.add_partial_upload("tm-pt1", ["b"], "Films overflow")
+        fd = self.store.get("tm-pt1")["file_drives"]
+        self.assertEqual(fd, {"a": "Films", "b": "Films overflow"})
 
     def test_nothing_pending_does_nothing_and_not_handled(self):
         self.set_state(S1, set(), status=4)      # nothing finished yet
@@ -3474,7 +3524,7 @@ class TestPartialPoll(PartialBase):
         # batch 1 lands on an overflow drive
         self.set_state(S1 | S3, S1)
         self.poller.poll_once()
-        _p, _d, gid, _n, rels, _pin = self.partials[0]
+        _p, _d, gid, _n, rels = self.partials[0]
         self.poller.upload_partial_done(gid, True, rels, "Films 2")
         self.assertEqual(self.store.get(gid)["partial_drive"], "Films 2")
         # everything selected and complete -> not partial anymore
@@ -3485,12 +3535,12 @@ class TestPartialPoll(PartialBase):
         self.assertEqual(len(self.moves), 1)        # the existing move path
         path, drive, mgid, _name = self.moves[0]
         self.assertEqual((path, mgid), (self.top(), gid))
-        self.assertEqual(drive, "Films 2")          # pinned to the copy drive
-        # worker-side plan: skip the rename hook, pin the drive
+        self.assertEqual(drive, "Films")            # choice drive, not pinned
+        # worker-side plan: skip the rename hook, no pin
         rename_cfg = {"enabled": True, "dry_run": False}
         plan = app.final_pass_plan(self.store.get(gid), drive, rename_cfg)
-        self.assertEqual(plan, ("Films 2", None, True))
-        # ...and perform_upload really does the whole-dir move with the pin
+        self.assertEqual(plan, ("Films", None))
+        # ...and perform_upload really does the whole-dir move, unpinned
         seen = {}
 
         def fake_up(p, d, bw, progress_cb=None, **kw):
@@ -3498,17 +3548,17 @@ class TestPartialPoll(PartialBase):
             return 0, ""
         rc, _ = app.perform_upload(
             self.client, path, plan[0], gid, todrive_up=fake_up,
-            rename_cfg=plan[1], cache=None, no_overflow=plan[2])
+            rename_cfg=plan[1], cache=None)
         self.assertEqual(rc, 0)
         self.assertEqual(seen["path"], self.top())   # as-is, not renamed
-        self.assertEqual(seen["kw"], {"no_overflow": True})
+        self.assertEqual(seen["kw"], {})
         self.assertEqual(self.calls, [("stop", gid), ("remove", gid)])
 
     def test_final_plan_unchanged_without_partial_uploads(self):
         cfg = {"enabled": True}
         self.assertEqual(app.final_pass_plan({"choice": "drive:A"}, "A", cfg),
-                         ("A", cfg, False))
-        self.assertEqual(app.final_pass_plan(None, "A", cfg), ("A", cfg, False))
+                         ("A", cfg))
+        self.assertEqual(app.final_pass_plan(None, "A", cfg), ("A", cfg))
 
     def test_non_partial_complete_behaves_as_before(self):
         everything = set(_PT_FILES)
@@ -3619,9 +3669,13 @@ class TestPartialPoll(PartialBase):
         self.assertTrue(self.store.requeue("tm-pt1", "drive:Other"))
         self.assertNotIn("uploaded_files", self.store.get("tm-pt1"))
         self.assertNotIn("partial_drive", self.store.get("tm-pt1"))
+        self.assertNotIn("file_drives", self.store.get("tm-pt1"))
         self.store.add_partial_upload("tm-pt1", ["S1/e1.mkv"], "Films")
+        self.assertEqual(self.store.get("tm-pt1")["file_drives"],
+                         {"S1/e1.mkv": "Films"})
         self.store.forget("tm-pt1")
         self.assertNotIn("uploaded_files", self.store.get("tm-pt1"))
+        self.assertNotIn("file_drives", self.store.get("tm-pt1"))
 
 
 class TestPerformPartialUpload(unittest.TestCase):
@@ -3641,9 +3695,6 @@ class TestPerformPartialUpload(unittest.TestCase):
         self.assertTrue(seen["kw"]["keep"])
         self.assertNotIn("no_overflow", seen["kw"])
         self.assertFalse(os.path.exists(seen["kw"]["files_from"]))  # cleaned
-        app.perform_partial_upload("/dl/Show", "Films", ["a"],
-                                   todrive_up=fake_up, pinned=True)
-        self.assertTrue(seen["kw"]["no_overflow"])
 
     def test_parse_routed_drive(self):
         self.assertEqual(app.parse_routed_drive("x\nOK: y", "A"), "A")
@@ -3792,6 +3843,14 @@ def _fl(folder):
 
 
 GIB = 1024 ** 3
+_MD5 = hashlib.md5(b"x" * 10).hexdigest()    # what PartialBase.write() writes
+
+
+def _entry(path, size=10, md5=_MD5):
+    e = {"Path": path, "Name": os.path.basename(path), "Size": size}
+    if md5 is not None:
+        e["Hashes"] = {"md5": md5}
+    return e
 
 
 class FakeFolderEngine:
@@ -3839,6 +3898,8 @@ class FolderBase(PartialBase):
         self.wanted, self.have = set(), set()
         self.events = []
         self.verifies = []
+        self.listed = []       # (drive, hashes) per lister call
+        self.remote = {}       # drive -> lsjson entries | None
         self.verify_result = (True, "ok")
         self.remove_is_noop = False
         self.engine = FakeFolderEngine(self)
@@ -3847,11 +3908,16 @@ class FolderBase(PartialBase):
         self.ran = []
         self.poller = self._fl_poller(self.store, spawn=lambda fn: fn())
 
-    def _fl_poller(self, store, spawn, cfg=None):
-        def verify(local, drive, subpath, excludes):
-            self.verifies.append((local, drive, subpath, tuple(excludes)))
-            self.events.append(("verify", os.path.basename(local),
-                                os.path.exists(local)))
+    def lister(self, drive, hashes=True):
+        self.listed.append((drive, hashes))
+        return self.remote.get(drive)
+
+    def _fl_poller(self, store, spawn, cfg=None, real_verify=False):
+        def verify(root, items):
+            self.verifies.append((root, sorted(items)))
+            self.events.append(("verify", os.path.basename(root),
+                                all(os.path.exists(os.path.join(root, r))
+                                    for r, _d in items)))
             return self.verify_result
         return app.Poller(
             self.client, store, ask_cb=lambda g, n: "local",
@@ -3860,7 +3926,8 @@ class FolderBase(PartialBase):
             now_fn=lambda: self.now[0],
             partial_upload_cb=lambda *a: self.partials.append(a),
             partial_cfg=cfg if cfg is not None else self.cfg,
-            verify_cb=verify,
+            verify_cb=None if real_verify else verify,
+            list_cb=self.lister,
             disk_usage_cb=lambda p: mock.Mock(free=self.free[0]),
             spawn_cb=spawn)
 
@@ -3890,6 +3957,14 @@ class FolderBase(PartialBase):
             self.store.add_partial_upload("tm-pt1", sorted(uploaded), "Films")
         self.rebuild()
 
+    def _absent_ticked_s3(self, remote):
+        # Season 3 ticked + complete + uploaded, then deleted by hand.
+        # `remote` = {basename: size} of what the drive holds (anywhere), or None.
+        self.set_state(S3F | S4F, S3F, uploaded=S3F)
+        shutil.rmtree(os.path.join(self.top(), "Season 3"))
+        self.remote["Films"] = None if remote is None else [
+            _entry("Moved/Show/" + n, size=sz) for n, sz in remote.items()]
+
     def ops(self, kind):
         return [e for e in self.events if e[0] == kind]
 
@@ -3909,8 +3984,8 @@ class TestFreeAfterUpload(FolderBase):
         self.poller.poll_once()
         # verify on the resolved drive/path, folder still there
         self.assertEqual(self.verifies, [(
-            os.path.join(self.top(), "Season 3"), "Films",
-            "%s/Season 3" % _FL_TOP, ())])
+            self.top(), [("Season 3/e1.mkv", "Films"),
+                         ("Season 3/e2.mkv", "Films")])])
         kinds = [e[0] for e in self.events]
         self.assertEqual(kinds, ["verify", "untick", "confirm"])
         self.assertEqual(self.events[0][2], True)      # existed at check time
@@ -4007,21 +4082,10 @@ class TestFreeAfterUpload(FolderBase):
         self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
                          ["Season 3"])
 
-    def _absent_ticked_s3(self, remote):
-        # Season 3 ticked + complete + uploaded, then deleted by hand.
-        self.set_state(S3F | S4F, S3F, uploaded=S3F)
-        shutil.rmtree(os.path.join(self.top(), "Season 3"))
-        self.listed = []
-
-        def sizes(drive, subpath):
-            self.listed.append((drive, subpath))
-            return remote
-        self.poller.remote_sizes_cb = sizes
-
     def test_ticked_folder_deleted_by_hand_is_unticked(self):
         self._absent_ticked_s3({"e1.mkv": 10, "e2.mkv": 10})
         self.poller.poll_once()
-        self.assertEqual(self.listed, [("Films", "%s/Season 3" % _FL_TOP)])
+        self.assertEqual(self.listed, [("Films", False)])   # one listing, no hashes
         self.assertEqual([e[0] for e in self.events], ["untick", "confirm"])
         self.assertEqual(self.events[0][1], sorted(S3F))
         self.assertTrue(S3F.isdisjoint(self.wanted))
@@ -4051,19 +4115,26 @@ class TestFreeAfterUpload(FolderBase):
         self.assertEqual([e[0] for e in self.events], ["untick", "confirm"])
         self.assertNotIn("freed_folders", self.store.get("tm-pt1"))
 
-    def test_remote_sizes_parses_lsjson(self):
+    def test_list_drive_files_argv_and_failures(self):
         run = mock.Mock(return_value=mock.Mock(
             returncode=0, stdout='[{"Path":"a/e1.mkv","Size":5}]'))
-        got = app.remote_sizes("D", "Top/S", resolve=lambda d: "r:",
-                               runner=run)
-        self.assertEqual(got, {"a/e1.mkv": 5})
+        got = app.list_drive_files("D", resolve=lambda d: "r:", runner=run)
+        self.assertEqual(got, [{"Path": "a/e1.mkv", "Size": 5}])
         self.assertEqual(run.call_args[0][0][1:],
-                         ["lsjson", "-R", "--files-only", "r:Top/S"])
+                         ["lsjson", "-R", "--files-only", "--hash",
+                          "--hash-type", "md5", "r:"])
+        app.list_drive_files("D", hashes=False, resolve=lambda d: "r:",
+                             runner=run)
+        self.assertEqual(run.call_args[0][0][1:],
+                         ["lsjson", "-R", "--files-only", "r:"])
         run.return_value = mock.Mock(returncode=3, stdout="")
-        self.assertIsNone(app.remote_sizes("D", "x", resolve=lambda d: "r:",
-                                           runner=run))
-        self.assertIsNone(app.remote_sizes("D", "x", resolve=lambda d: None,
-                                           runner=run))
+        self.assertIsNone(app.list_drive_files("D", resolve=lambda d: "r:",
+                                               runner=run))
+        self.assertIsNone(app.list_drive_files("D", resolve=lambda d: None,
+                                               runner=run))
+        run.return_value = mock.Mock(returncode=0, stdout="not json")
+        self.assertIsNone(app.list_drive_files("D", resolve=lambda d: "r:",
+                                               runner=run))
 
     def test_freed_folders_survive_restart(self):
         self.set_state(S3F | S4F, S3F, uploaded=S3F)   # Season 4 downloading
@@ -4264,7 +4335,7 @@ class TestPartialDone(FolderBase):
         self._all_on_drive()
         self.poller.poll_once()
         self.assertEqual(self.verifies, [(
-            self.top(), "Films", _FL_TOP, ("*.part",))])
+            self.top(), [("readme.txt", "Films")])])
         self.assertEqual([e[0] for e in self.events], ["verify", "remove"])
         self.assertFalse(os.path.exists(self.top()))
         rec = self.store.get("tm-pt1")
@@ -4382,16 +4453,203 @@ class TestFreedFolderMoveGuard(FolderBase):
         self.assertEqual(len(self.moves), 1)
 
 
-class TestFolderHelpers(unittest.TestCase):
-    def test_rclone_check_argv(self):
-        self.assertEqual(
-            app.rclone_check_argv("/l/S 1", "r,team_drive=ID:", "Show/S 1",
-                                  rclone="rc"),
-            ["rc", "check", "--one-way", "/l/S 1", "r,team_drive=ID:Show/S 1"])
-        self.assertEqual(
-            app.rclone_check_argv("/l", "r:", "Show", ("*.part",))[-2:],
-            ["--exclude", "*.part"])
+class TestLocationAgnosticVerify(FolderBase):
+    """D-022: free/done verify by content (basename+size+md5) anywhere on the
+    file's own drive, real verify_files_on_drives with a fake lister."""
+    cfg = {"partial_free_after_upload": True, "partial_auto_advance": False,
+           "partial_free_margin_gb": 5}
 
+    def setUp(self):
+        super().setUp()
+        self.poller = self._fl_poller(self.store, lambda fn: fn(),
+                                      real_verify=True)
+
+    def _s3(self):
+        self.set_state(S3F | S4F, S3F, uploaded=S3F)   # Season 4 downloading
+
+    def _s3_dir(self):
+        return os.path.join(self.top(), "Season 3")
+
+    def _assert_kept(self):
+        self.assertTrue(os.path.isdir(self._s3_dir()))
+        self.assertEqual(self.ops("untick"), [])
+        self.assertNotIn("freed_folders", self.store.get("tm-pt1"))
+        self.assertEqual(self.store.get("tm-pt1")["free_failures"], 1)
+
+    def test_folder_split_across_two_drives_one_listing_per_drive(self):
+        self._s3()
+        self.store.add_partial_upload("tm-pt1", ["Season 3/e2.mkv"],
+                                      "Films overflow")
+        self.remote["Films"] = [_entry("Season 3/e1.mkv"),
+                                _entry("Other/junk.mkv", size=99)]
+        self.remote["Films overflow"] = [_entry("Show (2007)/Season 3/e2.mkv")]
+        self.poller.poll_once()
+        self.assertEqual(sorted(self.listed),
+                         [("Films", True), ("Films overflow", True)])
+        self.assertFalse(os.path.exists(self._s3_dir()))
+        self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
+                         ["Season 3"])
+
+    def test_wrong_drive_for_a_file_is_not_enough(self):
+        # both files exist on "Films" only, but e2 was recorded on overflow
+        self._s3()
+        self.store.add_partial_upload("tm-pt1", ["Season 3/e2.mkv"],
+                                      "Films overflow")
+        self.remote["Films"] = [_entry("Season 3/e1.mkv"),
+                                _entry("Season 3/e2.mkv")]
+        self.remote["Films overflow"] = []
+        self.poller.poll_once()
+        self._assert_kept()
+
+    def test_moved_by_external_renamer_still_verifies(self):
+        self._s3()
+        self.remote["Films"] = [
+            _entry("Renamed Show (2007)/Season 3/e1.mkv"),
+            _entry("Renamed Show (2007)/Season 3/e2.mkv")]
+        self.poller.poll_once()
+        self.assertFalse(os.path.exists(self._s3_dir()))
+        self.assertEqual([e[0] for e in self.events], ["untick", "confirm"])
+
+    def test_md5_mismatch_deletes_nothing(self):
+        self._s3()
+        self.remote["Films"] = [_entry("Season 3/e1.mkv"),
+                                _entry("Season 3/e2.mkv", md5="0" * 32)]
+        self.poller.poll_once()
+        self._assert_kept()
+
+    def test_size_mismatch_deletes_nothing(self):
+        self._s3()
+        self.remote["Films"] = [_entry("Season 3/e1.mkv"),
+                                _entry("Season 3/e2.mkv", size=9)]
+        self.poller.poll_once()
+        self._assert_kept()
+
+    def test_missing_remote_md5_deletes_nothing(self):
+        self._s3()
+        self.remote["Films"] = [_entry("Season 3/e1.mkv"),
+                                _entry("Season 3/e2.mkv", md5=None)]
+        self.poller.poll_once()
+        self._assert_kept()
+
+    def test_listing_failure_deletes_nothing(self):
+        self._s3()
+        self.remote["Films"] = None
+        self.poller.poll_once()
+        self._assert_kept()
+
+    def test_file_absent_from_drive_deletes_nothing(self):
+        self._s3()
+        self.remote["Films"] = [_entry("Season 3/e1.mkv")]
+        self.poller.poll_once()
+        self._assert_kept()
+
+    def test_same_name_other_folder_duplicate_is_not_a_false_match(self):
+        # e1.mkv exists twice on the drive; only the right content counts
+        self._s3()
+        self.remote["Films"] = [_entry("Season 1/e1.mkv", md5="1" * 32),
+                                _entry("Season 3/e1.mkv"),
+                                _entry("Season 3/e2.mkv")]
+        self.poller.poll_once()
+        self.assertFalse(os.path.exists(self._s3_dir()))
+
+    def test_unaccounted_local_file_in_folder_blocks_free(self):
+        self._s3()
+        self.write("Season 3/stray.nfo")
+        self.remote["Films"] = [_entry("Season 3/e1.mkv"),
+                                _entry("Season 3/e2.mkv")]
+        self.poller.poll_once()
+        self.assertTrue(os.path.exists(os.path.join(self._s3_dir(),
+                                                    "stray.nfo")))
+        self.assertEqual(self.ops("untick"), [])
+
+    def test_untick_absent_finds_moved_files_by_basename_and_size(self):
+        self._absent_ticked_s3({"e1.mkv": 10, "e2.mkv": 10})
+        self.poller.poll_once()
+        self.assertEqual(self.listed, [("Films", False)])
+        self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
+                         ["Season 3"])
+
+    def test_untick_absent_uses_each_files_own_drive(self):
+        self.set_state(S3F | S4F, S3F, uploaded=S3F)
+        self.store.add_partial_upload("tm-pt1", ["Season 3/e2.mkv"],
+                                      "Films overflow")
+        shutil.rmtree(self._s3_dir())
+        self.remote["Films"] = [_entry("x/e1.mkv")]
+        self.remote["Films overflow"] = [_entry("y/e2.mkv")]
+        self.poller.poll_once()
+        self.assertEqual(sorted(self.listed),
+                         [("Films", False), ("Films overflow", False)])
+        self.assertEqual(self.store.get("tm-pt1")["freed_folders"],
+                         ["Season 3"])
+
+    def test_untick_absent_wrong_size_stays_ticked(self):
+        self._absent_ticked_s3({"e1.mkv": 10, "e2.mkv": 7})
+        self.poller.poll_once()
+        self.assertEqual(self.events, [])
+        self.assertNotIn("freed_folders", self.store.get("tm-pt1"))
+
+    def test_done_step_verifies_across_drives(self):
+        for f in ("Season 1", "Season 3", "Season 4", "Season 10",
+                  "Featurettes"):
+            self.store.add_freed_folder("tm-pt1", f)
+        self.set_state({"readme.txt"}, {"readme.txt"},
+                       uploaded=set(_FL_FILES))
+        self.write("Featurettes/f1.mkv")
+        self.write("Featurettes/f1.mkv", part=True)     # marker: skipped
+        self.store.add_partial_upload("tm-pt1", ["Featurettes/f1.mkv"],
+                                      "Films overflow")
+        self.remote["Films"] = [_entry("Elsewhere/readme.txt")]
+        self.remote["Films overflow"] = [_entry("Show (2007)/f1.mkv")]
+        self.poller.poll_once()
+        self.assertEqual(sorted(self.listed),
+                         [("Films", True), ("Films overflow", True)])
+        self.assertTrue(self.store.get("tm-pt1")["handled"])
+        self.assertFalse(os.path.exists(self.top()))
+
+    def test_done_step_content_mismatch_keeps_everything(self):
+        for f in ("Season 1", "Season 3", "Season 4", "Season 10",
+                  "Featurettes"):
+            self.store.add_freed_folder("tm-pt1", f)
+        self.set_state({"readme.txt"}, {"readme.txt"},
+                       uploaded=set(_FL_FILES))
+        self.remote["Films"] = [_entry("readme.txt", md5="2" * 32)]
+        self.poller.poll_once()
+        self.assertTrue(os.path.exists(self.top()))
+        self.assertEqual(self.ops("remove"), [])
+        self.assertFalse(self.store.get("tm-pt1")["handled"])
+
+
+class TestVerifyFilesOnDrives(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        with open(os.path.join(self.tmp, "a.mkv"), "wb") as f:
+            f.write(b"x" * 10)
+
+    def test_pure_function_paths(self):
+        ok_l = lambda d, h=True: [_entry("z/a.mkv")]  # noqa: E731
+        self.assertEqual(app.verify_files_on_drives(
+            self.tmp, [("a.mkv", "D")], lister=ok_l)[0], True)
+        self.assertEqual(app.verify_files_on_drives(
+            self.tmp, [], lister=lambda d, h=True: None)[0], True)
+        self.assertFalse(app.verify_files_on_drives(
+            self.tmp, [("a.mkv", "D")], lister=lambda d, h=True: None)[0])
+        # injected hasher is what gets compared
+        ok, detail = app.verify_files_on_drives(
+            self.tmp, [("a.mkv", "D")], lister=ok_l,
+            hasher=lambda p: "f" * 32)
+        self.assertFalse(ok)
+        self.assertIn("a.mkv", detail)
+        # missing local file
+        self.assertFalse(app.verify_files_on_drives(
+            self.tmp, [("gone.mkv", "D")], lister=ok_l)[0])
+
+    def test_md5_is_computed_in_8mib_chunks(self):
+        self.assertEqual(app.md5_file(os.path.join(self.tmp, "a.mkv"), chunk=3),
+                         _MD5)
+
+
+class TestFolderHelpers(unittest.TestCase):
     def test_todrive_resolve_uses_config_env_and_last_line(self):
         seen = {}
 
@@ -4406,24 +4664,6 @@ class TestFolderHelpers(unittest.TestCase):
         self.assertIsNone(app.todrive_resolve(
             "Films", runner=lambda *a, **k: mock.Mock(returncode=1,
                                                       stdout="")))
-
-    def test_verify_on_drive_only_rc_zero_counts(self):
-        ran = []
-
-        def runner(argv, **kw):
-            ran.append(argv)
-            return mock.Mock(returncode=self.rc, stdout="", stderr="diff")
-        for rc, want in ((0, True), (1, False), (7, False)):
-            self.rc = rc
-            ok, _d = app.verify_on_drive(
-                "/l", "Films", "Show/S1", resolve=lambda d: "r:", runner=runner)
-            self.assertEqual(ok, want)
-        self.assertEqual(ran[0][1:3], ["check", "--one-way"])
-        self.assertEqual(ran[0][-1], "r:Show/S1")
-        ok, _d = app.verify_on_drive("/l", "Films", "x",
-                                     resolve=lambda d: None, runner=runner)
-        self.assertFalse(ok)
-        self.assertEqual(len(ran), 3)                   # unresolved: no rclone
 
     def test_read_partial_config(self):
         tmp = tempfile.mkdtemp()

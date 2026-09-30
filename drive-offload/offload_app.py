@@ -17,6 +17,7 @@ Stdlib only for the logic (urllib JSON-RPC); rumps only for the UI.
 See README.md.
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -840,17 +841,25 @@ def parse_routed_drive(output, default):
 
 
 def final_pass_plan(rec, drive, rename_cfg):
-    """(drive, rename_cfg, no_overflow) for the whole-dir MOVE of a torrent.
+    """(drive, rename_cfg) for the whole-dir MOVE of a torrent.
 
     Once partial uploads have COPIED files, the final pass must use the same
     names (no rename hook: renaming would change the dir/episode names, so the
-    move would not dedup against what is already there) and the same drive
-    (pinned with --no-overflow, else overflow routing could pick another).
-    Torrents that never had a partial upload are unchanged."""
+    move would not dedup against what is already there). The drive is NOT
+    pinned (D-022): the caller asks the choice drive and todrive's overflow
+    routing picks the first chain member with room. Torrents that never had a
+    partial upload are unchanged."""
     if rec and rec.get("uploaded_files"):
-        return rec.get("partial_drive") or drive, None, bool(
-            rec.get("partial_drive"))
-    return drive, rename_cfg, False
+        return drive, None
+    return drive, rename_cfg
+
+
+def file_drive(rec, rel, choice_drive):
+    """Drive a copied file lives on: its file_drives entry; legacy records
+    (no entry) fall back to partial_drive, else the choice drive."""
+    rec = rec or {}
+    return ((rec.get("file_drives") or {}).get(rel)
+            or rec.get("partial_drive") or choice_drive)
 
 
 PARTIAL_FAIL_KEYS = ("partial_failed", "partial_failures",
@@ -943,17 +952,6 @@ def tree_leftovers(root, uploaded):
     return left
 
 
-def rclone_check_argv(local, remote_conn, subpath, excludes=(),
-                      rclone="rclone"):
-    """argv for `rclone check --one-way <local> <remote>:<subpath>` (pure, so
-    it is unit-testable). One-way: every LOCAL file must exist on the drive
-    with matching content; extra files on the drive are fine."""
-    argv = [rclone, "check", "--one-way", local, remote_conn + subpath]
-    for pat in excludes:
-        argv += ["--exclude", pat]
-    return argv
-
-
 def todrive_resolve_argv(drive):
     return [sys.executable, TODRIVE, "resolve", drive]
 
@@ -987,43 +985,99 @@ def todrive_resolve(drive, runner=subprocess.run):
     return lines[-1] if lines else None
 
 
-def verify_on_drive(local, drive, subpath, excludes=(),
-                    resolve=todrive_resolve, runner=subprocess.run):
-    """(ok, detail): does every file under `local` exist on `drive` at
-    <subpath>? Only rclone check rc == 0 counts."""
-    conn = resolve(drive)
-    if not conn:
-        return False, "cannot resolve drive %r" % drive
-    argv = rclone_check_argv(local, conn, subpath, excludes,
-                             rclone=_find_rclone())
-    try:
-        p = runner(argv, capture_output=True, text=True, encoding="utf-8",
-                   errors="replace")
-    except OSError as e:
-        return False, "rclone check could not run: %s" % e
-    if p.returncode == 0:
-        return True, "rclone check ok"
-    tail = " | ".join(((p.stderr or "") + (p.stdout or "")).strip()
-                      .splitlines()[-3:])
-    return False, "rclone check rc=%d %s" % (p.returncode, tail)
-
-
-def remote_sizes(drive, subpath, resolve=todrive_resolve,
-                 runner=subprocess.run):
-    """{relative path: size} of every file under <drive>:<subpath> via
-    `rclone lsjson -R --files-only`, or None on any failure."""
+def list_drive_files(drive, hashes=True, resolve=todrive_resolve,
+                     runner=subprocess.run):
+    """Every file on `drive` (the WHOLE drive, any folder) as rclone lsjson
+    entries, or None on any failure. hashes=True adds md5 (`Hashes.md5`)."""
     conn = resolve(drive)
     if not conn:
         return None
-    argv = [_find_rclone(), "lsjson", "-R", "--files-only", conn + subpath]
+    argv = [_find_rclone(), "lsjson", "-R", "--files-only"]
+    if hashes:
+        argv += ["--hash", "--hash-type", "md5"]
+    argv.append(conn)
     try:
         p = runner(argv, capture_output=True, text=True, encoding="utf-8",
                    errors="replace")
         if p.returncode != 0:
             return None
-        return {e["Path"]: int(e["Size"]) for e in json.loads(p.stdout or "[]")}
-    except (OSError, ValueError, KeyError, TypeError):
+        out = json.loads(p.stdout or "[]")
+        if not isinstance(out, list):
+            return None
+        return out
+    except (OSError, ValueError, TypeError):
         return None
+
+
+def md5_file(path, chunk=8 * 1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _index_by_basename(entries, want_hash):
+    """{basename: [(size, md5-or-None)]}; a malformed entry is skipped."""
+    idx = {}
+    for e in entries:
+        try:
+            name = e.get("Name") or os.path.basename(e["Path"])
+            size = int(e["Size"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        md5 = None
+        if want_hash:
+            md5 = ((e.get("Hashes") or {}).get("md5") or "").lower() or None
+        idx.setdefault(name, []).append((size, md5))
+    return idx
+
+
+def verify_files_on_drives(local_root, items, lister=list_drive_files,
+                           hasher=md5_file):
+    """(ok, detail): is every (rel, drive) item's local file on that drive,
+    with identical content, ANYWHERE on the drive?
+
+    Location-agnostic on purpose (D-022): an external renamer may move files
+    into another folder, so rclone check against the expected path can never
+    pass. Each drive is listed ONCE (lister(drive, hashes=True) -> lsjson
+    entries | None); a local file matches a remote entry with the same
+    basename, size AND md5. Any listing failure, unreadable local file, or a
+    same-name same-size remote with no md5 -> not ok (never delete on doubt)."""
+    by_drive = {}
+    for rel, drive in items:
+        by_drive.setdefault(drive, []).append(rel)
+    for drive, rels in by_drive.items():
+        entries = lister(drive, True)
+        if entries is None:
+            return False, "cannot list drive %r" % drive
+        idx = _index_by_basename(entries, True)
+        for rel in rels:
+            path = os.path.join(local_root, rel)
+            try:
+                size = os.path.getsize(path)
+            except OSError as e:
+                return False, "cannot read local %r: %s" % (rel, e)
+            cands = idx.get(os.path.basename(rel)) or []
+            same = [c for c in cands if c[0] == size]
+            if not cands:
+                return False, "%r not found on %s" % (rel, drive)
+            if not same:
+                return False, "%r has no same-size copy on %s" % (rel, drive)
+            try:
+                local_md5 = hasher(path).lower()
+            except OSError as e:
+                return False, "cannot hash local %r: %s" % (rel, e)
+            if any(m == local_md5 for _s, m in same):
+                continue
+            if any(m is None for _s, m in same):
+                return False, "%r on %s has no md5 to compare" % (rel, drive)
+            return False, "%r md5 differs from the copy on %s" % (rel, drive)
+    return True, "verified %d files across %d drive(s)" % (
+        len(items), len(by_drive))
 
 
 class DecisionStore:
@@ -1130,6 +1184,7 @@ class DecisionStore:
         # Relative paths carry content names, like "name" does.
         rec.pop("uploaded_files", None)
         rec.pop("partial_drive", None)
+        rec.pop("file_drives", None)
         rec.pop("freed_folders", None)
         for k in FREE_FAIL_KEYS:
             rec.pop(k, None)
@@ -1201,12 +1256,13 @@ class DecisionStore:
             rec.pop("next_attempt", None)
             for k in PARTIAL_FAIL_KEYS + FREE_FAIL_KEYS:
                 rec.pop(k, None)
-            # Partial-torrent state pins the drive: an explicit re-pick of a
-            # DIFFERENT drive wins, and the copied-files record is dropped
+            # An explicit re-pick of a DIFFERENT drive wins, and the
+            # copied-files record (uploaded_files + file_drives) is dropped
             # with it (they stay behind on the old drive; the next pass
             # re-uploads everything to the new one). Same drive keeps it.
             if rec.get("partial_drive") != choice[len("drive:"):]:
                 rec.pop("uploaded_files", None)
+                rec.pop("file_drives", None)
                 rec.pop("partial_drive", None)
             self.save()
             return True
@@ -1214,20 +1270,33 @@ class DecisionStore:
     def add_partial_upload(self, gid, rels, drive=None):
         """Record files COPIED by a partial upload (handled stays False).
 
-        Appends `rels` (deduped, order kept) to uploaded_files, remembers the
-        drive they landed on as partial_drive, and clears failure bookkeeping
-        so an earlier failed attempt doesn't leave the record stuck. One save,
-        called only after rclone reported success. Returns the number of
-        files newly recorded (0 for an unknown gid)."""
+        Appends `rels` (deduped, order kept) to uploaded_files, maps EVERY rel
+        of the batch to the drive it landed on in file_drives (D-022: batches
+        can overflow, so files of one torrent live on several drives),
+        remembers that drive as partial_drive (compat only, pins nothing), and
+        clears failure bookkeeping so an earlier failed attempt doesn't leave
+        the record stuck. One save, called only after rclone reported
+        success. Returns the number of files newly recorded (0 for an unknown
+        gid)."""
         with self._lock:
             rec = self.data.get(gid)
             if rec is None:
                 return 0
             have = rec.setdefault("uploaded_files", [])
             new = [r for r in rels if r not in have]
-            have.extend(new)
             if drive:
+                # Pin legacy rels (no file_drives entry) to where they
+                # resolved BEFORE partial_drive moves on to this batch's drive.
+                fd = rec.setdefault("file_drives", {})
+                legacy = (rec.get("partial_drive")
+                          or str(rec.get("choice", ""))[len("drive:"):])
+                if legacy:
+                    for r in have:
+                        fd.setdefault(r, legacy)
+                for r in rels:
+                    fd[r] = drive
                 rec["partial_drive"] = drive
+            have.extend(new)
             for k in PARTIAL_FAIL_KEYS:
                 rec.pop(k, None)
             self.save()
@@ -1414,7 +1483,7 @@ class Poller:
       - store:       DecisionStore
       - ask_cb(gid, name) -> choice string ("local" or "drive:<Name>")
       - upload_cb(path, drive_name, gid, display_name)  # runs the upload
-      - partial_upload_cb(path, drive_name, gid, display_name, rels, pinned)
+      - partial_upload_cb(path, drive_name, gid, display_name, rels)
                        # optional: COPIES a partial torrent's finished files
       - notify_cb(title, subtitle, message)             # optional
       - is_paused_cb() -> bool  (auto-keep-local when True)
@@ -1426,7 +1495,7 @@ class Poller:
                  notify_cb=None, is_paused_cb=None, now_fn=None,
                  ask_existing_cb=None, partial_upload_cb=None,
                  partial_cfg=None, verify_cb=None, disk_usage_cb=None,
-                 spawn_cb=None, remote_sizes_cb=None):
+                 spawn_cb=None, list_cb=None):
         self.client = client
         self.store = store
         self.ask_cb = ask_cb
@@ -1443,16 +1512,18 @@ class Poller:
         # unless a cfg is passed (the app passes read_partial_config(), whose
         # defaults are ON), so a bare Poller can never delete files or spawn
         # rclone by accident.
-        # verify_cb(local, drive, subpath, excludes) -> (ok, detail);
+        # verify_cb(local_root, [(rel, drive)]) -> (ok, detail);
         # spawn_cb(fn) runs fn off the poll thread (tests run it inline).
         self.partial_cfg = {"partial_free_after_upload": False,
                             "partial_auto_advance": False,
                             "partial_free_margin_gb":
                             DEFAULT_PARTIAL_CFG["partial_free_margin_gb"]}
         self.partial_cfg.update(partial_cfg or {})
-        self.verify_cb = verify_cb or verify_on_drive
-        # remote_sizes_cb(drive, subpath) -> {relpath: bytes} | None
-        self.remote_sizes_cb = remote_sizes_cb or remote_sizes
+        # list_cb(drive, hashes) -> lsjson entries of the WHOLE drive | None
+        self.list_cb = list_cb or list_drive_files
+        self.verify_cb = verify_cb or (
+            lambda root, items: verify_files_on_drives(
+                root, items, lister=self.list_cb))
         self.disk_usage_cb = disk_usage_cb or shutil.disk_usage
         self._spawn = spawn_cb or (lambda fn: threading.Thread(
             target=fn, daemon=True).start())
@@ -1555,10 +1626,9 @@ class Poller:
                         and rec.get("next_attempt", 0) <= self._now()):
                     choice = rec.get("choice", "local")
                     if choice.startswith("drive:"):
-                        # After partial uploads the drive is pinned to where
-                        # those files went (final_pass_plan's other half).
-                        drive = (rec.get("partial_drive")
-                                 or choice[len("drive:"):])
+                        # Always the choice drive: todrive's overflow routing
+                        # picks the chain member with room (D-022).
+                        drive = choice[len("drive:"):]
                         path = resolve_local_path(dl)
                         if path:
                             # On-disk readiness gate: the engine saying
@@ -1622,13 +1692,14 @@ class Poller:
                                         rec.get("uploaded_files") or [])
         if not pending:
             return
-        pinned = bool(rec.get("partial_drive"))
-        drive = rec.get("partial_drive") or rec["choice"][len("drive:"):]
+        # Never pinned (D-022): ask the choice drive every time and let
+        # todrive route to the first chain member with room.
+        drive = rec["choice"][len("drive:"):]
         self._uploading.add(gid)
-        log("PARTIAL dispatch gid=%s %r -> %s (%d files, copy%s)" %
-            (gid, name, drive, len(pending), ", pinned" if pinned else ""))
+        log("PARTIAL dispatch gid=%s %r -> %s (%d files, copy)" %
+            (gid, name, drive, len(pending)))
         try:
-            self.partial_upload_cb(path, drive, gid, name, pending, pinned)
+            self.partial_upload_cb(path, drive, gid, name, pending)
         except Exception as e:
             self._uploading.discard(gid)
             log("PARTIAL dispatch error gid=%s: %s" % (gid, e))
@@ -1651,7 +1722,7 @@ class Poller:
         if not path:
             return
         uploaded = set(rec.get("uploaded_files") or [])
-        drive = rec.get("partial_drive") or rec["choice"][len("drive:"):]
+        drive = rec["choice"][len("drive:"):]
         if cfg["partial_free_after_upload"]:
             if self._poll_free(dl, gid, name, rec, path, uploaded, drive):
                 return
@@ -1737,8 +1808,16 @@ class Poller:
         fpath = os.path.join(path, folder)
         if not safe_child_dir(fpath, path):
             return "refusing %r: not a plain direct child dir" % folder
-        ok, detail = self.verify_cb(
-            fpath, drive, "%s/%s" % (os.path.basename(path), folder), ())
+        rec = self.store.get(gid) or {}
+        known = {rel for _i, rel, _f in ents}
+        for dp, _dns, fns in os.walk(fpath):
+            for fn in fns:
+                rel = os.path.relpath(os.path.join(dp, fn), path)
+                if rel not in known:
+                    return ("refusing %r: local file %r is not one of the "
+                            "torrent's uploaded files" % (folder, rel))
+        items = [(rel, file_drive(rec, rel, drive)) for _i, rel, _f in ents]
+        ok, detail = self.verify_cb(path, items)
         if not ok:
             return "verify failed for %r: %s" % (folder, detail)
         idx = [i for i, _r, _f in ents]
@@ -1762,16 +1841,25 @@ class Poller:
         """A ticked, fully-uploaded folder the user already deleted: confirm
         every file is on the drive at its exact size -> untick -> confirm ->
         record freed. Deletes nothing. None on success, else the reason."""
-        sizes = self.remote_sizes_cb(
-            drive, "%s/%s" % (os.path.basename(path), folder))
-        if sizes is None:
-            return "cannot list %r on %s" % (folder, drive)
-        prefix = folder + "/"
-        missing = [rel for _i, rel, f in ents
-                   if sizes.get(rel[len(prefix):]) != int(f.get("length") or 0)]
+        # Size-only, location-agnostic (an external renamer may have moved the
+        # files): same basename + exact size anywhere on the file's drive.
+        rec = self.store.get(gid) or {}
+        by_drive = {}
+        for _i, rel, f in ents:
+            by_drive.setdefault(file_drive(rec, rel, drive), []).append(
+                (rel, int(f.get("length") or 0)))
+        missing = []
+        for d, files in by_drive.items():
+            entries = self.list_cb(d, False)
+            if entries is None:
+                return "cannot list %r on %s" % (folder, d)
+            idx = _index_by_basename(entries, False)
+            missing += [rel for rel, size in files
+                        if not any(c[0] == size for c in
+                                   idx.get(os.path.basename(rel), ()))]
         if missing:
-            return ("%d of %r's files missing or wrong size on %s (e.g. %r)"
-                    % (len(missing), folder, drive, missing[0]))
+            return ("%d of %r's files missing or wrong size on the drive "
+                    "(e.g. %r)" % (len(missing), folder, missing[0]))
         idx = [i for i, _r, _f in ents]
         eng = self.client.for_gid(gid)
         eng.set_files_wanted(gid, idx, False)
@@ -1812,8 +1900,14 @@ class Poller:
             if left:
                 return ("%d local files not on the drive (e.g. %r)" %
                         (len(left), left[0]))
-            ok, detail = self.verify_cb(path, drive, os.path.basename(path),
-                                        ("*.part",))
+            rec = self.store.get(gid) or {}
+            items = []
+            for dp, _dns, fns in os.walk(path):
+                for fn in fns:
+                    rel = os.path.relpath(os.path.join(dp, fn), path)
+                    if rel in uploaded and not rel.endswith(".part"):
+                        items.append((rel, file_drive(rec, rel, drive)))
+            ok, detail = self.verify_cb(path, items)
             if not ok:
                 return "verify failed for the torrent root: %s" % detail
         self.client.for_gid(gid).remove_torrent(gid)   # keeps the data
@@ -1906,7 +2000,8 @@ class Poller:
             log("PARTIAL ok gid=%s: %d files copied (total %d) -> %s" %
                 (gid, n, len(rec.get("uploaded_files") or []), final_drive))
             self.notify_cb("Partial upload", rec.get("name", gid),
-                           "Uploaded %d files — kept local, still seeding" % n)
+                           "Uploaded %d files%s — kept local, still seeding" %
+                           (n, " to %s" % final_drive if final_drive else ""))
         else:
             n = self.store.record_partial_failure(
                 gid, self._now(), UPLOAD_MAX_ATTEMPTS,
@@ -2730,7 +2825,7 @@ def run_todrive_up(path, drive_name, bwlimit="", cwd=SCRIPT_DIR,
     # base_remote (frozen, todrive's SCRIPT_DIR ships no config.json).
     env["TODRIVE_CONFIG"] = CONFIG_FILE
     cmd = [sys.executable, "-u", TODRIVE, "up", path, drive_name]
-    # Partial-torrent mode: copy only the listed files / pin the drive.
+    # Partial-torrent mode: copy only the listed files.
     if keep:
         cmd.append("--keep")
     if files_from:
@@ -2971,25 +3066,23 @@ def perform_upload(client, path, drive, gid, bwlimit="",
 
 
 def perform_partial_upload(path, drive, rels, bwlimit="",
-                           todrive_up=run_todrive_up, progress_cb=None,
-                           pinned=False):
+                           todrive_up=run_todrive_up, progress_cb=None):
     """COPY the listed files (relative to the torrent dir `path`) to the drive.
     Returns (returncode, combined_output).
 
     Deliberately NOT perform_upload: no engine stop/remove/resume, no rename
     hook, nothing deleted locally -- the torrent keeps downloading and seeding.
     The files land at <drive>/<dirname>/<rel>, where the final whole-dir move
-    would put them, so that move dedups them. `pinned` (the drive is already
-    known from an earlier batch) adds --no-overflow so every batch and the
-    final pass share one drive."""
+    would put them, so that move dedups them. Never --no-overflow (D-022): a
+    torrent bigger than one ~100 GB drive must be able to spill into the
+    chain's next drive; the caller reads the ROUTED line for where it landed."""
     import tempfile
     fd, list_path = tempfile.mkstemp(prefix="partial-files-", suffix=".txt")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(rels) + "\n")
-        extra = {"no_overflow": True} if pinned else {}
         return todrive_up(path, drive, bwlimit, progress_cb=progress_cb,
-                          keep=True, files_from=list_path, **extra)
+                          keep=True, files_from=list_path)
     finally:
         try:
             os.remove(list_path)
@@ -3578,14 +3671,13 @@ def _run_app():
             try:
                 size_before = tree_size(path)
                 # After partial (copy) uploads: same names, same drive.
-                drive, rename_cfg, pin = final_pass_plan(
+                drive, rename_cfg = final_pass_plan(
                     self.poller.store.get(gid), drive, self.rename_cfg)
                 rc, output = perform_upload(
                     self.client, path, drive, gid, self.state.bwlimit,
                     progress_cb=lambda p: self._set_upload_progress(gid, p),
                     name=display_name, rename_cfg=rename_cfg,
-                    cache=self.rename_cache, confirm_cb=confirm_new_show,
-                    no_overflow=pin)
+                    cache=self.rename_cache, confirm_cb=confirm_new_show)
                 for line in output.splitlines():
                     log("  todrive: %s" % line)
                 if rc == 0:
@@ -3668,19 +3760,17 @@ def _run_app():
                 if not success:
                     self._offer_repick(gid, display_name, drive, quota)
 
-        def _start_partial_upload(self, path, drive, gid, display_name, rels,
-                                  pinned):
+        def _start_partial_upload(self, path, drive, gid, display_name, rels):
             with self._lock:
                 self.uploads[gid] = {"name": display_name, "drive": drive,
                                      "pct": None, "speed": "", "eta": ""}
             log("PARTIAL start gid=%s %r -> %s (%d files)" %
                 (gid, display_name, drive, len(rels)))
             threading.Thread(target=self._partial_upload_worker,
-                             args=(path, drive, gid, display_name, rels,
-                                   pinned), daemon=True).start()
+                             args=(path, drive, gid, display_name, rels),
+                             daemon=True).start()
 
-        def _partial_upload_worker(self, path, drive, gid, display_name, rels,
-                                   pinned):
+        def _partial_upload_worker(self, path, drive, gid, display_name, rels):
             """Thin UI wrapper: the logic is perform_partial_upload and
             Poller.upload_partial_done. Never touches the engine or the
             decision's choice."""
@@ -3690,8 +3780,7 @@ def _run_app():
             try:
                 rc, output = perform_partial_upload(
                     path, drive, rels, self.state.bwlimit,
-                    progress_cb=lambda p: self._set_upload_progress(gid, p),
-                    pinned=pinned)
+                    progress_cb=lambda p: self._set_upload_progress(gid, p))
                 for line in output.splitlines():
                     log("  todrive: %s" % line)
                 if rc == 0:
