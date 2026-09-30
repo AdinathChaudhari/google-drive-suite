@@ -49,6 +49,8 @@ A non-empty scope that filters down to nothing (every named drive is unselected)
 
 `POST /api/settings` scopes to `added_drives ∪ section_changed` (a union — the Settings UI sends an add and its tab assignment in ONE request, and an `if/elif` here silently dropped the add). Removals and a pure **reorder** both fall through to the cache-only rebuild: drive order IS meaningful, because `Scanner.scan` builds `all_records` with `for drive_id in selected` and `group_seasons` merges same-named seasons across drives first-seen-wins — see `docs/DECISIONS.md` D-013. Never revert any of this to full-replace-only scans.
 
+**Same show on several drives:** after `group_seasons`, `library.merge_shows_across_drives` (per tab bucket, before `attach_extras`) merges show records with the same `(naming.show_key_title(title), year)` — e.g. a clean nested `Show (2007)` on one drive and a torrent-named `Show (2007) Season 1-7 S01-S07 (...)` pack on another. Movies and other tabs never merge; a year-less record joins only if there is at most one candidate year; two drive-is-the-show records never merge. Merged id is `grp:`+sha1(`show|<key>|<year>`); metadata carries via transient `_member_ids` (popped by the scanner) — see `docs/DECISIONS.md` D-024.
+
 A cache-only rebuild reports `total=0`, which is not "0 of 0 to scan" — both the web UI (`static/app.js` `pollScan`) and the menu bar (`drivecast_menubar.py` `_poll`) render "updating library…" for it instead of a progress fraction. New consumers of `/api/refresh/status` need the same guard.
 
 ## Conventions & gotchas

@@ -502,3 +502,43 @@ def parse(name):
         "raw": raw,
     }
     return result
+
+
+# ------------------------------------------------ pack-name -> show-title key --
+
+# Trailing "this folder holds many seasons" noise that survives parse(): a
+# season range ("Season 1-7", "Seasons 1 to 7", "S01-S07", "S01-s07"), a bare
+# season tag ("S03"), or a pack word ("Complete", "Complete Series",
+# "Full Series", "All Seasons", "Collection"). Only stripped from the END of
+# the title so a title that merely contains such a word survives.
+_PACK_TAIL_RES = [
+    re.compile(r"\s+(?:seasons?|series)\s*\d+\s*(?:(?:-|–|to|&|and|,)\s*\d+\s*)*$", re.IGNORECASE),
+    re.compile(r"\s+s\d{1,2}\s*(?:(?:-|–|&|,)\s*s?\d{1,2}\s*)*$", re.IGNORECASE),
+    re.compile(r"\s+(?:the\s+)?(?:complete|full)(?:\s+(?:series|collection|seasons?|edition))?$",
+               re.IGNORECASE),
+    re.compile(r"\s+all\s+seasons$", re.IGNORECASE),
+    re.compile(r"\s+(?:series\s+)?collection$", re.IGNORECASE),
+]
+
+
+def show_key_title(title):
+    """Normalised show-identity key from a (parsed) show/folder title.
+
+    Strips trailing pack noise (season ranges, "Complete Series", ...) then
+    lowercases to alphanumeric words, so "Show Season 1-7 S01-s07" and "Show"
+    both reduce to "show". Never returns "" for a non-empty title (falls back
+    to the un-stripped form when everything would be stripped).
+    """
+    t = _normalize_separators(title or "")
+    stripped = t
+    changed = True
+    while changed:
+        changed = False
+        for rx in _PACK_TAIL_RES:
+            new = rx.sub("", stripped).strip(" -_.")
+            if new != stripped and new and new.lower() not in ("the", "a", "an"):
+                stripped, changed = new, True
+
+    def norm(s):
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", s.lower())).strip()
+    return norm(stripped) or norm(t)

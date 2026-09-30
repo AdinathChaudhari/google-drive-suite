@@ -651,6 +651,169 @@ def group_seasons(records, drive_names):
     return _strip_transient(passthrough) + merged
 
 
+def _show_identity(rec):
+    """(key, year) for a show record; key = pack-noise-free normalised title."""
+    return naming.show_key_title(rec.get("title") or ""), rec.get("year") or None
+
+
+def _is_drive_show(rec):
+    """True for a bare-"Season N"-folders drive-is-the-show record."""
+    drive_id = rec.get("drive_id")
+    return bool(drive_id) and rec.get("id") == (
+        "grp:" + hashlib.sha1(("drive:" + str(drive_id)).encode("utf-8")).hexdigest()[:16])
+
+
+def _dedupe_episodes(eps):
+    """Drop an exact duplicate episode (same number AND same size or name)."""
+    kept = []
+    for e in eps:
+        dup = False
+        for k in kept:
+            if e.get("episode") != k.get("episode"):
+                continue
+            same_size = e.get("size") is not None and e.get("size") == k.get("size")
+            same_name = bool(e.get("name")) and (e.get("name") or "").lower() == (k.get("name") or "").lower()
+            if e.get("episode") is None:
+                dup = same_size and same_name
+            else:
+                dup = same_size or same_name
+            if dup:
+                break
+        if not dup:
+            kept.append(e)
+    return kept
+
+
+def _merge_show_members(members, key, year):
+    """One merged show record from same-show records (shape of group_seasons')."""
+    buckets = {}
+    extras_entries = []
+    best_q, best_q_rank = None, 0
+    thumb = None
+    member_drives = []
+    member_ids = []
+    for rec in members:
+        member_ids.append(rec.get("id"))
+        member_ids.extend(rec.get("_member_ids") or [])
+        for s in rec.get("seasons") or []:
+            if s.get("extras"):
+                extras_entries.append(dict(s))
+            else:
+                buckets.setdefault(s.get("season"), []).extend(s.get("episodes") or [])
+        r = naming.quality_rank(rec.get("quality"))
+        if r > best_q_rank:
+            best_q, best_q_rank = rec.get("quality"), r
+        if thumb is None:
+            thumb = rec.get("_thumb")
+        for d in rec.get("source_drives") or ([rec["drive_id"]] if rec.get("drive_id") else []):
+            if d not in member_drives:
+                member_drives.append(d)
+    seasons = []
+    for s in sorted(buckets, key=lambda n: (n is None, n if n is not None else 0)):
+        eps = _dedupe_episodes(buckets[s])
+        eps.sort(key=lambda e: (e.get("episode") if e.get("episode") is not None else 10 ** 6,
+                                (e.get("name") or "").lower()))
+        seasons.append({"season": s, "episodes": eps})
+    extras_entries.sort(key=lambda e: ((e.get("name") or "").lower(),
+                                       e.get("season") or 0))
+    seasons.extend(extras_entries)
+    first = members[0]
+    # Display title: the member whose title is already noise-free (the clean
+    # folder name); else the first member's.
+    title = next((m.get("title") for m in members
+                  if naming.show_key_title(m.get("title") or "")
+                  == re.sub(r"[^a-z0-9]+", " ", (m.get("title") or "").lower()).strip()),
+                 first.get("title"))
+    return {
+        "id": "grp:" + hashlib.sha1(
+            ("show|%s|%s" % (key, year or "")).encode("utf-8")).hexdigest()[:16],
+        "type": "show",
+        "title": title,
+        "year": year,
+        "drive_id": first.get("drive_id"),
+        "folder_id": None,
+        "poster": None,
+        "tmdb_id": None,
+        "overview": None,
+        "quality": best_q,
+        "source_drives": member_drives,
+        "_thumb": thumb,
+        "_member_ids": [i for i in member_ids if i],
+        "seasons": seasons,
+    }
+
+
+def merge_shows_across_drives(records):
+    """Merge show records that are the same show (one tab bucket's records).
+
+    Runs AFTER group_seasons: a show whose folder is a nested "Show/Season N"
+    tree on one drive and a torrent-named pack ("Show (2007) Season 1-7 S01-S07
+    (1080p ...)") on another otherwise renders as two tiles. Identity is
+    (show_key_title(title), year). A year-less record joins only when there is
+    at most one candidate year for that title (0 -> yearless records merge
+    together, but never two drive-is-the-show records: same-named drives stay
+    separate, D-013). Movies and every non-show record pass through untouched;
+    callers pass ONE tab's records so tabs never merge. The merged record keeps
+    a transient ``_member_ids`` so old metadata can be carried (see
+    merge_existing_metadata); the scanner pops it after use.
+    """
+    by_title = {}
+    for i, rec in enumerate(records):
+        if rec.get("type") == "show":
+            by_title.setdefault(_show_identity(rec)[0], []).append(i)
+
+    cluster_of = {}      # record index -> cluster id
+    clusters = {}        # cluster id -> {"key","year","idx":[...]}
+    for key, idxs in by_title.items():
+        if len(idxs) < 2 or not key:
+            continue
+        yeared = {}
+        for i in idxs:
+            y = _show_identity(records[i])[1]
+            if y:
+                yeared.setdefault(y, []).append(i)
+        for y, ii in yeared.items():
+            cid = (key, y)
+            clusters[cid] = {"key": key, "year": y, "idx": list(ii)}
+            for i in ii:
+                cluster_of[i] = cid
+        yearless = [i for i in idxs if not _show_identity(records[i])[1]]
+        if not yearless:
+            continue
+        if len(yeared) == 1:
+            cid = (key, next(iter(yeared)))
+            for i in yearless:
+                if _is_drive_show(records[i]) and any(
+                        _is_drive_show(records[j]) for j in clusters[cid]["idx"]):
+                    continue
+                clusters[cid]["idx"].append(i)
+                cluster_of[i] = cid
+        elif len(yeared) == 0:
+            cid = (key, None)
+            clusters[cid] = {"key": key, "year": None, "idx": []}
+            for i in yearless:
+                if _is_drive_show(records[i]) and any(
+                        _is_drive_show(records[j]) for j in clusters[cid]["idx"]):
+                    continue
+                clusters[cid]["idx"].append(i)
+                cluster_of[i] = cid
+
+    out = []
+    done = set()
+    for i, rec in enumerate(records):
+        cid = cluster_of.get(i)
+        if cid is None or len(clusters[cid]["idx"]) < 2:
+            out.append(rec)
+            continue
+        if cid in done:
+            continue
+        done.add(cid)
+        c = clusters[cid]
+        out.append(_merge_show_members([records[j] for j in sorted(c["idx"])],
+                                       c["key"], c["year"]))
+    return out
+
+
 def _strip_transient(records):
     """Remove the transient _folder_name/_video_name keys before persisting."""
     for rec in records:
@@ -828,6 +991,7 @@ def merge_existing_metadata(old_titles, new_titles):
     for tid, rec in new_titles.items():
         old = old_titles.get(tid)
         if not old:
+            _carry_from_members(old_titles, rec)
             continue
         # A record reclassified into a different TAB keeps NOTHING: its old
         # TMDB poster/overview (matched as a film) would be wrong for a
@@ -842,6 +1006,33 @@ def merge_existing_metadata(old_titles, new_titles):
         # title instead of carrying stale enrichment forever.
         if (old.get("title") or "") != (rec.get("title") or ""):
             continue
+        for k in ("poster", "tmdb_id", "overview", "category"):
+            if old.get(k) and not rec.get(k):
+                rec[k] = old[k]
+        _carry_from_members(old_titles, rec)
+
+
+def _member_olds(old_titles, rec):
+    """Prior records of a merged show's members that are the same show/tab.
+
+    Same guard as a same-id carry: a different tab keeps nothing, and a member
+    whose old title names a different show (key mismatch) is ignored.
+    """
+    key = naming.show_key_title(rec.get("title") or "")
+    for mid in rec.get("_member_ids") or []:
+        old = old_titles.get(mid)
+        if not old or old.get("section") != rec.get("section"):
+            continue
+        if naming.show_key_title(old.get("title") or "") != key:
+            continue
+        yield old
+
+
+def _carry_from_members(old_titles, rec):
+    """Fill a merged show's missing metadata from its members' previous ids."""
+    if not rec.get("_member_ids"):
+        return
+    for old in _member_olds(old_titles, rec):
         for k in ("poster", "tmdb_id", "overview", "category"):
             if old.get(k) and not rec.get(k):
                 rec[k] = old[k]
@@ -861,7 +1052,11 @@ def assign_added_at(old_titles, new_titles, now=None):
         if old and old.get("added_at"):
             rec["added_at"] = old["added_at"]
         elif not rec.get("added_at"):
-            rec["added_at"] = now
+            # A merged show inherits the EARLIEST timestamp among its members'
+            # previous records, so merging never makes an old show look new.
+            prior = [o["added_at"] for o in _member_olds(old_titles, rec)
+                     if o.get("added_at")]
+            rec["added_at"] = min(prior) if prior else now
 
 
 def prune_removed_posters(old_titles, new_titles, removed_ids):
@@ -1432,14 +1627,24 @@ class Scanner:
                 # the show's season folders) fold into their show after
                 # grouping, per bucket so cross-tab folding can't happen.
                 bucket, bucket_extras = split_extras_records(bucket)
+                # Same show on several drives (nested folder vs torrent-named
+                # pack) merges here, BEFORE extras attach and within this tab
+                # only. Always built from every selected drive's cached
+                # records, so a scoped refresh never splits a merged show.
                 bucket_grouped = attach_extras(
-                    group_seasons(bucket, drive_names), bucket_extras)
+                    merge_shows_across_drives(group_seasons(bucket, drive_names)),
+                    bucket_extras)
+                def _rehash(i):
+                    return "grp:" + hashlib.sha1(
+                        ("%s|%s" % (tab_key, i)).encode("utf-8")).hexdigest()[:16]
                 for rec in bucket_grouped:
                     rec["section"] = tab_key
                     if multi_ent_tabs and rec.get("id", "").startswith("grp:"):
-                        rec["id"] = "grp:" + hashlib.sha1(
-                            ("%s|%s" % (tab_key, rec["id"])).encode("utf-8")
-                        ).hexdigest()[:16]
+                        rec["id"] = _rehash(rec["id"])
+                    if multi_ent_tabs and rec.get("_member_ids"):
+                        rec["_member_ids"] = [
+                            _rehash(i) if i.startswith("grp:") else i
+                            for i in rec["_member_ids"]]
                 grouped.extend(bucket_grouped)
             grouped = grouped + _strip_transient(rest)
             new_titles = {rec["id"]: rec for rec in grouped}
@@ -1451,6 +1656,8 @@ class Scanner:
             added, removed = diff_library(old_titles, new_titles)
             merge_existing_metadata(old_titles, new_titles)
             assign_added_at(old_titles, new_titles)
+            for rec in new_titles.values():
+                rec.pop("_member_ids", None)
 
             self.status["added"] = len(added)
 
