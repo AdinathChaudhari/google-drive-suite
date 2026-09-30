@@ -60,6 +60,7 @@ than no entry.
 | [D-019](#d-019--forgetting-a-decision-means-scrubbing-it-not-deleting-it) | Forgetting a decision means scrubbing it, not deleting it | Adopted | drive-offload |
 | [D-020](#d-020--a-season-by-season-torrent-is-copied-as-it-finishes-moved-only-at-the-end) | A season-by-season torrent is copied as it finishes, moved only at the end | Adopted | drive-offload |
 | [D-021](#d-021--each-season-folder-is-freed-once-it-is-verifiably-on-the-drive-then-the-next-one-starts) | Each season folder is freed once it is verifiably on the drive, then the next one starts | Adopted | drive-offload |
+| [D-024](#d-024--the-same-show-on-two-drives-merges-by-normalised-title--year-after-group_seasons) | The same show on two drives merges by normalised title + year, after `group_seasons` | Adopted | drivecast |
 
 ---
 
@@ -724,3 +725,45 @@ than no entry.
   a re-pick of a different drive keeps `freed_folders` but drops
   `uploaded_files`, so freed folders are not re-uploaded (their data only exists
   on the old drive).
+
+### D-024 — The same show on two drives merges by normalised title + year, after `group_seasons`
+**Status:** Adopted · **When:** 2026-09-30
+
+- **Hit** — one show uploaded across two Shared Drives rendered as two tiles:
+  drive A held a clean `Show (2007)/Season 1..4` tree, drive B a nested pack
+  folder named like a torrent (`Show (2007) Season 1-7 S01-S07 (1080p BluRay
+  x265 ...)/Season 5..7`). `group_seasons` only merges `<Show> Season N`
+  siblings and bare `Season N` drive roots; nested `Show/Season N` records pass
+  through untouched, so nothing ever joined them.
+- **Learned** — the identity is already on the record: the scanner stores
+  `naming.clean_title(folder)`, which cuts at quality tokens and the year but
+  leaves pack noise behind (`Show Season 1-7 S01-s07`, `Show Complete Series`).
+  So the key needs one more, trailing-only, strip; a season *range* must not be
+  mistaken for a title, and a real title that merely contains such a word
+  (`Season of the Witch`) must survive.
+- **Did** — `naming.show_key_title` (strip trailing season ranges / `Sxx` tags
+  / "Complete Series" style words, then alphanumeric-lowercase) and
+  `library.merge_shows_across_drives`, run per tab bucket between
+  `group_seasons` and `attach_extras`. Key = `(show_key_title, year)`. A
+  year-less record joins only when there is at most one candidate year for that
+  title (with none, year-less records merge on title); two bare-`Season N`
+  drive-is-the-show records never merge with each other (D-013 keeps same-named
+  drives separate). Movies and other tabs are never touched. The merged record
+  has the `group_seasons` shape, id `grp:` + `sha1("show|<key>|<year>")[:16]`
+  (still re-hashed per tab when several entertainment tabs exist), season
+  numbers unioned, an exact duplicate episode (same number AND same size or
+  name) dropped, extras kept as labelled pseudo-seasons. Metadata: the record
+  carries transient `_member_ids` (old ids of its members) so
+  `merge_existing_metadata` / `assign_added_at` inherit poster, tmdb, category
+  and the earliest `added_at` (same tab + same show key only); the scanner
+  pops it. Scoped refreshes already rebuild from every selected drive's cached
+  records, so no extra handling was needed — the tests pin it.
+- **Where** — `drivecast/drivecast/naming.py` § `show_key_title`;
+  `drivecast/drivecast/library.py` § `merge_shows_across_drives`,
+  `_merge_show_members`, `_carry_from_members`; tests in `test_library.py`
+  (cross-drive section) and `test_naming.py` (mutation-checked: disabling the
+  merge call, the dedupe, member metadata carry, the year in the key, the tab
+  guard on carry, and the drive-show guard each fail a test).
+- **Revisit when** — two genuinely different shows share a title and both lack
+  a year across two drives (they would merge), or a torrent name carries a
+  title-shaped word the trailing strip does not know.
