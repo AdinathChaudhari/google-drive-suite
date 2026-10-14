@@ -120,13 +120,22 @@ episode 100. Canonical naming (`clean_source_title` / `synth_episode` /
 `plan_from_sequence`) lives in `renamer.py`; the R13 contract gate rejects bad
 folder names, e.g. digit-dash-digit show names like "9-1-1".
 
-Download/upload is pipelined: videos download sequentially while a background
-thread does per-file `rclone moveto` into `<Show> Season N/` for the previous
-video. Backpressure is a `threading.Semaphore(--max-gap)` (default 3): the
-producer acquires a permit before each download, the uploader releases one after
-each upload, so at most 3 episodes are downloaded-but-not-yet-uploaded and
-downloads PAUSE when uploads fall behind (disk bounded to ~3 videos). State is
-written only by the uploader thread, and only after `rclone`'s exit code is 0.
+Download/upload is pipelined: videos download sequentially while
+`--upload-workers` (default 3) background threads, sharing one queue, each do a
+per-file `rclone moveto` into `<Show> Season N/`. Parallel because Drive caps
+per-connection upload speed and rclone can't split one file across connections
+to Drive — the same reason `todrive` runs `--transfers 4`. Backpressure is a
+`threading.Semaphore(--max-gap)` (default workers + 1, so every worker stays
+busy while the next video downloads): the producer acquires a permit before each
+download, an uploader releases one after each upload, and downloads PAUSE when
+uploads fall behind. State is written only by upload threads, only after
+`rclone`'s exit code is 0, and only under `commit_lock` — the lock covers the
+`show_rec` mutation AND `save_state`, because two unlocked workers collide on
+the shared `yt_shows.json.tmp` and lose commits (proven by
+`TestParallelUploadWorkers`). Commits can land out of order; harmless, since
+season/episode are fixed in the plan before any download. `UI.up_start`
+returns a per-upload token for `up_advance`/`up_finish`; omitting it means
+"latest upload", which is how `yt-video`'s single upload still works.
 The **native** yt-dlp downloader is the DEFAULT (`--connections 1`) — it
 benchmarked ~3–4× faster than aria2c on un-throttled YouTube; `--connections 16`
 switches to aria2c multi-connection, which only helps when a single connection
