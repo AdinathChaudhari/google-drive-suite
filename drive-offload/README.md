@@ -415,9 +415,10 @@ yt-show falls back to terse plain-text progress. `aria2c` is only needed for
 Flags: `--new-season` / `--same-season` control how a second playlist folds
 into an existing show; `--pick` interactively lets you choose (or create) the
 target Shared Drive instead of passing `--drive`; `--connections N` switches to
-aria2c multi-connection (default 1 = native); `--max-gap N` caps how many
+aria2c multi-connection (default 1 = native); `--upload-workers N` sets how
+many episodes upload in parallel (default 3); `--max-gap N` caps how many
 episodes may be downloaded-but-not-yet-uploaded before downloading pauses
-(default 3); `--height` and `--stage` tune the download; `--plain` forces
+(default `--upload-workers` + 1); `--height` and `--stage` tune the download; `--plain` forces
 plain-text progress; `--dry-run` prints the planned episode numbering and does
 nothing else.
 
@@ -425,16 +426,19 @@ nothing else.
 downloader is the default — it benchmarked ~3–4× faster than aria2c on
 un-throttled YouTube. `--connections 16` switches to aria2c multi-connection,
 which only helps when a single connection is being throttled to a crawl (a slow
-run prints a hint suggesting it). Uploads are **pipelined**: video *N* uploads
-(`rclone moveto` straight to the drive) while video *N+1* downloads. A gap
-semaphore keeps at most `--max-gap` (default 3) episodes pending upload —
-downloads **pause** when uploads fall behind, so disk stays bounded to ~3 videos.
+run prints a hint suggesting it). Uploads are **pipelined and parallel**:
+`--upload-workers` (default 3) episodes upload at once (`rclone moveto` straight
+to the drive, one connection each — Drive caps per-connection speed, so this is
+what fills the uplink, the same reason `todrive` uses `--transfers 4`) while the
+next video downloads. A gap semaphore keeps at most `--max-gap` (default
+workers + 1 = 4) episodes pending upload — downloads **pause** when uploads fall
+behind, so disk stays bounded to ~4 videos.
 
 **Live dashboard.** With `rich` installed and a TTY, the run shows a live
 dashboard: a header (`show → drive`), a one-line drive-capacity readout, an
 overall `episodes N/total` progress bar, and the **concurrent** download and
-upload progress bars — both visible at once, since *N* uploads while *N+1*
-downloads — each with speed and ETA. Without `rich` (or on a non-TTY, or with
+upload progress bars — one download bar plus one bar per in-flight upload —
+each with speed and ETA. Without `rich` (or on a non-TTY, or with
 `--plain`) it falls back to terse plain-text progress; `pip install rich` to
 enable the dashboard.
 
