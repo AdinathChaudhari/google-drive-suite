@@ -279,3 +279,28 @@ def test_lesson_number(name, num):
 ])
 def test_clean_course_title(raw, clean):
     assert naming.clean_course_title(raw) == clean
+
+
+# ------------------------------------------------ show_key_title (pack names) --
+
+@pytest.mark.parametrize("raw", [
+    "Show Name (2007)",
+    "Show Name (2007) Season 1-7 S01-S07 (1080p BluRay x265 HEVC 10bit AAC 5.1 Silence)",
+    "Show.Name.2007.S01-S07.1080p.BluRay.x265-GRP",
+    "Show Name (2007) Complete Series 720p WEB-DL",
+    "Show Name Seasons 1 to 7 Complete",
+    "Show Name S01-S07 2160p",
+    "Show Name (2007) [Complete] (1080p BluRay x265 10bit)",
+    "Show Name Season 5",
+])
+def test_show_key_title_reduces_pack_names_to_show(raw):
+    title, _ = naming.clean_title(raw)
+    assert naming.show_key_title(title) == "show name"
+
+
+def test_show_key_title_keeps_real_titles():
+    assert naming.show_key_title("The Complete Series") == "the complete series"
+    assert naming.show_key_title("Season of the Witch") == "season of the witch"
+    assert naming.show_key_title("S Club 7") == "s club 7"
+    assert naming.show_key_title("Collection Agency") == "collection agency"
+    assert naming.show_key_title("") == ""
