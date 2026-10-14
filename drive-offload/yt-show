@@ -396,7 +396,7 @@ def _fmt_speed(speed):
 class UI:
     """Owns the single rich Live (or the plain-text fallback) for the whole
     run. The lock guards the board/counters, which are mutated from BOTH the
-    producer (download, main thread) and the consumer (upload, worker thread)
+    producer (download, main thread) and the consumers (upload worker threads)
     and read by the Live refresh thread in render()."""
 
     def __init__(self, use_rich):
@@ -424,9 +424,10 @@ class UI:
         self._up_task = None
         self._overall_task = None
         self._dl_label = ""
-        self._up_label = ""
+        self._up_labels = {}      # upload token -> label (concurrent uploads)
+        self._plain_up_last = {}  # upload token -> last plain-mode write time
+        self._up_seq = 0          # plain-mode upload token counter
         self._plain_dl_last = 0.0
-        self._plain_up_last = 0.0
         self._noted = set()
         if self.use_rich:
             self.console = RichConsole()
@@ -617,45 +618,65 @@ class UI:
             sys.stderr.flush()
 
     # -- upload progress -----------------------------------------------------
+    # Several uploads can run at once (--upload-workers), so each up_start
+    # returns its own token (a rich task id, or a plain-mode counter) and
+    # up_advance/up_finish take it. task=None means "the most recent upload",
+    # which keeps single-upload callers (yt-video) working unchanged.
     def up_start(self, label, total_bytes):
-        with self.lock:
-            self._up_label = label
         if self.use_rich:
-            self._up_task = self.up_progress.add_task(
-                "⬆ %s" % label, total=total_bytes)
+            task = self.up_progress.add_task("⬆ %s" % label, total=total_bytes)
         else:
-            self._plain_up_last = 0.0
             sys.stderr.write("  ⬆ %s  0%%\r" % label)
             sys.stderr.flush()
+        with self.lock:
+            if not self.use_rich:
+                self._up_seq += 1
+                task = self._up_seq
+            self._up_labels[task] = label
+            self._plain_up_last[task] = 0.0
+            self._up_task = task
+        return task
 
-    def up_advance(self, done_bytes, total_bytes, speed):
+    def up_advance(self, done_bytes, total_bytes, speed, task=None):
+        if task is None:
+            task = self._up_task
+        if task is None:
+            return
         if self.use_rich:
-            if self._up_task is not None:
-                kw = {"completed": done_bytes or 0}
-                if total_bytes:
-                    kw["total"] = total_bytes
-                try:
-                    self.up_progress.update(self._up_task, **kw)
-                except Exception:
-                    pass
+            kw = {"completed": done_bytes or 0}
+            if total_bytes:
+                kw["total"] = total_bytes
+            try:
+                self.up_progress.update(task, **kw)
+            except Exception:
+                pass
         else:
             now = time.monotonic()
-            if now - self._plain_up_last < 1.0:
-                return
-            self._plain_up_last = now
+            with self.lock:
+                if now - self._plain_up_last.get(task, 0.0) < 1.0:
+                    return
+                self._plain_up_last[task] = now
+                label = self._up_labels.get(task, "")
             pct = int(100 * done_bytes / total_bytes) if total_bytes else 0
             sys.stderr.write("  ⬆ %s  %d%%  %s\r" %
-                             (self._up_label, pct, _fmt_speed(speed)))
+                             (label, pct, _fmt_speed(speed)))
             sys.stderr.flush()
 
-    def up_finish(self):
-        if self.use_rich:
-            if self._up_task is not None:
-                try:
-                    self.up_progress.remove_task(self._up_task)
-                except Exception:
-                    pass
+    def up_finish(self, task=None):
+        with self.lock:
+            if task is None:
+                task = self._up_task
+            if task is None:
+                return
+            self._up_labels.pop(task, None)
+            self._plain_up_last.pop(task, None)
+            if self._up_task == task:
                 self._up_task = None
+        if self.use_rich:
+            try:
+                self.up_progress.remove_task(task)
+            except Exception:
+                pass
         else:
             sys.stderr.write("\n")
             sys.stderr.flush()
@@ -846,14 +867,16 @@ def upload_file(filepath, connstr, folder, dest_name, on_progress=None):
 
 
 # ===========================================================================
-# The pipeline -- producer (download, main thread) + consumer (upload, worker
-# thread). A gap semaphore (--max-gap permits) caps how many episodes are
+# The pipeline -- producer (download, main thread) + consumers (--upload-workers
+# upload threads on one queue). A gap semaphore (--max-gap permits) caps how many episodes are
 # downloaded-but-not-yet-uploaded: the producer acquires a permit before each
 # download and the consumer releases one after each upload, so when max_gap
 # episodes are pending the next download blocks until an upload drains. Overlap:
-# while the producer downloads item N+1, the consumer uploads item N. STATE is
-# written ONLY by the consumer thread (single writer) so no lock is needed; the
-# producer never mutates show_rec. An episode is committed only after rclone rc==0.
+# while the producer downloads item N+1, the consumers upload items N, N-1, ...
+# in parallel. STATE is written ONLY by the upload threads, under commit_lock
+# (mutation + save_state together); the producer never mutates show_rec.
+# Uploads can now commit out of order -- harmless, since every episode's
+# season/episode is fixed in the plan before any download starts. An episode is committed only after rclone rc==0.
 #
 # Re-uploading to the same canonical dest is idempotent (rclone moveto
 # overwrites an existing dest file), so the one accepted crash window --
@@ -939,7 +962,12 @@ def reconcile_stage(stage, display, show_rec, plan=None, ui_note=print):
 
 
 def upload_worker(q, connstr, display, plid, show_rec, state, results,
-                  results_lock, ui, gap):
+                  results_lock, ui, gap, commit_lock=None):
+    # --upload-workers runs several of these on one queue. commit_lock
+    # serialises the show_rec mutation + save_state so two workers finishing
+    # together can't interleave a json.dump or lose a commit.
+    if commit_lock is None:
+        commit_lock = threading.Lock()
     while True:
         job = q.get()
         try:
@@ -947,6 +975,7 @@ def upload_worker(q, connstr, display, plid, show_rec, state, results,
                 return
             a, filepath = job
             key = (a["season"], a["episode"])
+            tok = None
             # Guard the whole job: if this thread died (e.g. rclone missing ->
             # FileNotFoundError, or save_state -> OSError) the producer would
             # deadlock forever on the bounded queue. Stay alive, count the
@@ -966,18 +995,24 @@ def upload_worker(q, connstr, display, plid, show_rec, state, results,
                     total = os.path.getsize(filepath)
                 except OSError:
                     total = 0
-                ui.up_start(label, total)
-                rc = upload_file(filepath, connstr, folder, dest_name,
-                                 on_progress=ui.up_advance)
-                ui.up_finish()
+                tok = ui.up_start(label, total)
+                rc = upload_file(
+                    filepath, connstr, folder, dest_name,
+                    on_progress=lambda dn, tot, sp, tok=tok:
+                        ui.up_advance(dn, tot, sp, task=tok))
+                ui.up_finish(tok)
+                tok = None
                 if rc == 0:
-                    show_rec["episodes"][a["vid"]] = {
-                        "season": a["season"], "episode": a["episode"], "playlist": plid,
-                        "title": renamer.clean_source_title(a["title"], display),
-                        "uploaded": datetime.date.today().isoformat()}
-                    cur = show_rec["playlists"].get(plid, {}).get("season", 0)
-                    show_rec["playlists"][plid] = {"season": max(cur, a["season"])}
-                    save_state(state)
+                    with commit_lock:
+                        show_rec["episodes"][a["vid"]] = {
+                            "season": a["season"], "episode": a["episode"],
+                            "playlist": plid,
+                            "title": renamer.clean_source_title(a["title"], display),
+                            "uploaded": datetime.date.today().isoformat()}
+                        cur = show_rec["playlists"].get(plid, {}).get("season", 0)
+                        show_rec["playlists"][plid] = {
+                            "season": max(cur, a["season"])}
+                        save_state(state)
                     ui.update_status(key, "done")
                     with results_lock:
                         results["uploaded"] += 1
@@ -988,7 +1023,8 @@ def upload_worker(q, connstr, display, plid, show_rec, state, results,
                     with results_lock:
                         results["failed"] += 1
             except Exception as exc:
-                ui.up_finish()
+                if tok is not None:
+                    ui.up_finish(tok)
                 ui.update_status(key, "failed")
                 ui.note("  ! upload worker error S%02dE%02d: %s"
                         % (a["season"], a["episode"], exc))
@@ -1036,9 +1072,16 @@ def build_parser():
                          "throttling. >1 = aria2c multi-connection, which only "
                          "helps when a single connection is being throttled to "
                          "a crawl (try 16 if a download is stuck slow).")
-    ap.add_argument("--max-gap", type=int, default=3,
+    ap.add_argument("--upload-workers", type=int, default=3,
+                    help="parallel uploads (default 3). Each upload is one "
+                         "rclone connection, and Drive caps per-connection "
+                         "speed, so several at once fill the uplink -- the "
+                         "same idea as todrive's --transfers 4.")
+    ap.add_argument("--max-gap", type=int, default=None,
                     help="max episodes downloaded-but-not-yet-uploaded before "
-                         "downloading pauses (keeps disk bounded; default 3)")
+                         "downloading pauses (keeps disk bounded; default "
+                         "upload-workers + 1, so every worker stays busy "
+                         "while the next video downloads)")
     ap.add_argument("--stage", default=os.path.expanduser(
                         "~/Downloads/yt-show-stage"),
                     help="local staging directory")
@@ -1204,17 +1247,21 @@ def main(argv=None):
     # uploader releases one after each upload attempt, so when `max_gap`
     # episodes are pending upload the next download blocks until one drains —
     # keeping disk bounded to ~max_gap videos.
-    gap = threading.Semaphore(max(1, args.max_gap))
-    worker = threading.Thread(
+    n_workers = max(1, args.upload_workers)
+    max_gap = args.max_gap if args.max_gap is not None else n_workers + 1
+    gap = threading.Semaphore(max(1, max_gap))
+    commit_lock = threading.Lock()
+    workers = [threading.Thread(
         target=upload_worker,
         args=(q, connstr, display, plid, show_rec, state, results,
-              results_lock, ui, gap),
-        daemon=True)
-    worker.start()
+              results_lock, ui, gap, commit_lock),
+        daemon=True) for _ in range(n_workers)]
+    for w in workers:
+        w.start()
 
     # SIGTERM (launchd/system shutdown) now takes the identical drain path as
     # Ctrl-C: raise KeyboardInterrupt in the main thread -> the producer loop's
-    # except catches it -> sentinel + worker.join() below. Unlike Ctrl-C (which
+    # except catches it -> sentinels + workers' join() below. Unlike Ctrl-C (which
     # SIGINTs the whole process group, killing an in-flight rclone too),
     # SIGTERM only hits this process, so the in-flight upload actually
     # completes during the drain. try/except guards non-main-thread or exotic
@@ -1279,8 +1326,10 @@ def main(argv=None):
         except KeyboardInterrupt:
             ui.note("interrupted — finishing queued uploads...")
         finally:
-            q.put(None)             # sentinel
-            worker.join()           # drain: let queued uploads finish + commit
+            for _ in workers:
+                q.put(None)         # one sentinel per worker
+            for w in workers:
+                w.join()            # drain: let queued uploads finish + commit
 
     # tidy empty season dirs left in stage
     for d in glob.glob(os.path.join(args.stage, "*")):
