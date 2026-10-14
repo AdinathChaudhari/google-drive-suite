@@ -16,6 +16,11 @@ assignments for them, in order, WITHOUT mutating show_rec. `mode` ('same' or
 in show_rec['playlists'] keeps its recorded season regardless of mode.
 """
 import copy
+import io
+import json
+import queue
+import threading
+import time
 import importlib.machinery
 import importlib.util
 import os
@@ -427,6 +432,111 @@ class TestReconcileStage(unittest.TestCase):
             once = yt_show.renamer.clean_source_title(t, show)
             twice = yt_show.renamer.clean_source_title(once, show)
             self.assertEqual(twice, once, "not idempotent for %r" % t)
+
+
+class TestParallelUploadWorkers(unittest.TestCase):
+    """--upload-workers: several upload_worker threads on ONE queue must
+    upload concurrently, commit every episode exactly once, and release one
+    gap permit per job. upload_file is faked (no rclone); save_state writes a
+    tmp STATE_PATH so the real atomic-replace path runs."""
+
+    def _run(self, n_workers, n_jobs, fake_upload):
+        tmp = tempfile.mkdtemp()
+        state = {"version": 1, "shows": {}}
+        show_rec = {"display": "Show", "drive": "TV", "episodes": {},
+                    "playlists": {}}
+        state["shows"]["show"] = show_rec
+        results = {"uploaded": 0, "failed": 0}
+        q = queue.Queue()
+        gap = threading.Semaphore(0)
+        ui = yt_show.UI(use_rich=False)
+        lock = threading.Lock()
+        commit_lock = threading.Lock()   # ONE lock shared by every worker
+        with mock.patch.object(yt_show, "STATE_PATH",
+                               os.path.join(tmp, "yt_shows.json")), \
+                mock.patch.object(yt_show, "upload_file", fake_upload), \
+                mock.patch("sys.stderr", io.StringIO()):
+            ws = [threading.Thread(
+                target=yt_show.upload_worker,
+                args=(q, "gdrive,team_drive=X:", "Show", "PL1", show_rec,
+                      state, results, lock, ui, gap, commit_lock),
+                daemon=True) for _ in range(n_workers)]
+            for w in ws:
+                w.start()
+            for i in range(1, n_jobs + 1):
+                q.put(({"vid": "v%d" % i, "season": 1, "episode": i,
+                        "title": "T%d" % i}, "/stage/f%d.mp4" % i))
+            for _ in ws:
+                q.put(None)
+            for w in ws:
+                w.join(10)
+                self.assertFalse(w.is_alive(), "worker hung")
+            with open(yt_show.STATE_PATH, encoding="utf-8") as f:
+                saved = json.load(f)
+        # every job released exactly one gap permit
+        released = 0
+        while gap.acquire(blocking=False):
+            released += 1
+        return results, show_rec, saved, released
+
+    def test_uploads_run_concurrently(self):
+        # Each fake upload blocks until 3 are in flight at once -- with a
+        # single worker this would time out and fail every upload.
+        barrier = threading.Barrier(3, timeout=5)
+
+        def fake_upload(filepath, connstr, folder, dest_name, on_progress=None):
+            barrier.wait()
+            on_progress(10, 10, "1 MiB/s")
+            return 0
+
+        results, show_rec, saved, released = self._run(3, 3, fake_upload)
+        self.assertEqual(results, {"uploaded": 3, "failed": 0})
+        self.assertEqual(released, 3)
+
+    def test_every_commit_lands_in_state(self):
+        def fake_upload(filepath, connstr, folder, dest_name, on_progress=None):
+            time.sleep(0.01)
+            return 1 if filepath.endswith("f5.mp4") else 0
+
+        results, show_rec, saved, released = self._run(4, 12, fake_upload)
+        self.assertEqual(results, {"uploaded": 11, "failed": 1})
+        self.assertEqual(released, 12)
+        want = {"v%d" % i for i in range(1, 13)} - {"v5"}
+        self.assertEqual(set(show_rec["episodes"]), want)
+        self.assertEqual(set(saved["shows"]["show"]["episodes"]), want)
+        self.assertEqual({e["episode"] for e in show_rec["episodes"].values()},
+                         set(range(1, 13)) - {5})
+
+
+class TestConcurrentUploadBars(unittest.TestCase):
+    """Each up_start gets its own token; finishing one upload must not
+    remove another's bar."""
+
+    def test_rich_tokens_are_independent(self):
+        if yt_show.RichProgress is None:
+            self.skipTest("rich not installed")
+        ui = yt_show.UI(use_rich=True)
+        t1 = ui.up_start("S01E01 One", 100)
+        t2 = ui.up_start("S01E02 Two", 100)
+        self.assertNotEqual(t1, t2)
+        ui.up_advance(50, 100, "1 MiB/s", task=t1)
+        ui.up_finish(t1)
+        self.assertEqual(list(ui.up_progress.task_ids), [t2])
+        ui.up_advance(70, 100, "1 MiB/s", task=t2)
+        self.assertEqual(ui.up_progress.tasks[0].completed, 70)
+        ui.up_finish(t2)
+        self.assertEqual(list(ui.up_progress.task_ids), [])
+
+    def test_untokened_calls_use_latest_upload(self):
+        # yt-video's single-upload call shape: no task argument.
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            ui = yt_show.UI(use_rich=False)
+            ui.up_start("Movie (2019)", 100)
+            ui.up_advance(40, 100, "2 MiB/s")
+            ui.up_finish()
+        self.assertIn("Movie (2019)  40%", err.getvalue())
+        self.assertIsNone(ui._up_task)
+        self.assertEqual(ui._up_labels, {})
 
 
 if __name__ == "__main__":
