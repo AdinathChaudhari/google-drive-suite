@@ -777,8 +777,8 @@ than no entry.
   VLC's network caching did nothing. The obvious suspects were Wi-Fi, a Drive
   stall, or the relay's `read=None` timeout.
 - **Learned** — it is the Stick's vendor hardware AVC decoder crashing, not
-  the stream. On a 97-min 1080p-class H.264 High@L4.0 MP4 (~2.1 Mbps, AAC
-  stereo — the lightest file in the library) the decoder service segfaulted in
+  the stream. On a light 1080p-class H.264 High@L4.0 MP4 (~2 Mbps, AAC
+  stereo) the decoder service segfaulted in
   every hardware run: 6 reproductions at 4 media positions, deterministic per
   start offset (identical frame counts on repeats). VLC stops its MediaCodec
   output thread and neither falls back to software nor shows an error.
@@ -791,7 +791,7 @@ than no entry.
   remux survives in hardware, so the trigger is container/timestamp-dependent
   inside the vendor decoder; the mechanism is unknown and routing around it
   does not need it. Software is not an option for 4K HEVC Main10 on this SoC
-  (~28 fps at 1080p), and ~40% of the library is 4K, so a global VLC
+  (~28 fps at 1080p), and much of a typical library is 4K, so a global VLC
   "hardware acceleration off" is wrong.
 - **Did** — a per-file policy on the server: `GET /api/media-info/{id}`
   ffprobes the file once over loopback `/stream` (cached in
