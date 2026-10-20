@@ -68,6 +68,11 @@ class DetailViewModel(
                     runCatching { container.repository.watchedMap().progress }.getOrDefault(_state.value.progress)
                 fetched to progress
             }.onSuccess { (fetched, progress) ->
+                // Warm the server's ffprobe cache for a movie's file so the VLC
+                // decode-policy lookup on Play is a cache hit (D-028).
+                fetched?.fileId?.let { fid ->
+                    viewModelScope.launch { container.repository.mediaInfo(fid) }
+                }
                 _state.update {
                     val resolved = fetched ?: it.title
                     it.copy(

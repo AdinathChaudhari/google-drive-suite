@@ -5,6 +5,7 @@ import com.drivecast.tv.api.AwakeStatus
 import com.drivecast.tv.api.ContinueItem
 import com.drivecast.tv.api.DrivecastApi
 import com.drivecast.tv.api.LibraryResponse
+import com.drivecast.tv.api.MediaInfo
 import com.drivecast.tv.api.PlaylistItem
 import com.drivecast.tv.api.ProgressBody
 import com.drivecast.tv.api.RefreshStarted
@@ -22,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import java.io.IOException
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -32,6 +34,9 @@ import retrofit2.Retrofit
 
 /** A probed subtitle track: the streamable URL plus the MIME the player needs. */
 data class SubtitleTrack(val url: String, val mimeType: String)
+
+/** Bound on GET /api/media-info; see [LibraryRepository.mediaInfo]. */
+private const val MEDIA_INFO_TIMEOUT_MS = 15_000L
 
 /**
  * The single source of truth for library data. Holds the active server URL, an
@@ -300,6 +305,17 @@ class LibraryRepository(
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * The server's per-file VLC hardware-decode policy (cached ffprobe, see
+     * docs/DECISIONS.md D-028). Null on timeout/any failure, which means
+     * "keep hardware" — the pre-0.5.2 behaviour. Never throws. The first probe
+     * of a large moov-at-end MP4 took ~10 s over Drive, so the bound is 15 s;
+     * DetailViewModel prefetches it so Play normally hits the cache.
+     */
+    suspend fun mediaInfo(fileId: String): MediaInfo? = withContext(Dispatchers.IO) {
+        runCatching { withTimeoutOrNull(MEDIA_INFO_TIMEOUT_MS) { requireApi().mediaInfo(fileId) } }.getOrNull()
     }
 
     private fun mimeForSubtitle(contentType: String?): String = when (contentType) {

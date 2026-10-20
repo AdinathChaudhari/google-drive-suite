@@ -1317,3 +1317,51 @@ def test_poster_override_invalid_id(client, monkeypatch):
     r = client.post("/api/poster-override",
                     json={"title": "Skyharbor", "type": "movie", "tmdb_id": 999999})
     assert r.status_code == 404
+
+
+# ---- /api/media-info (cached ffprobe + VLC hardware policy) ----
+
+def test_media_info_probes_once_and_returns_policy(client, monkeypatch, tmp_path):
+    from drivecast import media_info as media_info_mod
+    calls = []
+
+    async def fake_probe(file_id, port):
+        calls.append(file_id)
+        return {"codec": "h264", "profile": "High", "width": 1918, "height": 816,
+                "pix_fmt": "yuv420p", "fps": 23.976, "bitrate_mbps": 2.1,
+                "container": "mov,mp4"}
+
+    monkeypatch.setattr(media_info_mod, "probe", fake_probe)
+    client.app.state.dc.media_info.data = {}
+    client.app.state.dc.media_info.path = str(tmp_path / "media_info.json")
+    r = client.get("/api/media-info/fileA")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["known"] is True
+    assert body["codec"] == "h264"
+    assert body["vlc_disable_hardware"] is True
+    assert body["reason"] == "h264_sd_hd_software"
+    assert client.get("/api/media-info/fileA").json()["vlc_disable_hardware"] is True
+    assert calls == ["fileA"]  # second call was a cache hit
+    # The library's size is stored with the entry (a size change re-probes).
+    assert client.app.state.dc.media_info.data["fileA"]["size"] == 5000
+
+
+def test_media_info_unknown_keeps_hardware(client, monkeypatch, tmp_path):
+    from drivecast import media_info as media_info_mod
+
+    async def fake_probe(file_id, port):
+        return None
+
+    monkeypatch.setattr(media_info_mod, "probe", fake_probe)
+    client.app.state.dc.media_info.data = {}
+    client.app.state.dc.media_info.path = str(tmp_path / "media_info.json")
+    body = client.get("/api/media-info/fileE1").json()
+    assert body["known"] is False
+    assert body["vlc_disable_hardware"] is False
+    assert body["reason"] == "unknown_keep_hw"
+
+
+def test_media_info_requires_token_remotely(make_client):
+    with make_client({"remote_access": True, "remote_token": "s3cret"}) as c:
+        assert c.get("/api/media-info/fileA").status_code == 401
