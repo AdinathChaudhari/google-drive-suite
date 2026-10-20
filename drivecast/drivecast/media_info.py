@@ -25,7 +25,7 @@ from . import config as config_mod
 
 log = logging.getLogger("drivecast.media_info")
 
-# Software-decode envelope. 1918x816p24 measured ~111% of 400% CPU in VLC's
+# Software-decode envelope. 1080p-class 24p measured ~111% of 400% CPU in VLC's
 # software decoder; 1080p24 at 15 Mbps is estimated <=250%. 1080p60 or
 # >15 Mbps is not safe in software and keeps hardware.
 SW_DECODE_MAX_WIDTH = 1920
