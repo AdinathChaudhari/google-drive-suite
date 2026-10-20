@@ -17,7 +17,7 @@ def _info(codec="h264", w=1920, h=1080, fps=24.0, mbps=5.0, pix="yuv420p"):
 
 
 @pytest.mark.parametrize("info,disable,reason", [
-    (_info(w=1918, h=816, fps=23.976, mbps=2.1), True, "h264_sd_hd_software"),
+    (_info(w=1920, h=800, fps=23.976, mbps=2.1), True, "h264_sd_hd_software"),
     (_info(w=1280, h=720, fps=None, mbps=None), True, "h264_sd_hd_software"),
     (_info(fps=59.94), False, "h264_too_heavy_for_software"),
     (_info(fps=24, mbps=22.0), False, "h264_too_heavy_for_software"),
@@ -33,7 +33,7 @@ def test_vlc_policy_table(info, disable, reason):
 
 
 def test_vlc_policy_config_off_keeps_hardware():
-    out = media_info.vlc_policy(_info(w=1918, h=816), {"vlc_software_decode": False})
+    out = media_info.vlc_policy(_info(w=1920, h=800), {"vlc_software_decode": False})
     assert out == {"vlc_disable_hardware": False, "reason": "disabled_by_config"}
 
 
@@ -49,7 +49,7 @@ def test_parse_rate(raw, want):
 
 
 def test_normalise_bitrate_falls_back_to_format():
-    raw = {"streams": [{"codec_name": "h264", "width": 1918, "height": 816,
+    raw = {"streams": [{"codec_name": "h264", "width": 1920, "height": 800,
                         "pix_fmt": "yuv420p", "avg_frame_rate": "24000/1001"}],
            "format": {"bit_rate": "2200000", "format_name": "mov,mp4,m4a,3gp,3g2,mj2"}}
     out = media_info.normalise(raw)

@@ -1327,7 +1327,7 @@ def test_media_info_probes_once_and_returns_policy(client, monkeypatch, tmp_path
 
     async def fake_probe(file_id, port):
         calls.append(file_id)
-        return {"codec": "h264", "profile": "High", "width": 1918, "height": 816,
+        return {"codec": "h264", "profile": "High", "width": 1920, "height": 800,
                 "pix_fmt": "yuv420p", "fps": 23.976, "bitrate_mbps": 2.1,
                 "container": "mov,mp4"}
 
