@@ -10,6 +10,7 @@ upstream response in the generator's finally block.
 """
 import asyncio
 import logging
+import time
 
 import httpx
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -26,6 +27,9 @@ except ImportError:
 
 MEDIA_URL = "https://www.googleapis.com/drive/v3/files/{id}"
 CHUNK_SIZE = 1024 * 1024  # 1 MiB — fewer, larger relays than the old 64 KB
+# A gap this long between two upstream chunks is logged as a stall (WARNING).
+# Measured Drive->Mac max gap was 1.9 s at ~116 Mbps (docs/DECISIONS.md D-028).
+STALL_WARN_S = 5.0
 
 # Header names we relay from upstream to the client.
 RELAY_HEADERS = ("content-range", "content-length", "content-type", "accept-ranges")
@@ -173,17 +177,44 @@ class Streamer:
             # aclose) and on seek-abort, so the reference is always released.
             if self.keepawake is not None:
                 self.keepawake.acquire()
+            # Per-request throughput stats, logged once at INFO in `finally`, so
+            # a real upstream stall is visible in daily use (D-028). Never log
+            # the token, URL or file name.
+            t0 = last = time.monotonic()
+            sent = 0
+            max_gap = 0.0
+            gaps_over_2s = 0
+            end = "complete"
             try:
                 async for chunk in upstream.aiter_raw(CHUNK_SIZE):
+                    now = time.monotonic()
+                    gap = now - last
+                    last = now
+                    if gap > max_gap:
+                        max_gap = gap
+                    if gap > 2.0:
+                        gaps_over_2s += 1
+                    if gap > STALL_WARN_S:
+                        log.warning("stream %s… upstream stall %.1fs at offset %.1fMB",
+                                    file_id[:6], gap, sent / 1e6)
+                    sent += len(chunk)
                     yield chunk
             except (asyncio.CancelledError, httpx.RemoteProtocolError, httpx.ReadError, GeneratorExit):
                 # Player seeked or disconnected — normal, not an error.
+                end = "client_abort"
                 log.debug("stream aborted for %s (client seek/disconnect)", file_id)
                 raise
             except Exception as exc:  # pragma: no cover - defensive
+                end = "upstream_error"
                 log.debug("stream error for %s: %r", file_id, exc)
                 raise
             finally:
+                dur = time.monotonic() - t0
+                log.info("stream %s… range=%s status=%s sent=%.1fMB dur=%.1fs "
+                         "avg=%.1fMbps max_gap=%.2fs gaps>2s=%d end=%s",
+                         file_id[:6], range_header or "-", status, sent / 1e6, dur,
+                         (sent * 8 / 1e6 / dur) if dur > 0 else 0.0,
+                         max_gap, gaps_over_2s, end)
                 if self.keepawake is not None:
                     self.keepawake.release()
                 await upstream.aclose()

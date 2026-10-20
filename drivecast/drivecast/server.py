@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as config_mod
 from . import localcert
+from . import media_info
 from . import naming
 from .awake import KeepAwake
 from .drive_api import DriveAPI, DriveAPIError
@@ -73,6 +74,10 @@ class AppState:
         self._pending_scope = set()  # scopes requested while a scan was running
         self._pending_rebuild = False  # a rebuild/scope arrived mid-scan; re-kick on finish
         self.stream_activity = {}  # file_id -> epoch of last GET /stream request
+        # Cached ffprobe facts + the VLC hardware-decode policy (/api/media-info).
+        self.media_info = media_info.MediaInfoCache(
+            port=int(port),
+            size_for=lambda fid: (self.library.file_info(fid) or {}).get("size"))
 
     def start_refresh(self, scope=None, _draining=False):
         """Kick a background library scan, if idle.
@@ -712,6 +717,15 @@ def create_app(cfg=None):
         now = time.time()
         items = sorted(state.stream_activity.items(), key=lambda kv: kv[1], reverse=True)[:25]
         return {"now": now, "items": [{"file_id": fid, "ts": ts, "age": now - ts} for fid, ts in items]}
+
+    @app.get("/api/media-info/{file_id}")
+    async def api_media_info(file_id: str):
+        """Video stream facts (cached ffprobe) + whether the Fire TV app should
+        ask VLC for software decoding (see media_info.vlc_policy)."""
+        state = app.state.dc
+        info = await state.media_info.get(file_id)
+        return {"file_id": file_id, "known": info is not None, **(info or {}),
+                **media_info.vlc_policy(info, state.cfg)}
 
     # ---- keep-awake ("Are you still watching?") ----
     # Behind the normal auth middleware (no exemptions): the TV app will adopt

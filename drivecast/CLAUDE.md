@@ -56,5 +56,6 @@ A cache-only rebuild reports `total=0`, which is not "0 of 0 to scan" — both t
 ## Conventions & gotchas
 - Pure classifier functions do no I/O — they operate on the walked node trees the scanner builds; keep them side-effect-free (plugins get the same shapes).
 - Read-only on Drive: only the local cache (`library.json`, `data/scan_cache.json`, posters, `data/history.json`) is written.
+- `/api/media-info/{id}` = cached ffprobe + VLC hardware-decode policy (`media_info.py`, D-028); INFO logs (per-request stream stats) go to `data/drivecast.log`.
 - rclone config must be **unencrypted** (token is read non-interactively); default remote name `gdrive1`.
 - Local playback targets: mpv/IINA/VLC (position-tracked) + Infuse (launch-only via infuse:// URL scheme — no resume/watched/autoplay; never auto-picked).

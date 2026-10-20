@@ -50,6 +50,10 @@ DEFAULTS = {
     # Hold a macOS power assertion (caffeinate) while any stream is active, so a
     # lid-closed/clamshell Mac doesn't sleep and kill remote playback.
     "keep_awake": True,
+    # Fire TV: tell VLC to software-decode light H.264 (<=1080p30, <=15 Mbps)
+    # because the Stick's hardware AVC decoder crashes mid-file on some files
+    # (media_info.py, docs/DECISIONS.md D-028). False = always hardware.
+    "vlc_software_decode": True,
     # Remote access (opt-in): when enabled the server binds to the LAN/tailnet
     # instead of loopback and every non-local request must carry the secret
     # token. Both keys are non-secret and auto-saved (the token is generated on

@@ -32,6 +32,7 @@ import uvicorn
 
 from drivecast import config as config_mod
 from drivecast import localcert
+from drivecast.logging_setup import setup_logging
 from drivecast.rclone_auth import RcloneError, TokenManager
 from drivecast.server import create_app
 
@@ -330,6 +331,9 @@ def _notify_already_running(url):
 
 def main():
     cfg = config_mod.load_config()
+    # INFO (per-stream stats, media-info probes) -> data/drivecast.log; the
+    # .app has no console and uvicorn runs at "warning".
+    setup_logging(to_file=True)
     host = "0.0.0.0" if cfg.get("remote_access") else "127.0.0.1"
     port = int(cfg.get("port", 8737))
     # The browser URL is always loopback — "0.0.0.0" is a bind address, not
