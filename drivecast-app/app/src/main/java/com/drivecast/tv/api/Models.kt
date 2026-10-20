@@ -262,3 +262,16 @@ data class ApiError(
     val error: String? = null,
     val message: String? = null,
 )
+
+/** GET /api/media-info/{fileId} — cached ffprobe facts + the server's VLC
+ *  hardware-decode policy (drivecast/drivecast/media_info.py). Unknown -> hardware. */
+@Serializable
+data class MediaInfo(
+    @SerialName("file_id") val fileId: String = "",
+    val known: Boolean = false,
+    val codec: String? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    @SerialName("vlc_disable_hardware") val vlcDisableHardware: Boolean = false,
+    val reason: String? = null,
+)
