@@ -16,6 +16,7 @@ import uvicorn
 
 from drivecast import config as config_mod
 from drivecast import localcert
+from drivecast.logging_setup import setup_logging
 from drivecast.player import detect_player
 from drivecast.rclone_auth import RcloneError, TokenManager
 from drivecast.server import create_app
@@ -101,6 +102,7 @@ def main():
     except Exception:
         pass
     cfg = config_mod.load_config()
+    setup_logging(to_file=True)
     host = "0.0.0.0" if cfg.get("remote_access") else "127.0.0.1"
     port = int(cfg.get("port", 8737))
 

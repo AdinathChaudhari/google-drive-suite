@@ -149,6 +149,8 @@ private fun VlcPlayerHost(
                 putExtra("from_start", req.fromStart)
                 if (!req.fromStart && req.positionMs > 0) putExtra("position", req.positionMs)
                 req.subtitleUrl?.let { putExtra("subtitles_location", it) }
+                // VLC checks hasExtra(), not the value: never put `false` here.
+                if (req.disableHardware) putExtra("disable_hardware", true)
             }
             try {
                 launcher.launch(intent)

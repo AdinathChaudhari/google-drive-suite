@@ -4,9 +4,12 @@ import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.drivecast.tv.api.MediaInfo
 import com.drivecast.tv.api.WatchedProgress
 import com.drivecast.tv.di.AppContainer
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,7 +26,16 @@ data class VlcLaunchRequest(
     val fromStart: Boolean,
     val positionMs: Long,
     val subtitleUrl: String?,
+    /** Ask VLC to software-decode (the `disable_hardware` extra). See [shouldDisableHardware]. */
+    val disableHardware: Boolean = false,
 )
+
+/**
+ * True only when the server says this file should bypass the Stick's hardware
+ * AVC decoder, which crashes mid-file on some H.264 (audio keeps playing over
+ * a frozen frame). Unknown/failed lookups keep hardware. docs/DECISIONS.md D-028.
+ */
+fun shouldDisableHardware(info: MediaInfo?): Boolean = info?.vlcDisableHardware == true
 
 data class ExternalPlayerUiState(
     val loading: Boolean = true,
@@ -120,6 +132,13 @@ class ExternalPlayerViewModel(
             return
         }
         val resumeMs = if (fromStart) 0L else PlaybackQueue.resumeMsFor(item, progressMap)
+        // Subtitle probe and decode policy in parallel: both are best-effort.
+        val (subtitle, mediaInfo) = coroutineScope {
+            val sub = async { runCatching { repo.probeSubtitle(item.fileId) }.getOrNull() }
+            val info = async { runCatching { repo.mediaInfo(item.fileId) }.getOrNull() }
+            sub.await() to info.await()
+        }
+        val disableHardware = shouldDisableHardware(mediaInfo)
 
         _upNextRemaining.value = null
         _ui.value = _ui.value.copy(
@@ -143,8 +162,9 @@ class ExternalPlayerViewModel(
                 seed = seed,
             )
             // Best-effort subtitle for the first episode only — it may not
-            // survive VLC's playlist expansion, and that's acceptable.
-            val subtitle = runCatching { repo.probeSubtitle(item.fileId) }.getOrNull()
+            // survive VLC's playlist expansion, and that's acceptable. Same for
+            // disableHardware: VLC drops intent extras on m3u expansion, so it
+            // applies to the first item only (known gap).
             val subtitleUrl = if (subtitle != null) repo.authorizedSubtitleUrl(item.fileId) else null
             _launches.send(
                 VlcLaunchRequest(
@@ -153,12 +173,12 @@ class ExternalPlayerViewModel(
                     fromStart = true,
                     positionMs = 0,
                     subtitleUrl = subtitleUrl,
+                    disableHardware = disableHardware,
                 )
             )
         } else {
             // Movie / extra clip / resume bridge: single-item request, exactly as before.
             playlistSession = false
-            val subtitle = runCatching { repo.probeSubtitle(item.fileId) }.getOrNull()
             val subtitleUrl = if (subtitle != null) repo.authorizedSubtitleUrl(item.fileId) else null
             _launches.send(
                 VlcLaunchRequest(
@@ -167,6 +187,7 @@ class ExternalPlayerViewModel(
                     fromStart = fromStart,
                     positionMs = resumeMs,
                     subtitleUrl = subtitleUrl,
+                    disableHardware = disableHardware,
                 )
             )
         }
