@@ -43,6 +43,10 @@ interface DrivecastApi {
     @GET("api/watched-map")
     suspend fun watchedMap(): WatchedMap
 
+    /** Video facts + whether VLC should software-decode this file (D-028). */
+    @GET("api/media-info/{fileId}")
+    suspend fun mediaInfo(@Path("fileId") fileId: String): MediaInfo
+
     @POST("api/progress")
     suspend fun progress(@Body body: ProgressBody): OkResponse
 

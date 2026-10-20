@@ -61,6 +61,7 @@ than no entry.
 | [D-020](#d-020--a-season-by-season-torrent-is-copied-as-it-finishes-moved-only-at-the-end) | A season-by-season torrent is copied as it finishes, moved only at the end | Adopted | drive-offload |
 | [D-021](#d-021--each-season-folder-is-freed-once-it-is-verifiably-on-the-drive-then-the-next-one-starts) | Each season folder is freed once it is verifiably on the drive, then the next one starts | Adopted | drive-offload |
 | [D-024](#d-024--the-same-show-on-two-drives-merges-by-normalised-title--year-after-group_seasons) | The same show on two drives merges by normalised title + year, after `group_seasons` | Adopted | drivecast |
+| [D-028](#d-028--vlc-software-decodes-light-h264-on-the-fire-tv-stick) | VLC software-decodes light H.264 on the Fire TV Stick | Adapted | drivecast, drivecast-app |
 
 ---
 
@@ -767,3 +768,58 @@ than no entry.
 - **Revisit when** — two genuinely different shows share a title and both lack
   a year across two drives (they would merge), or a torrent name carries a
   title-shaped word the trailing strip does not know.
+
+### D-028 — VLC software-decodes light H.264 on the Fire TV Stick
+**Status:** Adapted · **When:** 2026-10-20
+
+- **Hit** — movies on the Fire TV Stick 4K Plus (AFTMA08C15, VLC 3.6.5)
+  froze mid-file: audio kept playing over a frozen frame, forever. Raising
+  VLC's network caching did nothing. The obvious suspects were Wi-Fi, a Drive
+  stall, or the relay's `read=None` timeout.
+- **Learned** — it is the Stick's vendor hardware AVC decoder crashing, not
+  the stream. On a 97-min 1080p-class H.264 High@L4.0 MP4 (~2.1 Mbps, AAC
+  stereo — the lightest file in the library) the decoder service segfaulted in
+  every hardware run: 6 reproductions at 4 media positions, deterministic per
+  start offset (identical frame counts on repeats). VLC stops its MediaCodec
+  output thread and neither falls back to software nor shows an error.
+  Controls: the original bytes served by a plain LAN HTTP server (Drive and
+  drivecast out of the path) crashed at the identical frame; the relay showed
+  no throughput dip at the crash second; Drive→Mac pulled ~116 Mbps with a
+  max 1.9 s gap between 1 MiB chunks. The same file and seek with VLC's
+  `disable_hardware` extra played 150 s straight through the crash point at a
+  mean ~111% (max ~152%) of the Stick's 400% CPU. A byte-identical `-c copy`
+  remux survives in hardware, so the trigger is container/timestamp-dependent
+  inside the vendor decoder; the mechanism is unknown and routing around it
+  does not need it. Software is not an option for 4K HEVC Main10 on this SoC
+  (~28 fps at 1080p), and ~40% of the library is 4K, so a global VLC
+  "hardware acceleration off" is wrong.
+- **Did** — a per-file policy on the server: `GET /api/media-info/{id}`
+  ffprobes the file once over loopback `/stream` (cached in
+  `data/media_info.json`; failures re-probed after an hour) and answers
+  `vlc_disable_hardware=true` only for H.264, 8/10-bit 4:2:0, ≤1920×1088,
+  ≤30.5 fps, ≤15 Mbps. Everything else and every unknown keeps hardware.
+  The app (0.5.2) forwards it as the `disable_hardware` intent extra — VLC
+  tests the extra's *presence*, so `false` is never put. Playlists carry it
+  for the first item only (VLC drops extras on m3u expansion). The first
+  probe of a moov-at-end MP4 took ~10 s over Drive, so the detail screen
+  prefetches it and the app waits at most 15 s before falling back to
+  hardware. `"vlc_software_decode": false` in config.json turns the policy
+  off. The relay also logs one INFO line per request to `data/drivecast.log`
+  (`stream <id6>… range=… status=… sent=…MB dur=…s avg=…Mbps max_gap=…s
+  gaps>2s=N end=complete|client_abort|upstream_error`) and a WARNING for any
+  gap over 5 s between upstream chunks, so a real Drive stall would show up.
+- **Where** — `drivecast/drivecast/media_info.py:84` (`vlc_policy`,
+  thresholds at `:31`); `drivecast/drivecast/server.py:722`;
+  `drivecast/drivecast/streaming.py:213` (log line), `:32` (stall threshold);
+  `drivecast/drivecast/logging_setup.py`;
+  `drivecast-app/app/src/main/java/com/drivecast/tv/ui/player/PlayerScreen.kt:153`,
+  `ExternalPlayerViewModel.kt:38`. Tests: `test_media_info.py`,
+  `test_server.py` (media-info section), `HardwareDecodePolicyTest.kt`
+  (mutation-checked: forcing the policy to hardware, and demoting the stream
+  log line to DEBUG, each fail a test).
+- **Revisit when** — VLC on the Stick updates (re-run the hardware control:
+  if the decoder no longer crashes, the policy can go); a 1080p H.264 title
+  stutters in software (tighten the thresholds); many 1080p H.264 titles never
+  crash in hardware (narrow the gate, e.g. to MP4 only); or the stream log ever
+  shows `max_gap` > 5 s (then build a stall-resilient relay — "long 4K movies
+  keep buffering" is unmeasured and may be a separate issue).
