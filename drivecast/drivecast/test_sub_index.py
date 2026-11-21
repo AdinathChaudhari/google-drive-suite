@@ -349,6 +349,49 @@ def test_sweep_complete_only_after_run_finishes(tmp_path, monkeypatch):
     assert SubIndex(path=index.path).sweep_complete() is True
 
 
+def test_all_probes_failed_does_not_mark_sweep_complete(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec_factory("", calls, returncode=1))
+    index = SubIndex(path=str(tmp_path / "sub_index.json"))
+    sweeper = SubtitleSweeper(index, port=8737)
+    asyncio.run(sweeper.run([("a", 1), ("b", 2)]))
+    assert index.sweep_complete() is False
+    assert "failed" in sweeper.status["error"]
+    # Recovers once ffprobe answers.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec_factory(SUBRIP_EN, calls))
+    asyncio.run(sweeper.run([("a", 1), ("b", 2)]))
+    assert index.sweep_complete() is True
+
+
+def test_minority_failures_still_mark_complete(tmp_path, monkeypatch):
+    async def _exec(*cmd, stdout=None, stderr=None):
+        bad = cmd[-1].endswith("/bad")
+        return _FakeProc(stdout=SUBRIP_EN.encode("utf-8"),
+                         returncode=1 if bad else 0)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec)
+    index = SubIndex(path=str(tmp_path / "sub_index.json"))
+    sweeper = SubtitleSweeper(index, port=8737)
+    asyncio.run(sweeper.run([("g1", 1), ("g2", 2), ("bad", 3)]))
+    assert index.get("bad")["ok"] is False
+    assert index.sweep_complete() is True  # one dead file must not block
+
+
+def test_transient_oserror_is_per_file_failure_not_abort(tmp_path, monkeypatch):
+    def _emfile(*cmd, **kw):
+        async def _boom(*a, **k):
+            raise OSError(24, "Too many open files")
+        return _boom(*cmd, **kw)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _emfile)
+    index = SubIndex(path=str(tmp_path / "sub_index.json"))
+    sweeper = SubtitleSweeper(index, port=8737)
+    asyncio.run(sweeper.run([("a", 1), ("b", 2)]))
+    assert sweeper._aborted is False
+    assert index.get("a")["ok"] is False and index.get("b")["ok"] is False
+    assert index.needs_probe("a", 1) is True
+
+
 def test_flush_failure_does_not_wedge_running(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(asyncio, "create_subprocess_exec",

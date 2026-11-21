@@ -368,7 +368,7 @@ def test_periodic_backfill_waits_for_the_first_sweep(monkeypatch):
 
 
 def test_periodic_backfill_ignores_a_pending_list_left_from_before_the_sweep(monkeypatch):
-    """The probed_count guard is not redundant with the worklist gate.
+    """The sweep_complete guard is not redundant with the worklist gate.
 
     `_refresh_backfill_worklist` returning early keeps a NEW guess-list from
     being built, but it cannot un-persist one that is already on disk. This

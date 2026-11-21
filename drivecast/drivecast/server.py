@@ -154,6 +154,7 @@ class AppState:
         self._refresh_task = None
         self._pending_scope = set()  # scopes requested while a scan was running
         self._pending_rebuild = False  # a rebuild/scope arrived mid-scan; re-kick on finish
+        self._inflight_resolves = {}  # (file_id, force, allow_os) -> resolve() task
         self._detached_resolves = set()  # resolve() tasks outliving their wait bound
         self.stream_activity = {}  # file_id -> epoch of last GET /stream request
         # Cached ffprobe facts + the VLC hardware-decode policy (/api/media-info).
@@ -432,10 +433,23 @@ class AppState:
         """resolve() with a wait bound that does NOT cancel it: on timeout
         the lookup finishes detached, so an OpenSubtitles slot already spent
         still lands a cached sidecar instead of being thrown away."""
-        task = asyncio.ensure_future(self.subtitles.resolve(*args, **kw))
-        self._detached_resolves.add(task)
-        task.add_done_callback(self._detached_resolves.discard)
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        # One in-flight resolve per (file, force, allow_opensubtitles): a
+        # retry made while a detached lookup is still running joins it
+        # instead of starting a second one that would spend another slot.
+        key = (args[0] if args else kw.get("file_id"), bool(kw.get("force")),
+               kw.get("allow_opensubtitles", True))
+        task = self._inflight_resolves.get(key)
+        if task is None or task.done():
+            task = asyncio.ensure_future(self.subtitles.resolve(*args, **kw))
+            self._inflight_resolves[key] = task
+            self._detached_resolves.add(task)
+
+            def _finished(t, key=key):
+                self._detached_resolves.discard(t)
+                if self._inflight_resolves.get(key) is t:
+                    del self._inflight_resolves[key]
+                t.cancelled() or t.exception()
+            task.add_done_callback(_finished)
         return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
     def swept(self):
@@ -513,12 +527,12 @@ class AppState:
         before = self.subtitles.os_download_calls
         transient = False
         try:
-            path = await asyncio.wait_for(
-                self.subtitles.resolve(
-                    fid, info.get("name") or fid, info.get("drive_id"),
-                    info.get("parent_id"), size=size,
-                    tmdb_id=tmdb_id, season=season, episode=episode),
-                timeout=25.0)
+            # Bounded but not cancelled: a download already charged still
+            # lands its sidecar after the wait gives up.
+            path = await self._resolve_bounded(
+                25.0, fid, info.get("name") or fid, info.get("drive_id"),
+                info.get("parent_id"), size=size,
+                tmdb_id=tmdb_id, season=season, episode=episode)
         except Exception as e:
             # A timeout or crash is not a "not found": say so in the log and
             # flag it so the queue can tell it apart from a genuine miss.

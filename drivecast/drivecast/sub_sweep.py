@@ -156,8 +156,16 @@ class SubtitleSweeper:
             "-show_entries", "stream_disposition=forced,hearing_impaired",
             "-of", "json", self._url(file_id),
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+        except (FileNotFoundError, PermissionError):
+            raise  # ffprobe missing / not executable: aborts the sweep
+        except OSError as e:
+            # Transient spawn fault (e.g. EMFILE): a per-file failure.
+            return {"ok": False, "tracks": [], "has_text_en": False,
+                    "has_image_en": False, "error": "spawn_failed: %s" % e}
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(),
                                                      timeout=PROBE_TIMEOUT)
@@ -187,7 +195,7 @@ class SubtitleSweeper:
         try:
             async with self.sem:
                 result = await self._probe_one(file_id)
-        except OSError as e:
+        except (FileNotFoundError, PermissionError) as e:
             # Spawn failure (ffprobe missing / not executable): an
             # environment fault, not a fact about this file. Store nothing
             # and stop the sweep so no false "no subtitles" data is written.
@@ -204,6 +212,8 @@ class SubtitleSweeper:
         record["probed_at"] = time.time()
         self.index.put(file_id, record)
         self.status["probed"] += 1
+        if not record.get("ok"):
+            self._failed += 1
 
     async def run(self, file_ids_with_size):
         """Probe every ``(file_id, size)`` not already indexed at that size.
@@ -216,11 +226,21 @@ class SubtitleSweeper:
         pending = [(fid, size) for fid, size in file_ids_with_size
                   if self.index.needs_probe(fid, size)]
         self._aborted = False
+        self._failed = 0
         self.status.update(running=True, probed=0, total=len(pending), error=None)
         try:
             await asyncio.gather(*(self._probe_and_store(fid, size)
                                    for fid, size in pending))
-            if not self._aborted:
+            if self._aborted:
+                pass
+            elif self._failed * 2 > len(pending):
+                # Most probes failed (e.g. /stream unreachable): the data is
+                # not usable coverage, so do not open the swept() gate.
+                # needs_probe retries the failed records next sweep.
+                self.status["error"] = ("%d of %d probes failed; sweep not "
+                                        "marked complete"
+                                        % (self._failed, len(pending)))
+            else:
                 # Explicit completion marker (see SubIndex.sweep_complete):
                 # a partial/interrupted sweep never sets it.
                 self.index.mark_complete()

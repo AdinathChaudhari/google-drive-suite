@@ -349,6 +349,11 @@ class SubtitleQueue:
             self.data["spent"][provider] = self.spent(provider) + 1
         if remaining is not None:
             self.data["remaining_hint"][provider] = max(int(remaining), 0)
+        elif spend and self.data["remaining_hint"].get(provider) is not None:
+            # A charged attempt that reported no quota: an older hint is now
+            # one slot too generous.
+            self.data["remaining_hint"][provider] = max(
+                int(self.data["remaining_hint"][provider]) - 1, 0)
         if not ok and mark_failed and file_id not in self.data["failed_today"]:
             self.data["failed_today"].append(file_id)
         self._save()
@@ -506,14 +511,17 @@ class SubtitleQueue:
                 quota_stop = (not ok and spent and remaining is not None
                               and int(remaining) <= 0)
                 glitch = outcome.get("glitch")
-                # A transient failure (e.g. a 25 s timeout) says nothing
-                # about the file: no failed_today entry, no parking attempt.
+                # A transient failure (e.g. a 25 s timeout) says nothing about
+                # the file: no parking attempt. If a slot was actually spent,
+                # still keep it off the queue for the day so the next pass
+                # does not burn a second slot on it.
                 transient = bool(outcome.get("transient"))
                 if outcome.get("reset_utc") is not None:
                     self.note_quota_reset(outcome["reset_utc"])
                 self.record_spend(item["file_id"], ok, remaining=remaining,
                                   spend=spent,
-                                  mark_failed=not (quota_stop or glitch or transient))
+                                  mark_failed=not (quota_stop or glitch
+                                                    or (transient and not spent)))
                 if ok:
                     self._remove_pending(item["file_id"])
                     self.status["ok"] += 1

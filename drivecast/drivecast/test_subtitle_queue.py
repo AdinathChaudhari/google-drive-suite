@@ -479,12 +479,36 @@ def test_transient_failure_is_not_blamed_on_the_item(tmp_path):
          "queued_at": "2026-08-22T09:00:00"}]
 
     async def attempt(item):
-        return {"ok": False, "spent": True, "transient": True}
+        return {"ok": False, "spent": False, "transient": True}
 
     _run(q.run(attempt))
     assert q.data["failed_today"] == []
     assert not q.data["pending"][0].get("attempts")
     assert [i["file_id"] for i in q.data["pending"]] == ["f1"]
+
+
+def test_spent_transient_failure_is_not_retried_same_day(tmp_path):
+    q = _queue(tmp_path, daily_limit=5, today="2026-08-22")
+    q.data["pending"] = [
+        {"file_id": "f1", "priority": PRIORITY_OTHER, "reason": "other",
+         "queued_at": "2026-08-22T09:00:00"}]
+
+    async def attempt(item):
+        return {"ok": False, "spent": True, "transient": True}
+
+    _run(q.run(attempt))
+    assert q.spent() == 1
+    assert q.data["failed_today"] == ["f1"]
+    assert not q.data["pending"][0].get("attempts")
+
+
+def test_spend_without_remaining_decrements_existing_hint(tmp_path):
+    q = _queue(tmp_path, daily_limit=5)
+    q.record_spend("f1", True, remaining=3)
+    q.record_spend("f2", False, remaining=None)
+    assert q.remaining() == 2
+    q.record_spend("f3", False, remaining=None, spend=False)
+    assert q.remaining() == 2
 
 
 def test_save_failure_cleans_temp_and_clears_running(tmp_path, monkeypatch):

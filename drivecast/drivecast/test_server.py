@@ -1783,3 +1783,49 @@ def test_api_subtitles_refresh_post_passes_match_hints(client):
     state._os_match_hints = lambda fid, info=None: (123, 77, 2, 5)
     client.post("/api/subtitles/fileA/refresh")
     assert (seen["size"], seen["tmdb_id"], seen["season"], seen["episode"]) == (123, 77, 2, 5)
+
+
+def test_resolve_bounded_joins_inflight_resolve_for_same_file(client):
+    state = client.app.state.dc
+    started = []
+
+    async def _slow(file_id, *a, **k):
+        started.append(file_id)
+        await asyncio.sleep(0.1)
+        return "/x.srt"
+    state.subtitles.resolve = _slow
+
+    async def _go():
+        with pytest.raises(asyncio.TimeoutError):
+            await state._resolve_bounded(0.01, "f")
+        again = await state._resolve_bounded(1.0, "f")   # retry joins it
+        other = await state._resolve_bounded(1.0, "g")   # other file: own task
+        return again, other
+    again, other = asyncio.run(_go())
+    assert again == "/x.srt" and other == "/x.srt"
+    assert started == ["f", "g"]
+    assert state._inflight_resolves == {}
+
+
+def test_backfill_attempt_does_not_cancel_resolve_on_timeout(client, monkeypatch):
+    state = client.app.state.dc
+    done = []
+
+    async def _slow(*a, **k):
+        await asyncio.sleep(0.2)
+        done.append(1)
+        return "/x.srt"
+    state.subtitles.resolve = _slow
+    real = state._resolve_bounded
+
+    async def _fast_bound(timeout, *a, **k):
+        return await real(0.01, *a, **k)
+    monkeypatch.setattr(state, "_resolve_bounded", _fast_bound)
+
+    async def _go():
+        res = await state._backfill_attempt({"file_id": "f"})
+        await asyncio.sleep(0.4)
+        return res
+    res = asyncio.run(_go())
+    assert res["transient"] is True and res["ok"] is False
+    assert done == [1]          # the lookup finished detached
