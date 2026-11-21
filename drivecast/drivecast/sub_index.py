@@ -87,7 +87,7 @@ class SubIndex:
         Zero means the sweep has never run, which callers must NOT read as
         "nothing is covered": before the first sweep every file looks
         uncovered, and a backfill worklist built from that would be the whole
-        library (2,225 entries) plus a Settings panel confidently reporting
+        library (every entry) plus a Settings panel confidently reporting
         0% coverage. See server.py's `_refresh_backfill_worklist`.
         """
         return len(self.data["probed"])

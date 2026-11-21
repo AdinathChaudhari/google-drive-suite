@@ -248,7 +248,7 @@ still at its `none` default (`app.js` § `groupItems`) — an explicit `type`/`c
 something to "fix" — the TV simply has no vocabulary to offer on those tabs.
 
 ### 5.8 The TV cannot select an embedded subtitle track
-Roughly 40% of this library's files carry a usable English **text** track of
+Roughly 40% of sampled files carry a usable English **text** track of
 their own, and another ~27% carry an English **image** track (measured over 30
 real files, `DECISIONS.md` [D-029](DECISIONS.md#d-029--embedded-first-subtitles-index-before-fetch)).
 On the desktop the server exploits that directly: `/api/play` reads the probe

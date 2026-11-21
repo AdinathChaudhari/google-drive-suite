@@ -835,10 +835,10 @@ than no entry.
 ### D-029 — Embedded-first subtitles: index before fetch
 **Status:** Adopted · **When:** 2026-08-23
 
-- **Hit** — the subtitle cache held 62 sidecars against 2,225 video files, 2.8%,
-  and the plan that followed was "fetch the other 97%": 111 days at
-  OpenSubtitles' 20/day, 445 days at the anonymous 5/day.
-- **Learned** — 2.8% was the wrong denominator. It counts sidecars, not
+- **Hit** — the subtitle cache held sidecars for under 3% of the video files,
+  and the plan that followed was "fetch the other 97%": months at
+  OpenSubtitles' 20/day, more than a year at the anonymous 5/day.
+- **Learned** — that share was the wrong denominator. It counts sidecars, not
   coverage; most of these files already carry their own subtitle tracks (138
   subtitle streams across 30 files, 4.6 per file on average). But the first
   10-file sample said "9 of 10 carry an embedded English track", and a
@@ -856,12 +856,13 @@ than no entry.
 
   So two thirds of files carry *some* English track, but only **40%** carry the
   text track the desktop short-circuit needs — not 90%. The backfill worklist
-  (anything without `has_text_en`) is therefore ~60% of the library, ~1,335
-  files, not the ~220 the plan projected. Tagging held up well enough to build
+  (anything without `has_text_en`) is therefore ~60% of the files, several
+  times what the plan projected. Tagging held up well enough to build
   on: 24 English-tagged tracks, and 35 of 138 streams untagged/`und` — present
   where it matters, so `--slang=eng` has something to match. Cost also came in
   better than estimated: **0.65 s/file** wall-clock at 6-way concurrency (19.4 s
-  for 30 files), which puts a full 2,225-file sweep near **24 minutes**, not 8.
+  for 30 files), which puts a full sweep of a few thousand files in the tens of minutes,
+  about three times the estimate.
 - **Did** — coverage comes from a one-time ffprobe index into
   `data/sub_index.json`, keyed on the immutable `file_id` with `size` alongside,
   and external fetching serves only the measured remainder. Standalone, not
@@ -877,7 +878,7 @@ than no entry.
   `:218` (the scope guard that keeps the sweep off a cache-only rebuild),
   `:252` (`start_sweep`); `drivecast/drivecast/scan_cache.py:64` (the `put`
   behaviour this store avoids).
-- **Revisit when** — the full sweep finishes. These are 30 files of 2,225; the
+- **Revisit when** — the full sweep finishes. These are 30 sampled files; the
   real figure is what the sweep prints. If it lands near 40% text coverage, the
   five-a-day budget is badly undersized (see D-023) and D-022's device test
   becomes the cheapest way to cut the gap almost in half.
@@ -904,15 +905,15 @@ than no entry.
   a Settings row all override. Accepted files keep their native extension —
   writing ASS bytes under `.srt` would mislabel them for `mime_for`. UTF-16 is
   deliberately absent from the decode list: a BOM-less UTF-16 attempt destroyed
-  a real 1,752-cue subtitle.
+  a real, full-length subtitle.
 - **Where** — `drivecast/drivecast/subtitles.py:210`
   (`sanitize_subtitle_bytes`), `:462` (`_accept`, the single write point),
   `:253` (`NEG_TTL`), `:407` (`cached`, the existence-trust this bounds);
   `drivecast/scripts/migrate_subtitles.py` (dry-run by default, quarantines
   rather than deletes).
 - **Revisit when** — the migration prints a reject you believe is good. Verified
-  on the live cache on 2026-08-23: **65 files, 62 kept (59 re-encoded), 3
-  rejected** — the same two block pages and one ad stub, no false positives. The
+  on the live cache on 2026-08-23: almost every file kept (most re-encoded),
+  a handful rejected — block pages and an ad stub, no false positives. The
   cue-count and ad-ratio thresholds are named constants for exactly this.
 
 ### D-031 — Android VLC per-item XSPF subtitles: still unmeasured
@@ -970,21 +971,21 @@ than no entry.
   (`build_infuse_url`, the text-only consumer).
 - **Revisit when** — someone plays a PGS-only file and confirms text appears **on
   screen**, per player (Fire TV VLC, then desktop mpv/IINA/VLC). This is now the
-  highest-value 10 minutes available: a pass moves ~590 files out of the
+  highest-value 10 minutes available: a pass moves about a quarter of the files out of the
   backfill queue and cuts the remaining gap by roughly 44%.
 
 ### D-023 — One subtitle provider, anonymous tier, no stored credentials
 **Status:** Open · **When:** 2026-08-23
 
 - **Hit** — OpenSubtitles allows 5 downloads/day anonymous, 20/day with an
-  account, 1000/day VIP. Against 2,225 files that is 111 days even at 20/day,
+  account, 1000/day VIP. Against a library of a few thousand files that is months even at 20/day,
   which argued for a login and a second provider.
 - **Learned** — the embedded-first re-weighting shrank the gap, but not nearly
   as far as hoped. The 30-file measurement (D-029) puts the text-uncovered
-  worklist at ~60% of the library, **~1,335 files**: that is ~267 days at 5/day
-  and ~67 days at 20/day. If D-022's device test passes and image-only files
-  count as covered, the worklist drops to ~33%, ~741 files — ~148 days at 5/day,
-  ~37 days at 20/day. So the 5/day default is comfortably undersized, and the
+  worklist at **~60% of the files**: most of a year at 5/day
+  and a couple of months at 20/day. If D-022's device test passes and image-only files
+  count as covered, the worklist drops to ~33% — roughly half that time at
+  either rate. So the 5/day default is comfortably undersized, and the
   honest ranking of remedies is: run D-022's device test first (free, cuts the
   gap ~44%), then consider the 20/day login. A live download on 2026-08-23
   returned `remaining: 2`, confirming the field name and shape the queue's
@@ -1004,7 +1005,7 @@ than no entry.
   `:663` (`_download_os_file`, where `remaining` is read);
   `drivecast/drivecast/moviehash.py` (the OSDb hash).
 - **Revisit when** — the full sweep prints the real worklist size. If it
-  confirms ~1,335 files and D-022 fails, the login is the cheaper of the two
+  confirms a worklist near 60% and D-022 fails, the login is the cheaper of the two
   reinstatements and this entry flips to Adopted.
 
 ### D-032 — A backfill slot is spent only when the provider was really called
@@ -1029,7 +1030,7 @@ than no entry.
   `SubtitleResolver.os_download_calls` counts issued `/download` requests, the
   caller snapshots it around `resolve()`, and `run()` charges only on a
   difference. Coverage now also counts an existing sidecar, read with **one**
-  `os.listdir` rather than four `os.path.exists` per file across 2,225 ids. The
+  `os.listdir` rather than four `os.path.exists` per file across thousands of ids. The
   head-of-line stall gets two guards: a free `is_blocked` pre-check (the
   negative cache) skips an item without an attempt or a spend, and an item with
   `PARK_AFTER_ATTEMPTS` real misses is retried weekly instead of daily. A
@@ -1089,7 +1090,7 @@ than no entry.
 
   Extraction is a **full-file read**, and unavoidably so: subtitle packets are
   interleaved across the whole container, so the last cue lives near the last
-  byte. On this library that means pulling a multi-gigabyte movie through the
+  byte. For a typical film that means pulling a multi-gigabyte movie through the
   Drive proxy to obtain ~60 KB of text — per file, for hundreds of files. The
   probe, by contrast, is bounded by `-probesize` and stays near a megabyte
   regardless of how large the film is.

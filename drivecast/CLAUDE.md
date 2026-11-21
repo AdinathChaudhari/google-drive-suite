@@ -130,7 +130,7 @@ subtitles". Do not remove that gate: a stale `pending` list on disk from
 before a sweep is exactly the case it also guards.
 
 **Image-only English** (`hdmv_pgs_subtitle`/`dvd_subtitle`) is ~27% of the
-sampled library and is **not** treated as coverage yet — `--slang` would
+sampled files and is **not** treated as coverage yet — `--slang` would
 select it and these players are documented to render it, but that is
 unverified on this hardware and a wrong "covered" is unrecoverable. Flip
 `prefer_embedded_image_subtitles` to `True` after the device test; it is a

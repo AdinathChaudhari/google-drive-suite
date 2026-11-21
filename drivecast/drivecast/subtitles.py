@@ -150,7 +150,7 @@ _CUE_RE = re.compile(r"\d{1,3}:\d{2}:\d{2}[,.]\d{1,3}\s*-->")
 _ASS_CUE_RE = re.compile(r"^\s*Dialogue\s*:", re.M)
 # Encodings tried in order once no BOM has settled it. UTF-16 is deliberately
 # ABSENT: a BOM-less UTF-16 attempt "succeeds" on plain ASCII by pairing bytes
-# into CJK garbage, which silently turned a real 1,752-cue subtitle in the live
+# into CJK garbage, which silently turned a real, full-length subtitle in the live
 # cache into a zero-cue reject. latin-1 never fails, so it is the floor and the
 # reason "undecodable" is reserved for bytes that are not text at all.
 _ENCODINGS = ("utf-8", "cp1252", "latin-1")

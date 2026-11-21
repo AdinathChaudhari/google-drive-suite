@@ -1,8 +1,8 @@
 """Persistent, daily-budgeted priority queue for the OpenSubtitles backfill
 (Session D of the subtitles plan).
 
-Why this exists: session B's sweep turns "2.8% cached" into a real number —
-roughly a tenth of the library, ~220 files, genuinely has no usable English
+Why this exists: session B's sweep turns "under 3% cached" into a real number —
+a share of the library genuinely has no usable English
 subtitle. OpenSubtitles' anonymous tier allows five downloads a day (D-022),
 so backfilling that gap is a matter of weeks, not one sweep. This module is
 the thing that remembers, across restarts, which files still need a fetch,

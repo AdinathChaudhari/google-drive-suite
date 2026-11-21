@@ -239,8 +239,8 @@ class AppState:
     def _video_files_for_sweep(self):
         """(file_id, size) for every movie and episode in the CURRENT library.
 
-        Extras and audiobooks are left out on purpose: 356 movies + 1,869
-        episodes = 2,225 is the exact file count this plan measures against,
+        Extras and audiobooks are left out on purpose: movies + episodes is
+        the exact file set this plan measures against,
         and extras/audiobooks were never part of that count.
         """
         out = []
@@ -360,8 +360,8 @@ class AppState:
         """file_ids that already have a cached sidecar subtitle on disk.
 
         ONE listdir of the subs directory, not four os.path.exists calls per
-        file: the caller runs this over 2,225 ids on every worklist sync and
-        status poll, and 8,900 stat calls per poll is a real cost for an
+        file: the caller runs this over every id on each worklist sync and
+        status poll, and four stat calls per id per poll is a real cost for an
         answer one directory read gives exactly.
         """
         out = set()
@@ -405,8 +405,8 @@ class AppState:
         """Has the embedded-track sweep ever produced a result?
 
         Everything downstream is meaningless before it has. With an empty
-        index every one of 2,225 files reads as uncovered, which built a
-        2,225-entry pending list (rewritten on every later spend), told the
+        index every file reads as uncovered, which built a
+        whole-library pending list (rewritten on every later spend), told the
         Settings panel "0 of 2225 files have subtitles", and pointed the
         Fetch-now button at five files that are ~90% likely to have had an
         embedded English track all along.

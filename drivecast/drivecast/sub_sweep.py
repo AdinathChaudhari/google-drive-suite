@@ -1,6 +1,6 @@
 """One-time ffprobe sweep of embedded subtitle tracks (Session B).
 
-Measured motive: the sidecar cache covered 2.8% of the library, which said
+Measured motive: the sidecar cache covered under 3% of the library, which said
 nothing about what the files themselves carry. A 10-file sample suggested 9
 of 10 already had an embedded English track; a 30-file run put usable
 English **text** tracks at 40%, image-only at 27% and nothing at 33% (see
@@ -140,7 +140,7 @@ class SubtitleSweeper:
 
         Every failure path (timeout, non-zero exit, unparsable output)
         returns a record with ``ok: False`` rather than raising — a sweep
-        over ~2,225 files must not let one bad file abort the rest, and
+        over thousands of files must not let one bad file abort the rest, and
         `run()`'s per-item wrapper still stores whatever this returns so a
         dead file is at least recorded as "checked, no answer" and does not
         get re-probed every sweep."""

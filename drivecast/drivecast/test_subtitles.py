@@ -348,7 +348,7 @@ def test_sanitize_does_not_misdecode_bomless_utf16_lookalike():
     This is the live-cache bug in miniature: the file is not valid UTF-8 (one
     cp1252 byte), so a UTF-16 attempt gets its turn — and BOM-less UTF-16
     "succeeds" on even-length text by pairing bytes into CJK garbage, which
-    turned a real 1,752-cue subtitle into a zero_cue reject. The payload is
+    turned a real, full-length subtitle into a zero_cue reject. The payload is
     padded to an even length so UTF-16 really would decode it.
     """
     # Genuine cp1252 bytes, not a UTF-8 encoding of the same characters —
