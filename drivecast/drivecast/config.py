@@ -39,6 +39,37 @@ DEFAULTS = {
     # Load English subtitles when available (sibling .srt on the drive, or
     # OpenSubtitles when an API key is configured in secrets).
     "subtitles": True,
+    # Session C (subtitles plan): when the embedded-subtitle index
+    # (sub_index.py) shows a usable English text track already inside the
+    # file, tell the player to select it by language (--slang / --sub-
+    # language) instead of fetching/serving a sidecar at all. Measured on 30
+    # real files: 40% carry one (a 10-file sample said 9 of 10 -- see
+    # docs/DECISIONS.md D-029 for why the bigger sample governs); a
+    # forced-only or hearing-impaired-only English track, or one with no
+    # index entry yet, still falls through to the sidecar resolver exactly
+    # as if this were off. Off reproduces pre-session-C behaviour: always
+    # resolve() a sidecar, ignore what the index knows.
+    "prefer_embedded_subtitles": True,
+    # Session D (subtitles plan): how many OpenSubtitles downloads the
+    # backfill queue (subtitle_queue.py) may spend per calendar day. Kept as
+    # a config key rather than a constant so raising it (e.g. after logging
+    # into a 20/day account, D-022) is a one-line change, not a code change.
+    # 5 matches the current anonymous-tier key -- see docs/DECISIONS.md D-022.
+    "subtitle_daily_limit": 5,
+    # Image-based English tracks (PGS/dvd_subtitle) count as "already
+    # subtitled" for the desktop players. Default OFF because D-031's device
+    # test has not run: mpv/IINA/VLC are all DOCUMENTED to render an image
+    # track selected by language, but that is unverified on this hardware,
+    # and a false "covered" would silently leave those files with no
+    # subtitle at all. Flipping this to True after the test passes is the
+    # one-line change D-031 promised -- no code edit.
+    "prefer_embedded_image_subtitles": False,
+    # Hours between automatic backfill passes. The five-a-day budget assumes
+    # a daily run, and before this the only triggers were a walking scan's
+    # sweep and a manual button press -- so an app left running for weeks
+    # (auto_refresh_on_startup defaults False) spent none of its budget and
+    # the "matter of weeks" completion never arrived. 0 disables the timer.
+    "subtitle_backfill_interval_hours": 6,
     "port": 8737,
     "https_port": 8738,               # trusted-LAN HTTPS listener (remote access)
     "page_size": 200,

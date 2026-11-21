@@ -60,8 +60,17 @@ than no entry.
 | [D-019](#d-019--forgetting-a-decision-means-scrubbing-it-not-deleting-it) | Forgetting a decision means scrubbing it, not deleting it | Adopted | drive-offload |
 | [D-020](#d-020--a-season-by-season-torrent-is-copied-as-it-finishes-moved-only-at-the-end) | A season-by-season torrent is copied as it finishes, moved only at the end | Adopted | drive-offload |
 | [D-021](#d-021--each-season-folder-is-freed-once-it-is-verifiably-on-the-drive-then-the-next-one-starts) | Each season folder is freed once it is verifiably on the drive, then the next one starts | Adopted | drive-offload |
+| [D-022](#d-022--image-only-english-tracks-stay-uncovered-until-a-device-test) | Image-only English tracks stay uncovered until a device test | Open | drivecast |
+| [D-023](#d-023--one-subtitle-provider-anonymous-tier-no-stored-credentials) | One subtitle provider, anonymous tier, no stored credentials | Open | drivecast |
 | [D-024](#d-024--the-same-show-on-two-drives-merges-by-normalised-title--year-after-group_seasons) | The same show on two drives merges by normalised title + year, after `group_seasons` | Adopted | drivecast |
+| [D-025](#d-025--infuse-cannot-be-told-a-language-so-it-keeps-the-sidecar-path) | Infuse cannot be told a language, so it keeps the sidecar path | Adapted | drivecast |
+| [D-026](#d-026--extracting-an-embedded-subtitle-reads-the-whole-file) | Extracting an embedded subtitle reads the whole file | Adapted | drivecast |
+| [D-027](#d-027--editing-an-infoplist-inside-a-signed-bundle-breaks-tcc-weeks-later) | Editing an `Info.plist` inside a signed bundle breaks TCC, weeks later | Adapted | suite |
 | [D-028](#d-028--vlc-software-decodes-light-h264-on-the-fire-tv-stick) | VLC software-decodes light H.264 on the Fire TV Stick | Adapted | drivecast, drivecast-app |
+| [D-029](#d-029--embedded-first-subtitles-index-before-fetch) | Embedded-first subtitles: index before fetch | Adopted | drivecast |
+| [D-030](#d-030--subtitle-bytes-are-validated-at-the-single-write-point) | Subtitle bytes are validated at the single write point | Adopted | drivecast |
+| [D-031](#d-031--android-vlc-per-item-xspf-subtitles-still-unmeasured) | Android VLC per-item XSPF subtitles: still unmeasured | Open | drivecast-app |
+| [D-032](#d-032--a-backfill-slot-is-spent-only-when-the-provider-was-really-called) | A backfill slot is spent only when the provider was really called | Adopted | drivecast |
 
 ---
 
@@ -823,3 +832,334 @@ than no entry.
   crash in hardware (narrow the gate, e.g. to MP4 only); or the stream log ever
   shows `max_gap` > 5 s (then build a stall-resilient relay — "long 4K movies
   keep buffering" is unmeasured and may be a separate issue).
+### D-029 — Embedded-first subtitles: index before fetch
+**Status:** Adopted · **When:** 2026-08-23
+
+- **Hit** — the subtitle cache held 62 sidecars against 2,225 video files, 2.8%,
+  and the plan that followed was "fetch the other 97%": 111 days at
+  OpenSubtitles' 20/day, 445 days at the anonymous 5/day.
+- **Learned** — 2.8% was the wrong denominator. It counts sidecars, not
+  coverage; most of these files already carry their own subtitle tracks (138
+  subtitle streams across 30 files, 4.6 per file on average). But the first
+  10-file sample said "9 of 10 carry an embedded English track", and a
+  **30-file measurement refuted that number**. Real, seed-pinned
+  (`seed=20260823`), 15 movies + 15 episodes, ffprobe through the server's own
+  `/stream` proxy:
+
+  | Bucket | Files | Share |
+  |---|---|---|
+  | usable English **text** track (not forced, not SDH) | 12 | 40.0% |
+  | English **image** track only (PGS / dvd_subtitle) | 8 | 26.7% |
+  | English text but forced/SDH only | 0 | 0.0% |
+  | no English subtitle track at all | 10 | 33.3% |
+  | probe failed | 0 | 0.0% |
+
+  So two thirds of files carry *some* English track, but only **40%** carry the
+  text track the desktop short-circuit needs — not 90%. The backfill worklist
+  (anything without `has_text_en`) is therefore ~60% of the library, ~1,335
+  files, not the ~220 the plan projected. Tagging held up well enough to build
+  on: 24 English-tagged tracks, and 35 of 138 streams untagged/`und` — present
+  where it matters, so `--slang=eng` has something to match. Cost also came in
+  better than estimated: **0.65 s/file** wall-clock at 6-way concurrency (19.4 s
+  for 30 files), which puts a full 2,225-file sweep near **24 minutes**, not 8.
+- **Did** — coverage comes from a one-time ffprobe index into
+  `data/sub_index.json`, keyed on the immutable `file_id` with `size` alongside,
+  and external fetching serves only the measured remainder. Standalone, not
+  inside `scan_cache.json`, because `ScanCache.put` replaces a drive's whole
+  record list on every walk and would re-pay the sweep on each scan. The sweep
+  fires automatically after a *walking* scan and never after a `scope=[]`
+  cache-only rebuild, which walks no Drive bytes by definition.
+- **Where** — `drivecast/drivecast/sub_index.py:31` (the store),
+  `drivecast/drivecast/sub_index.py:28` (`FLUSH_EVERY = 25`, the resume
+  granularity); `drivecast/drivecast/sub_sweep.py:107` (`SubtitleSweeper`),
+  `:58` (`is_english`, why `und` is not English);
+  `drivecast/drivecast/server.py:43` (`_has_embedded_english_text_track`),
+  `:218` (the scope guard that keeps the sweep off a cache-only rebuild),
+  `:252` (`start_sweep`); `drivecast/drivecast/scan_cache.py:64` (the `put`
+  behaviour this store avoids).
+- **Revisit when** — the full sweep finishes. These are 30 files of 2,225; the
+  real figure is what the sweep prints. If it lands near 40% text coverage, the
+  five-a-day budget is badly undersized (see D-023) and D-022's device test
+  becomes the cheapest way to cut the gap almost in half.
+
+### D-030 — Subtitle bytes are validated at the single write point
+**Status:** Adopted · **When:** 2026-08-23
+
+- **Hit** — two cached "subtitles" were 263-byte Airtel court-order block pages
+  with an `<iframe>`, served as HTTP 200; a third was a 267-byte ads-only stub
+  with 4 cues and no dialogue. Each was permanent for its title.
+- **Learned** — the old `_atomic_write` accepted any bytes and `cached()` trusts
+  file existence forever, so one ISP substitution poisoned a title for good. The
+  substitution is network-level and can hit any host, so per-provider validation
+  copies would drift — and migration-versus-live-gate drift is exactly how a
+  purged file gets re-poisoned.
+- **Did** — one gate, `sanitize_subtitle_bytes`, applied at the resolver's single
+  write point after any source's bytes arrive, and reused verbatim by the
+  migration script: HTML sniff, cue count, ad-density check on short files,
+  charset normalised to UTF-8 without BOM and CRLF line endings. A source that
+  does not call `_accept` has no way to write into the cache at all. Rejects go
+  to `data/subs_negative.json` with reason-scoped TTLs — poisoned 14 days (the
+  block page recurs deterministically on this ISP), not-found 2 days, transient
+  failures never recorded. `?refresh=1`, `POST /api/subtitles/{id}/refresh` and
+  a Settings row all override. Accepted files keep their native extension —
+  writing ASS bytes under `.srt` would mislabel them for `mime_for`. UTF-16 is
+  deliberately absent from the decode list: a BOM-less UTF-16 attempt destroyed
+  a real 1,752-cue subtitle.
+- **Where** — `drivecast/drivecast/subtitles.py:210`
+  (`sanitize_subtitle_bytes`), `:462` (`_accept`, the single write point),
+  `:253` (`NEG_TTL`), `:407` (`cached`, the existence-trust this bounds);
+  `drivecast/scripts/migrate_subtitles.py` (dry-run by default, quarantines
+  rather than deletes).
+- **Revisit when** — the migration prints a reject you believe is good. Verified
+  on the live cache on 2026-08-23: **65 files, 62 kept (59 re-encoded), 3
+  rejected** — the same two block pages and one ad stub, no false positives. The
+  cue-count and ad-ratio thresholds are named constants for exactly this.
+
+### D-031 — Android VLC per-item XSPF subtitles: still unmeasured
+**Status:** Open · **When:** 2026-08-23
+
+- **Hit** — a show played as a playlist gets a sidecar subtitle for episode 1
+  only; the code's own comment admits it may not survive VLC's playlist
+  expansion.
+- **Learned (so far)** — per-track `<vlc:option>input-slave=URL</vlc:option>` is
+  documented for **desktop libvlc**. Whether Android VLC's playlist engine
+  honours it is unknown. Android VLC's documented intent extras are
+  `from_start`, `position`, `title`, `extra_duration`, `subtitles_location` —
+  one external file, no track selection. Not settled without a device test.
+- **Did** — nothing in code, deliberately. The 15-minute adb procedure is
+  recorded in the implementation plan (§6.1); it has **not been run**. No XSPF
+  route gets built either way until the sweep shows a real population of shows
+  that are both embedded-uncovered *and* sidecar-fetched.
+- **Where** —
+  `drivecast-app/app/src/main/java/com/drivecast/tv/ui/player/ExternalPlayerViewModel.kt`
+  (the playlist branch and its comment, and the single-item branch that does
+  this correctly); `drivecast/drivecast/server.py:792` (`api_playlist_m3u`, the
+  m3u route, which cannot carry a per-item subtitle).
+- **Revisit when** — the test runs; or VLC auto-updates on the Stick (the Play
+  Store updates it independently of the app release, so re-run and record the
+  `versionName` here).
+
+### D-022 — Image-only English tracks stay uncovered until a device test
+**Status:** Open · **When:** 2026-08-23
+
+- **Hit** — image-based English subtitles (`hdmv_pgs_subtitle`, `dvd_subtitle`)
+  are invisible to a text pipeline, and a text sidecar fetched for such a file
+  spends a scarce quota slot on a title that may already be watchable subtitled.
+- **Learned** — this is much bigger than the first sample suggested. At 30 files,
+  **8 (26.7%)** have an English *image* track and no English text track (the
+  10-file sample said 2). Extrapolated, that is roughly **590 files** of the
+  library sitting in exactly this bucket. VLC, mpv and IINA are all *documented*
+  to render an image track selected by language, and `--slang`/`--sub-language`
+  select it the same way — but that is **unverified on this hardware**, and an
+  image track can never be extracted to a sidecar (Infuse's `sub=` is a
+  text-only consumer). A wrong "covered" here is unrecoverable in practice:
+  nothing re-checks it, and the file would leave the backfill worklist forever.
+- **Did** — the index stores `has_text_en` and `has_image_en` **separately**,
+  plus per-stream `forced`/`hearing_impaired` dispositions, all captured in the
+  first sweep because a re-sweep costs another ~24 minutes of uplink. Play-time
+  use of an image track is gated behind `prefer_embedded_image_subtitles`,
+  **default False**, so turning it on after the device test is a settings edit
+  and not a code change. Until then image-only files stay in the backfill
+  worklist.
+- **Where** — `drivecast/drivecast/server.py:72`
+  (`_has_embedded_english_image_track`), `:1140` (`api_play`, where the config
+  key gates it), `:373` (`_uncovered_file_ids`, which deliberately keeps these
+  files queued); `drivecast/drivecast/config.py:65`
+  (`prefer_embedded_image_subtitles`); `drivecast/drivecast/sub_sweep.py:51`
+  (`_IMAGE_CODECS`); `drivecast/drivecast/player.py:174`
+  (`build_infuse_url`, the text-only consumer).
+- **Revisit when** — someone plays a PGS-only file and confirms text appears **on
+  screen**, per player (Fire TV VLC, then desktop mpv/IINA/VLC). This is now the
+  highest-value 10 minutes available: a pass moves ~590 files out of the
+  backfill queue and cuts the remaining gap by roughly 44%.
+
+### D-023 — One subtitle provider, anonymous tier, no stored credentials
+**Status:** Open · **When:** 2026-08-23
+
+- **Hit** — OpenSubtitles allows 5 downloads/day anonymous, 20/day with an
+  account, 1000/day VIP. Against 2,225 files that is 111 days even at 20/day,
+  which argued for a login and a second provider.
+- **Learned** — the embedded-first re-weighting shrank the gap, but not nearly
+  as far as hoped. The 30-file measurement (D-029) puts the text-uncovered
+  worklist at ~60% of the library, **~1,335 files**: that is ~267 days at 5/day
+  and ~67 days at 20/day. If D-022's device test passes and image-only files
+  count as covered, the worklist drops to ~33%, ~741 files — ~148 days at 5/day,
+  ~37 days at 20/day. So the 5/day default is comfortably undersized, and the
+  honest ranking of remedies is: run D-022's device test first (free, cuts the
+  gap ~44%), then consider the 20/day login. A live download on 2026-08-23
+  returned `remaining: 2`, confirming the field name and shape the queue's
+  `remaining_hint` reads.
+- **Did** — kept the single `opensubtitles_api_key` and the 5/day default, both
+  as config keys so raising the limit is a one-line edit rather than a code
+  change. Added the priority queue, the OSDb moviehash match, and a real ranking
+  function (`moviehash_match` outright, then log-scaled `download_count`, then a
+  penalty for machine-translated) instead of trusting `results[0]`. No provider
+  ABC: an interface with one implementation is speculation, and extracting one
+  later from a working provider is mechanical. subdl.com was declined — same
+  block-page-substituting ISP, no moviehash search, self-reported limits.
+- **Where** — `drivecast/drivecast/config.py:57` (`subtitle_daily_limit: 5`),
+  `:51` (`prefer_embedded_subtitles: True`);
+  `drivecast/drivecast/subtitle_queue.py:111` (`DEFAULT_DAILY_LIMIT`);
+  `drivecast/drivecast/subtitles.py:415` (`resolve`'s match-hint kwargs),
+  `:663` (`_download_os_file`, where `remaining` is read);
+  `drivecast/drivecast/moviehash.py` (the OSDb hash).
+- **Revisit when** — the full sweep prints the real worklist size. If it
+  confirms ~1,335 files and D-022 fails, the login is the cheaper of the two
+  reinstatements and this entry flips to Adopted.
+
+### D-032 — A backfill slot is spent only when the provider was really called
+**Status:** Adopted · **When:** 2026-08-23
+
+- **Hit** — the first cut of the backfill queue charged one of its five daily
+  slots to every *attempt*. Reviewed before it ever ran, that accounting makes
+  the queue stop making net progress after roughly its first week.
+- **Learned** — two separate leaks, both invisible to a green test suite.
+  (1) A successfully backfilled file never becomes "covered": a fetched `.srt`
+  cannot set `has_text_en` — only a re-probe of the video could — so judging
+  coverage on the index alone put every completed file straight back into the
+  worklist, where it was re-attempted, satisfied instantly from cache with zero
+  network, and still charged a slot. Over weeks the budget goes almost entirely
+  on re-confirming finished work. A free Drive-sibling hit leaked the same way.
+  (2) Items are ordered tier-then-`queued_at` and a failure does not re-stamp
+  `queued_at`, so the handful of files OpenSubtitles genuinely lacks sat at the
+  head of the queue forever: `failed_today` resets at local midnight, the 2-day
+  `not_found` negative-cache entry then makes the retry an instant no-network
+  failure — which still burned a slot — and nothing behind them was ever reached.
+- **Did** — the budget is charged from a **real provider call**, not an attempt:
+  `SubtitleResolver.os_download_calls` counts issued `/download` requests, the
+  caller snapshots it around `resolve()`, and `run()` charges only on a
+  difference. Coverage now also counts an existing sidecar, read with **one**
+  `os.listdir` rather than four `os.path.exists` per file across 2,225 ids. The
+  head-of-line stall gets two guards: a free `is_blocked` pre-check (the
+  negative cache) skips an item without an attempt or a spend, and an item with
+  `PARK_AFTER_ATTEMPTS` real misses is retried weekly instead of daily. A
+  failure while the provider reports `remaining == 0` is a quota stop, not the
+  item's fault, so it is not added to `failed_today` — in IST the local calendar
+  day rolls 5.5 h before OpenSubtitles' UTC quota does, and blacklisting there
+  would waste the rest of the real day.
+- **Where** — `drivecast/drivecast/subtitle_queue.py:414` (`run`, the accounting),
+  `:305` (`record_spend`'s `spend`/`mark_failed` flags), `:372` (`_is_parked`),
+  `:119` (`PARK_AFTER_ATTEMPTS = 3`, `PARK_RETRY_DAYS = 7`);
+  `drivecast/drivecast/server.py:373` (`_uncovered_file_ids`), `:354`
+  (`_sidecar_covered_ids`, the one-listdir read), `:451` (`_backfill_attempt`,
+  which reports `spent`), `:495` (`_backfill_blocked`);
+  `drivecast/drivecast/subtitles.py:399` (`os_download_calls`).
+- **Revisit when** — a week of real running. `data/subtitle_queue.json`'s
+  `spent` should track actual downloads, and `pending` should shrink
+  monotonically rather than oscillate.
+
+### D-025 — Infuse cannot be told a language, so it keeps the sidecar path
+**Status:** Adapted · **When:** 2026-08-23
+
+- **Hit** — the embedded-first short-circuit skips `resolve()` and hands the
+  player `prefer_lang="eng"` instead. For Infuse that produced a silent
+  regression: worse than before the feature existed.
+- **Learned** — the `infuse://` scheme has no language or track parameter, only
+  `sub=`. So `prefer_lang` is dropped at launch with nothing to replace it: the
+  short-circuit gave Infuse **neither** the sidecar it used to get **nor** a
+  usable hint, and `/api/play` then reported `subtitles: true`. There is no
+  parameter to invent — this is a consumer limit, not a missing feature.
+- **Did** — `/api/play` resolves the player kind *before* the coverage decision
+  and only treats an embedded track as usable for mpv, IINA and VLC. Infuse
+  falls through to `resolve()` exactly as it did before, and the reported
+  `subtitles` flag then describes what it actually received. `detect_player`
+  never auto-picks Infuse, so this only affects an explicit `player: infuse`.
+- **Where** — `drivecast/drivecast/server.py:1140` (`api_play`, the
+  `embedded_usable` gate); `drivecast/drivecast/player.py:174`
+  (`build_infuse_url`, whose docstring states the ceiling), `:324` (`_launch`,
+  where `prefer_lang` is dropped for Infuse).
+- **Revisit when** — Infuse's URL scheme gains a subtitle-language parameter.
+  Nothing else changes this; it is a property of the consumer.
+
+### D-026 — Extracting an embedded subtitle reads the whole file
+**Status:** Adapted · **When:** 2026-08-23
+
+- **Hit** — the Fire TV's only subtitle mechanism is `GET /api/subtitles/{id}`,
+  which serves a *sidecar file*. The clean-sounding fix for the ~40% of files
+  that carry their own English text track is to extract that track server-side
+  with `ffmpeg -map 0:s:m:language:eng -f srt -`, run it through the same
+  quality gate, and serve it — deterministic on the TV and zero provider quota.
+- **Learned** — measured, it is not cheap. Against a byte-counting local HTTP
+  server and a 6,979,911-byte MKV carrying a 60-cue `subrip` track:
+
+  | Operation | Bytes read | Share of file |
+  |---|---|---|
+  | the sweep's `ffprobe -probesize 200k` (build the index) | 917,504 | 13.1% |
+  | `ffmpeg -map 0:s:m:language:eng -f srt -` (extract) | 6,979,911 | **100.0%** |
+
+  Extraction is a **full-file read**, and unavoidably so: subtitle packets are
+  interleaved across the whole container, so the last cue lives near the last
+  byte. On this library that means pulling a multi-gigabyte movie through the
+  Drive proxy to obtain ~60 KB of text — per file, for hundreds of files. The
+  probe, by contrast, is bounded by `-probesize` and stays near a megabyte
+  regardless of how large the film is.
+- **Did** — did not build it. Instead `/api/subtitles` stops *wasting* quota:
+  when the index shows a usable embedded English text track it skips the
+  OpenSubtitles step and serves only the free sources (cache, Drive sibling), so
+  the TV's HEAD probe on the ~40% covered files no longer spends anonymous-tier
+  downloads on a redundant sidecar. `?refresh=1` still forces the paid step,
+  since that is a person explicitly asking. The consequence is recorded rather
+  than hidden: on the Fire TV, an embedded-covered file depends on VLC's own
+  **Settings → Subtitles → Preferred subtitle language = English**, which is a
+  two-minute device setting and the single highest-value action in this whole
+  effort.
+- **Where** — `drivecast/drivecast/server.py:1294` (`api_subtitles`, the
+  skip); `drivecast/drivecast/subtitles.py:415` (`resolve`'s
+  `allow_opensubtitles` flag), `:462` (`_accept`, the gate any future
+  extraction source would still have to write through);
+  `docs/FEATURE-PARITY.md` § 4 (the subtitle rows and the TV's gap).
+- **Revisit when** — extraction becomes cheap for a *specific* case worth the
+  bytes: a single title on demand ("get subtitles for this one now"), where the
+  user has chosen to spend the egress, is defensible. An automatic path over the
+  library is not.
+
+### D-027 — Editing an `Info.plist` inside a signed bundle breaks TCC, weeks later
+**Status:** Adapted · **When:** 2026-09-09
+
+- **Hit** — the hub's Download and Upload rows stopped working. Clicking
+  either did nothing at all: no window, no browser, no error, no alert. The
+  menu bar itself was responsive and both console scripts ran perfectly from a
+  terminal, which pointed suspicion at the hub's script resolution and cost a
+  whole first pass on the wrong layer.
+- **Learned** — the child process was dying before it reached a single line of
+  suite code, and the per-tool log had said so all along:
+  `PermissionError: [Errno 1] Operation not permitted:
+  <repo>/toolkit/venv/pyvenv.cfg`, then `Fatal Python error:
+  init_import_site`. `pyvenv.cfg` is mode `644` and reads fine from a shell,
+  so **EPERM on a world-readable file is macOS TCC**, not a file permission.
+  The real cause sat one level further out: `codesign --verify --deep --strict`
+  reported `invalid Info.plist (plist or signature have been modified)`. The
+  ad-hoc signature was made when the `.app` was built; the `Info.plist` was
+  rewritten **six weeks later** by the path sweep that followed moving this
+  repo into the monorepo — a `.app`'s `Info.plist` records the interpreter
+  path, so a path sweep is precisely the thing that touches it. With the seal
+  broken, `tccd` logs `IDENTITY_ATTRIBUTION: Failed to copy signing info …
+  #-67030` on every request and can no longer attribute the app, so no
+  Files-and-Folders grant applies to it *or to anything it spawns* — and this
+  suite's checkout lives under a TCC-protected folder. It then kept working
+  for another two weeks on a cached grant, which is what makes this worth an
+  entry: the break and the symptom are separated by weeks, so the change that
+  caused it is nowhere near the failure in time or in git history.
+- **Did** — nothing in the code; this is a constraint on how the `.app` is
+  built and installed, not something the suite can defend against. Recovery is
+  re-seal, then re-grant: `codesign --force --deep --sign -
+  /Applications/Drivedeck.app`, relaunch the app, then allow the Documents (or
+  Full Disk Access) prompt — re-signing changes the cdhash, so TCC treats the
+  result as a new app and any surviving grant does not carry over. The standing
+  rule this buys: **never edit anything inside a signed bundle in place.**
+  Rebuild the `.app`, or re-sign immediately afterwards, and confirm with
+  `codesign --verify --deep --strict` rather than assuming — a broken seal is
+  invisible until the OS happens to need the identity.
+- **Where** — `toolkit/src/gdrive_toolkit/hub/hub_core.py:232` (the
+  `kind == "web"` launch), `:234` (`_log_path` — the per-tool log that was the
+  only diagnostic anywhere in the system), `:241` (`start_new_session=True`,
+  which detaches the child so its death is silent);
+  `toolkit/src/gdrive_toolkit/hub/menubar.py:219` (`rumps.alert`, which only
+  fires for a `HubError` and never for a child that exits after `Popen` has
+  already returned).
+- **Revisit when** — the hub is asked to report a launched web tool's exit
+  status. A child that dies milliseconds after `Popen` is currently
+  indistinguishable from one still starting, and `installed_if_any` is
+  satisfied by `argv[0]` merely existing, so an unrunnable tool still reports
+  installed. A short post-launch port re-probe would turn this whole class of
+  failure from a silent no-op into a visible error.

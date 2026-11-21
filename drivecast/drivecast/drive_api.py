@@ -219,6 +219,34 @@ class DriveAPI:
             pass
         return None
 
+    async def fetch_range(self, file_id, start, end):
+        """Download the inclusive byte range [start, end] of a file's content.
+
+        For moviehash (see moviehash.py), which only ever needs the first/last
+        64 KiB of a file that can be gigabytes long — never the whole thing.
+        Drive honours an explicit Range header on this exact alt=media
+        endpoint already; streaming.py sets one on every proxied request, this
+        is the same shape, just buffered into memory instead of streamed.
+        Returns bytes, or None on any error.
+        """
+        try:
+            headers = await self._auth_headers()
+            headers["Range"] = "bytes=%d-%d" % (start, end)
+            resp = await self._client.get(
+                "%s/%s" % (FILES_URL, file_id),
+                params={"alt": "media", "supportsAllDrives": "true"},
+                headers=headers, follow_redirects=True)
+            if resp.status_code == 206:
+                return resp.content
+            if resp.status_code == 200:
+                # Some edge case ignored Range and sent the whole file (e.g.
+                # requested range covered it entirely) -- slice defensively
+                # rather than trust length and hand back more than asked.
+                return resp.content[start:end + 1]
+        except httpx.HTTPError:
+            pass
+        return None
+
     # ---- search ----
 
     async def search(self, query, page_token=None, page_size=200):
