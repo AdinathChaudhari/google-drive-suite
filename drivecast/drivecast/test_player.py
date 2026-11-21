@@ -157,6 +157,34 @@ def test_detect_player_infuse(monkeypatch):
     assert player.detect_player("infuse") == ("infuse", player.INFUSE_APP)
 
 
+# ---- Session C: prefer_lang (embedded-track language selection) ----
+
+def test_mpv_args_prefer_lang_emits_slang_only_without_sidecar():
+    args = player.build_mpv_args("mpv", "/tmp/s.sock", 0, "X", "http://u",
+                                 prefer_lang="eng")
+    assert "--slang=eng" in args
+    assert not any("sub-file" in a for a in args)
+    assert args[-1] == "http://u"
+
+
+def test_mpv_args_sidecar_wins_over_prefer_lang():
+    # Both given: the explicit sidecar wins, no --slang at all (mutual
+    # exclusivity enforced inside the builder, not by caller discipline).
+    args = player.build_mpv_args("mpv", "/tmp/s.sock", 0, "X", "http://u",
+                                 sub_path="/tmp/x.srt", prefer_lang="eng")
+    assert "--sub-file=/tmp/x.srt" in args
+    assert not any(a.startswith("--slang") for a in args)
+
+
+def test_vlc_args_prefer_lang_uses_sub_language_not_sub_track():
+    args = player.build_vlc_args("vlc", 0, "X", "http://u", 8738, "pw",
+                                 prefer_lang="eng")
+    assert "--sub-language" in args
+    i = args.index("--sub-language")
+    assert args[i + 1] == "eng"
+    assert "--sub-track" not in args
+
+
 def test_detect_player_auto_never_picks_infuse(monkeypatch):
     # Infuse is the ONLY thing "installed"; auto must still find nothing.
     monkeypatch.setattr(player.shutil, "which", lambda n: None)

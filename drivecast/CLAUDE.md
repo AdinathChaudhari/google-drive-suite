@@ -53,6 +53,98 @@ A non-empty scope that filters down to nothing (every named drive is unselected)
 
 A cache-only rebuild reports `total=0`, which is not "0 of 0 to scan" — both the web UI (`static/app.js` `pollScan`) and the menu bar (`drivecast_menubar.py` `_poll`) render "updating library…" for it instead of a progress fraction. New consumers of `/api/refresh/status` need the same guard.
 
+## Subtitles (embedded-first — read before touching any of it)
+
+The goal is "subtitles are always on". Most files already carry their own, so
+the order is **look before you fetch**.
+
+**Resolution order.** `/api/play` consults `data/sub_index.json` first. A
+non-forced, non-SDH English **text** track means the player is simply told
+which language to select (`prefer_lang="eng"` → mpv `--slang`, IINA
+`--mpv-slang`, VLC `--sub-language`) and `resolve()` is skipped entirely — no
+fetch, no quota, no timeout. Anything else falls through to `resolve()`:
+cached sidecar → Drive sibling `.srt` → OpenSubtitles. Four things are
+deliberately *not* coverage, and each one is a trap someone will want to
+"fix": a **forced** track (a few foreign-language lines), a **hearing-impaired**
+track (bracketed sound effects), an **`und`/untagged** track (`--slang` and
+VLC's device setting both match the declared tag, so it would be a false
+positive nothing rechecks), and an **image** track (see the config key below).
+`sub_path` and `prefer_lang` are mutually exclusive *inside* each builder, not
+by caller discipline — mpv prioritises an explicit `--sub-file` over a
+`--slang` match, so sending both is a race with no upside.
+
+**Infuse is excluded on purpose.** `infuse://` has no language or track
+parameter, only `sub=`, so `/api/play` resolves the player kind *before* the
+coverage decision and lets Infuse fall through to the sidecar path. Skipping
+`resolve()` for it would hand it neither a sidecar nor a hint (D-025).
+
+**One write point.** Every subtitle byte in the system passes through
+`SubtitleResolver._accept`, which runs `sanitize_subtitle_bytes` and only then
+writes. A new source cannot bypass the gate, because a source that does not
+call `_accept` has no way into the cache. This exists because the ISP here
+substitutes a 263-byte HTML block page for the subtitle host at HTTP 200, and
+`cached()` trusts file existence forever — one substitution used to poison a
+title permanently (D-030).
+
+**Negative cache** (`data/subs_negative.json`, keyed `"<file_id>:<source>"`).
+Poisoned verdicts — `html_block_page`, `ads_only_or_empty`, `zero_cue`,
+`undecodable` — last **14 days**; `not_found` lasts **2 days**; transient
+failures are **never recorded**, or one flaky listing would hide a real
+subtitle. `?refresh=1`, `POST /api/subtitles/{id}/refresh` and the "Retry
+failed subtitle lookups" Settings row all clear it.
+
+**The sweep's scope guard is load-bearing.** The sweep probes bytes through
+loopback `/stream`, which is live Drive egress, so it fires only after a scan
+whose **final** scope was non-empty — never after `scope=[]`. Gate on the
+post-merge `scope` local, not the caller's argument: a pending-scope drain can
+escalate `[]` into a real walk, and a non-empty request can filter down to
+nothing. The sweep also drops to serial while a `/stream` request has arrived
+in the last 120 s, because it otherwise fights playback for the same uplink.
+
+**The daily-budget backfill.** `subtitle_queue.json` holds the worklist
+(anything without `has_text_en` *and* without an existing sidecar), tiered
+continue-watching → unwatched movie → next episode of a show in progress →
+everything else, FIFO inside a tier. `subtitle_daily_limit` defaults to 5
+(anonymous OpenSubtitles). Three accounting rules that look arbitrary and are
+not (all D-032):
+
+1. A slot is charged only when a `/download` was really issued — `resolve()`
+   often completes free from cache or a Drive sibling, and charging those made
+   the queue spend its whole budget re-confirming finished files.
+2. An item inside its negative-cache TTL is skipped free, and an item with 3
+   real misses is retried weekly, not daily. Without both, a handful of
+   genuinely-missing files hold the head of the queue forever.
+3. A failure while the provider reports `remaining == 0` is a quota stop, not
+   an item failure, so it is not blacklisted for the day — local midnight is
+   5.5 h ahead of OpenSubtitles' UTC reset.
+
+A backfill pass runs after each sweep and every
+`subtitle_backfill_interval_hours` (default 6, `0` disables): the five-a-day
+budget is a *daily* budget, and before that timer nothing scheduled a daily
+run, so an app left running simply never spent it.
+
+**Coverage numbers are unknown until the sweep has run.** With an empty index
+every file reads as uncovered, so `swept()` gates the worklist and the
+Settings panel says "run the subtitle scan first" rather than "0 of 2225 have
+subtitles". Do not remove that gate: a stale `pending` list on disk from
+before a sweep is exactly the case it also guards.
+
+**Image-only English** (`hdmv_pgs_subtitle`/`dvd_subtitle`) is ~27% of the
+sampled files and is **not** treated as coverage yet — `--slang` would
+select it and these players are documented to render it, but that is
+unverified on this hardware and a wrong "covered" is unrecoverable. Flip
+`prefer_embedded_image_subtitles` to `True` after the device test; it is a
+config key precisely so that is not a code change (D-022).
+
+**The Fire TV is the weak path.** Its only mechanism is
+`GET /api/subtitles/{file_id}`, which serves a sidecar file. That endpoint now
+skips the OpenSubtitles step for embedded-covered files so TV probes stop
+draining the same 5/day the queue needs — but it cannot *select* an embedded
+track, and extracting one server-side reads 100% of the file (measured, D-026).
+On the TV, embedded subtitles come from VLC's own **Settings → Subtitles →
+Preferred subtitle language = English**. The web `<video>` player has never had
+subtitles and still does not.
+
 ## Conventions & gotchas
 - Pure classifier functions do no I/O — they operate on the walked node trees the scanner builds; keep them side-effect-free (plugins get the same shapes).
 - Read-only on Drive: only the local cache (`library.json`, `data/scan_cache.json`, posters, `data/history.json`) is written.

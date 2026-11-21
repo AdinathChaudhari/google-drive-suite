@@ -30,7 +30,9 @@ fact that doesn't move. This file describes what the code does *right now*,
 which does move, so it needs a citation style that survives the code moving
 under it.
 
-**Last verified**: 2026-08-03, against the working tree at commit `5470b33`
+**Last verified**: 2026-08-23 for the subtitle rows (§4, §5.8, §5.9), against
+the working tree on branch `feat/subtitles-embedded-first` (uncommitted).
+Everything else: 2026-08-03, against the working tree at commit `5470b33`
 plus the uncommitted sort/group-vocabulary + TV-rescan changes described in
 §8 (`git status` at verification time showed those files modified/added, not
 yet committed).
@@ -147,6 +149,10 @@ Shared rules:
 | Sort/group per canonical vocabulary | yes | yes | n/a | §2–3 | |
 | VLC / external player handoff | yes | yes | — | `app.js` § `launch` (`res.player === "vlc"`); `PlayerScreen.kt` § `VlcPlayerHost` (`ACTION_VIEW` + `VLC_PACKAGE`) | |
 | Keep-awake prompt | yes | yes | — | `app.js` § `awakeWatch`/`pollAwake` (`api/awake/*`); `KeepAwakeController.kt` § `poll()`/`extend()`/`release()` | |
+| Sidecar subtitle fetch + serve | yes (desktop launch) | yes | — | `server.py` § `api_subtitles` (`GET|HEAD /api/subtitles/{file_id}`); `LibraryRepository.kt` § `probeSubtitle`/`authorizedSubtitleUrl` (called from `ExternalPlayerViewModel.kt`), `PlayerScreen.kt` § the `subtitles_location` extra | Both consume the same endpoint. Every byte is gated by `subtitles.py` § `sanitize_subtitle_bytes` at `SubtitleResolver._accept`, so a poisoned file cannot be cached on either client |
+| Embedded-track **selection** (tell the player "English") | yes | **no** | — | `player.py` § `build_mpv_args` (`--slang`), `build_iina_args` (`--mpv-slang`), `build_vlc_args` (`--sub-language`); no TV equivalent exists | §5.8. The single biggest parity gap in subtitles |
+| Embedded-track index / coverage numbers | yes | no | — | `server.py` § `api_subs_sweep_status`, `api_subs_backfill_status`; `app.js` § `loadSubtitleCoverage` | Server-side data; the TV never asks for it |
+| Subtitle backfill queue + budget | yes (Settings) | no | — | `server.py` § `api_subs_backfill_start`; `app.js` § `loadSubtitleCoverage` / the `startBackfill` handler; `subtitle_queue.py` § `SubtitleQueue.run` (`subtitle_daily_limit`, default `5`) | Runs server-side for both clients' benefit; only web can see or trigger it |
 
 ### Server/web-only
 | Feature | Where (server route) | Notes |
@@ -241,6 +247,51 @@ still at its `none` default (`app.js` § `groupItems`) — an explicit `type`/`c
 `drive` pick applies there exactly as it would on an entertainment tab. Not
 something to "fix" — the TV simply has no vocabulary to offer on those tabs.
 
+### 5.8 The TV cannot select an embedded subtitle track
+Roughly 40% of sampled files carry a usable English **text** track of
+their own, and another ~27% carry an English **image** track (measured over 30
+real files, `DECISIONS.md` [D-029](DECISIONS.md#d-029--embedded-first-subtitles-index-before-fetch)).
+On the desktop the server exploits that directly: `/api/play` reads the probe
+index and passes a language preference to the player (`player.py` §
+`build_mpv_args` / `build_iina_args` / `build_vlc_args`), so the right track is
+active from the first frame with no fetch and no quota.
+
+**The TV has no equivalent, and cannot be given one from the server.** Android
+VLC's documented intent extras are `from_start`, `position`, `title`,
+`extra_duration`, `subtitles_location` — one *external file*, no track or
+language selector (`PlayerScreen.kt` § the `subtitles_location` extra). The TV's
+only subtitle mechanism is a HEAD probe of `/api/subtitles/{file_id}`
+(`LibraryRepository.kt` § `probeSubtitle`), which serves a sidecar or
+404s. Three consequences, all deliberate:
+
+1. **On the TV, embedded subtitles are a device setting.** VLC → Settings →
+   Subtitles → Preferred subtitle language → English. Two minutes, and it
+   covers the ~40% text-track case better than any server change can. It
+   matches on the language *tag* only, so it cannot apply the server's
+   forced/SDH exclusion — a title whose only English track is forced will
+   auto-select there and show near-empty text. Known false positive, TV only.
+2. **The endpoint no longer spends quota on covered files.** It used to fetch a
+   redundant sidecar from OpenSubtitles on every TV probe, draining the same
+   5/day the backfill queue budgets against. It now skips the paid step when the
+   index shows a usable embedded English text track, keeping the free sources
+   (`server.py` § `api_subtitles`). `?refresh=1` still forces a fetch.
+3. **Server-side extraction was measured and rejected**: pulling the embedded
+   track out with ffmpeg reads **100%** of the file, versus ~0.9 MB for the
+   probe ([D-026](DECISIONS.md#d-026--extracting-an-embedded-subtitle-reads-the-whole-file)).
+   A multi-gigabyte download per 60 KB of text is not an automatic path.
+
+**Revisit if** Android VLC ever gains a track-selection intent extra, or the app
+grows a player that exposes track selection to the server. At that point the
+index is already there to answer from.
+
+### 5.9 The web `<video>` player has no subtitles at all
+`app.js` § `openWebPlayer` streams into a plain `<video src="/stream/…">`. There
+is no `<track>` element, no textTrack wiring, and no way for JS to select an
+embedded track inside an MKV/MP4 from that element. It never had subtitles and
+this round did not change that — the desktop `prefer_lang` work covers only the
+mpv/IINA/VLC/Infuse *launch* path. Giving the browser subtitles means
+server-side WebVTT extraction, which carries D-026's full-file read cost.
+
 ---
 
 ## 6. Rescan / refresh status contract
@@ -309,6 +360,16 @@ that's parity, not a gap.
 ---
 
 ## 8. Revision log
+
+- **2026-08-23** — Subtitles round. Added the four subtitle rows to §4 and the
+  two divergences §5.8 (the TV cannot select an embedded track; the device
+  setting is the remedy) and §5.9 (the web `<video>` player has never had
+  subtitles). Server-side: an embedded-track index (`sub_index.py`,
+  `sub_sweep.py`), a language preference passed to the desktop players
+  (`player.py`), a validated single write point plus negative cache
+  (`subtitles.py`), and a daily-budget backfill queue (`subtitle_queue.py`).
+  See `DECISIONS.md` D-029 through D-026. Changes were in the working tree,
+  not yet committed, at verification time.
 
 - **2026-08-03** — Initial version. Documents the round that added: TV —
   real server rescan via `POST /api/refresh` + status polling

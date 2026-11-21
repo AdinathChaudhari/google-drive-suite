@@ -88,14 +88,23 @@ def _install_stubs(tmp_path, monkeypatch):
     captured = {}
 
     def _fake_play(self, file_id, name, duration_ms=None, drive_id=None,
-                   parent_id=None, queue=None, media=None, sub_path=None):
+                   parent_id=None, queue=None, media=None, sub_path=None,
+                   prefer_lang=None):
         captured["media"] = media
         captured["sub_path"] = sub_path
+        captured["prefer_lang"] = prefer_lang
         captured["file_id"] = file_id
         captured["duration_ms"] = duration_ms
         captured["queue"] = queue
         return {"player": "mpv", "resumed_from": 0}
 
+    # /api/play resolves the player KIND before deciding whether an embedded
+    # track is usable (Infuse can't take a language hint -- see api_play), so
+    # without this stub every subtitle-decision test would silently depend on
+    # which players happen to be installed on the machine running pytest.
+    # Pinned to mpv, the "can take --slang" case; the Infuse test overrides it.
+    monkeypatch.setattr(server_mod, "detect_player",
+                        lambda pref="auto": ("mpv", "/stub/mpv"))
     monkeypatch.setattr(TokenManager, "get_token", _fake_token)
     monkeypatch.setattr(DriveAPI, "_get", _no_network)
     monkeypatch.setattr(PlayerManager, "play", _fake_play)
@@ -590,13 +599,144 @@ def test_watched_map_progress_shape(client):
 
 
 def test_play_resolves_and_passes_subtitle(client, tmp_path):
-    async def _fake_resolve(file_id, name, drive_id=None, parent_id=None):
+    async def _fake_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
         return str(tmp_path / "subs" / ("%s.srt" % file_id))
 
     client.app.state.dc.subtitles.resolve = _fake_resolve
     r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
     assert r.status_code == 200
     assert r.json()["subtitles"] is True
+    assert client._captured["sub_path"].endswith("fileA.srt")
+
+
+def test_api_play_skips_resolve_when_embedded_english_text_track_present(client):
+    # A non-forced, non-hearing-impaired English text track in the index
+    # means /api/play tells the player which language to select and never
+    # consults the (network-hitting) sidecar resolver at all.
+    calls = []
+
+    async def _spy_resolve(*a, **k):
+        calls.append(a)
+        return None
+
+    client.app.state.dc.subtitles.resolve = _spy_resolve
+    client.app.state.dc.sub_index.put("fileA", {
+        "size": 5000, "probed_at": 1.0, "ok": True,
+        "tracks": [{"index": 2, "codec": "subrip", "kind": "text",
+                    "lang": "eng", "title": None, "forced": False,
+                    "hearing_impaired": False}],
+        "has_text_en": True, "has_image_en": False, "error": None,
+    })
+    r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+    assert r.status_code == 200
+    assert calls == []                                # resolve() never called
+    assert r.json()["subtitles"] is True
+    assert client._captured["sub_path"] is None
+    assert client._captured["prefer_lang"] == "eng"
+
+
+def test_api_play_falls_through_on_forced_or_sdh_track(client, tmp_path):
+    # The ONLY English text track is forced -> treated as if there were no
+    # embedded track at all: resolve() still runs, exactly like session A.
+    calls = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        calls.append(file_id)
+        return str(tmp_path / "subs" / ("%s.srt" % file_id))
+
+    client.app.state.dc.subtitles.resolve = _spy_resolve
+    client.app.state.dc.sub_index.put("fileA", {
+        "size": 5000, "probed_at": 1.0, "ok": True,
+        "tracks": [{"index": 2, "codec": "subrip", "kind": "text",
+                    "lang": "eng", "title": "Forced", "forced": True,
+                    "hearing_impaired": False}],
+        "has_text_en": True, "has_image_en": False, "error": None,
+    })
+    r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+    assert r.status_code == 200
+    assert calls == ["fileA"]                          # resolve() DID run
+    assert r.json()["subtitles"] is True
+    assert client._captured["prefer_lang"] is None
+    assert client._captured["sub_path"].endswith("fileA.srt")
+
+
+def test_api_play_falls_through_on_hearing_impaired_only_track(client, tmp_path):
+    # The ONLY English text track is SDH (hearing_impaired) -> same
+    # fall-through as forced: bracketed sound-effect text is not "subtitles
+    # are already on".
+    calls = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        calls.append(file_id)
+        return str(tmp_path / "subs" / ("%s.srt" % file_id))
+
+    client.app.state.dc.subtitles.resolve = _spy_resolve
+    client.app.state.dc.sub_index.put("fileA", {
+        "size": 5000, "probed_at": 1.0, "ok": True,
+        "tracks": [{"index": 2, "codec": "subrip", "kind": "text",
+                    "lang": "eng", "title": "SDH", "forced": False,
+                    "hearing_impaired": True}],
+        "has_text_en": True, "has_image_en": False, "error": None,
+    })
+    r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+    assert r.status_code == 200
+    assert calls == ["fileA"]                          # resolve() DID run
+    assert r.json()["subtitles"] is True
+    assert client._captured["prefer_lang"] is None
+    assert client._captured["sub_path"].endswith("fileA.srt")
+
+
+def test_api_play_falls_through_on_und_language_tag(client, tmp_path):
+    # A text track with no/"und" language tag is NOT treated as covered --
+    # --slang=eng and VLC's language setting both match the DECLARED tag
+    # only, so an untagged track would silently lose the match at playback.
+    calls = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        calls.append(file_id)
+        return str(tmp_path / "subs" / ("%s.srt" % file_id))
+
+    client.app.state.dc.subtitles.resolve = _spy_resolve
+    client.app.state.dc.sub_index.put("fileA", {
+        "size": 5000, "probed_at": 1.0, "ok": True,
+        "tracks": [{"index": 2, "codec": "subrip", "kind": "text",
+                    "lang": "und", "title": None, "forced": False,
+                    "hearing_impaired": False}],
+        "has_text_en": False, "has_image_en": False, "error": None,
+    })
+    r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+    assert r.status_code == 200
+    assert calls == ["fileA"]                          # resolve() DID run
+    assert r.json()["subtitles"] is True
+    assert client._captured["prefer_lang"] is None
+    assert client._captured["sub_path"].endswith("fileA.srt")
+
+
+def test_api_play_falls_through_on_image_only_english_track(client, tmp_path):
+    # An image-based English track (PGS/VOBSUB) can't be selected via
+    # --slang/--sub-language the way a text track can -- nothing text-based
+    # can serve it, and only the player itself (rendering the embedded
+    # track) can show it. Falls through to resolve() exactly as if no
+    # embedded track existed.
+    calls = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        calls.append(file_id)
+        return str(tmp_path / "subs" / ("%s.srt" % file_id))
+
+    client.app.state.dc.subtitles.resolve = _spy_resolve
+    client.app.state.dc.sub_index.put("fileA", {
+        "size": 5000, "probed_at": 1.0, "ok": True,
+        "tracks": [{"index": 2, "codec": "hdmv_pgs_subtitle", "kind": "image",
+                    "lang": "eng", "title": None, "forced": False,
+                    "hearing_impaired": False}],
+        "has_text_en": False, "has_image_en": True, "error": None,
+    })
+    r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+    assert r.status_code == 200
+    assert calls == ["fileA"]                          # resolve() DID run
+    assert r.json()["subtitles"] is True
+    assert client._captured["prefer_lang"] is None
     assert client._captured["sub_path"].endswith("fileA.srt")
 
 
@@ -1365,3 +1505,327 @@ def test_media_info_unknown_keeps_hardware(client, monkeypatch, tmp_path):
 def test_media_info_requires_token_remotely(make_client):
     with make_client({"remote_access": True, "remote_token": "s3cret"}) as c:
         assert c.get("/api/media-info/fileA").status_code == 401
+
+# ---------------------------------------------------------------------------
+# Manager pass: the play/HEAD-probe decisions an architecture review found
+# untested (Infuse regression, image-only gate, TV quota drain, match hints).
+# ---------------------------------------------------------------------------
+
+def _index_track(kind="text", lang="eng", forced=False, hearing_impaired=False):
+    return {
+        "size": 5000, "probed_at": 1.0, "ok": True,
+        "tracks": [{"index": 2, "codec": "subrip" if kind == "text" else "hdmv_pgs_subtitle",
+                    "kind": kind, "lang": lang, "title": None, "forced": forced,
+                    "hearing_impaired": hearing_impaired}],
+        "has_text_en": kind == "text", "has_image_en": kind == "image",
+        "error": None,
+    }
+
+
+def test_api_play_falls_through_to_resolve_for_infuse(make_client, monkeypatch, tmp_path):
+    """Infuse regression guard.
+
+    infuse:// has no language or track parameter -- only `sub=` -- so a
+    prefer_lang hint is silently dropped at launch. Short-circuiting
+    resolve() for an embedded-covered file therefore handed Infuse NEITHER
+    a sidecar (which it used to get) nor a language hint, and then reported
+    subtitles=True. That is strictly worse than before the feature existed,
+    so Infuse must keep taking the sidecar path.
+    """
+    monkeypatch.setattr(server_mod, "detect_player",
+                        lambda pref="auto": ("infuse", "/Applications/Infuse.app"))
+    calls = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        calls.append(file_id)
+        return str(tmp_path / "subs" / ("%s.srt" % file_id))
+
+    with make_client({"player": "infuse"}, client_addr=("127.0.0.1", 5000)) as c:
+        c.app.state.dc.subtitles.resolve = _spy_resolve
+        c.app.state.dc.sub_index.put("fileA", _index_track())
+        r = c.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+        assert r.status_code == 200
+        assert calls == ["fileA"]                  # resolve() DID run
+        assert c._captured["prefer_lang"] is None   # never a bare hint for Infuse
+        assert c._captured["sub_path"].endswith("fileA.srt")
+        assert r.json()["subtitles"] is True        # and it is TRUE this time
+
+
+def test_api_play_image_only_track_needs_the_config_key(client, tmp_path):
+    """D-031's one-line flip, and the fact that it is OFF by default.
+
+    mpv/IINA/VLC are documented to render a PGS track selected by language,
+    which would make image-only files covered for free -- but that is
+    unverified on this hardware, and a wrong "covered" is unrecoverable in
+    practice: nothing re-checks it and the file leaves the backfill worklist
+    forever. So it stays behind a config key until the device test passes.
+    """
+    calls = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        calls.append(file_id)
+        return str(tmp_path / "subs" / ("%s.srt" % file_id))
+
+    state = client.app.state.dc
+    state.subtitles.resolve = _spy_resolve
+    state.sub_index.put("fileA", _index_track(kind="image"))
+
+    # Default (key off): image-only is NOT coverage, so resolve() runs.
+    r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+    assert r.status_code == 200
+    assert calls == ["fileA"]
+    assert client._captured["prefer_lang"] is None
+
+    # Key on (post-D-031): the same flag selects the image track, no fetch.
+    calls.clear()
+    state.cfg["prefer_embedded_image_subtitles"] = True
+    r = client.post("/api/play", json={"file_id": "fileA", "name": "Skyharbor"})
+    assert r.status_code == 200
+    assert calls == []
+    assert client._captured["prefer_lang"] == "eng"
+
+
+def test_api_play_passes_the_precise_match_hints_to_resolve(client):
+    """The moviehash/tmdb fallback chain was dead code on every interactive
+    path: only the backfill passed these kwargs, so a play-time lookup used
+    the weakest title-text query and could miss a file the queue would
+    later match exactly by hash."""
+    seen = {}
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        seen.update(kw)
+        return None
+
+    client.app.state.dc.subtitles.resolve = _spy_resolve
+    r = client.post("/api/play", json={"file_id": "fileE1",
+                                       "name": "The.Ladle.S01E01.mkv"})
+    assert r.status_code == 200
+    assert seen["size"] == 900
+    assert seen["season"] == 1
+    assert seen["episode"] == 1
+
+
+def test_api_subtitles_skips_opensubtitles_when_embedded_covered(client):
+    """The Fire TV's only subtitle mechanism is this endpoint, and it
+    HEAD-probes before every playback. On the files that carry
+    their own English track it was spending scarce anonymous-tier
+    downloads on a redundant sidecar -- draining the very five-a-day the
+    backfill queue is budgeted against, invisibly to the queue's own
+    counter. The free sources still run; only the paid step is skipped."""
+    seen = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        seen.append(kw.get("allow_opensubtitles"))
+        return None
+
+    state = client.app.state.dc
+    state.subtitles.resolve = _spy_resolve
+    state.sub_index.put("fileA", _index_track())
+
+    r = client.get("/api/subtitles/fileA")
+    assert r.status_code == 404              # nothing free was available
+    assert seen == [False]                   # and OpenSubtitles was NOT dialled
+
+    # A file with no embedded track still gets the paid step.
+    seen.clear()
+    state.sub_index.put("fileE1", {"size": 900, "probed_at": 1.0, "ok": True,
+                                    "tracks": [], "has_text_en": False,
+                                    "has_image_en": False, "error": None})
+    client.get("/api/subtitles/fileE1")
+    assert seen == [True]
+
+
+def test_api_subtitles_refresh_always_allows_opensubtitles(client):
+    """?refresh=1 is a person explicitly asking for a re-fetch, so it
+    overrides the embedded-covered skip -- otherwise the remedy for a
+    wrongly-rejected subtitle would be unreachable on exactly the files
+    that have an embedded track."""
+    seen = []
+
+    async def _spy_resolve(file_id, name, drive_id=None, parent_id=None, **kw):
+        seen.append(kw.get("allow_opensubtitles"))
+        return None
+
+    state = client.app.state.dc
+    state.subtitles.resolve = _spy_resolve
+    state.sub_index.put("fileA", _index_track())
+
+    client.get("/api/subtitles/fileA?refresh=1")
+    assert seen == [True]
+
+
+def test_backfill_status_reports_unknown_coverage_before_the_sweep(client):
+    """"0 of 2225 files have subtitles" is not a cautious estimate before
+    the sweep, it is wrong in the alarming direction -- roughly 40% of
+    those files carry their own text track (30-file sample)."""
+    r = client.get("/api/subs/backfill/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["swept"] is False
+    assert body["covered_count"] is None
+    assert body["uncovered_count"] is None
+    assert body["pending_count"] == 0        # no library-sized guess persisted
+
+    # The button refuses rather than spending the day's five slots on guesses.
+    r = client.post("/api/subs/backfill")
+    assert r.json() == {"started": False, "running": False, "swept": False}
+
+    # A completed sweep and the numbers become real.
+    client.app.state.dc.sub_index.put("fileA", _index_track())
+    body = client.get("/api/subs/backfill/status").json()
+    assert body["swept"] is False            # mid-sweep: probes, no completion
+    client.app.state.dc.sub_index.mark_complete()
+    body = client.get("/api/subs/backfill/status").json()
+    assert body["swept"] is True
+    assert body["covered_count"] == 1        # fileA has its own English track
+    assert body["uncovered_count"] == body["total_count"] - 1
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: subtitles gate, coverage predicate, bounded resolve, hints
+# ---------------------------------------------------------------------------
+
+def test_sweep_and_backfill_callbacks_respect_subtitles_off(client):
+    state = client.app.state.dc
+    calls = []
+    state.start_sweep = lambda *a, **k: calls.append("sweep")
+    state.start_backfill = lambda *a, **k: calls.append("backfill")
+
+    class _Done:
+        def cancelled(self): return False
+        def exception(self): return None
+
+    state.cfg["subtitles"] = False
+    state._after_scan_maybe_sweep(_Done())
+    state._after_sweep_maybe_backfill(_Done())
+    assert calls == []
+    state.cfg["subtitles"] = True
+    state._after_scan_maybe_sweep(_Done())
+    state._after_sweep_maybe_backfill(_Done())
+    assert calls == ["sweep", "backfill"]
+
+
+def test_worklist_ignores_forced_and_sdh_english_text(client):
+    state = client.app.state.dc
+    state._video_files_for_sweep = lambda: [("f1", 1), ("f2", 1), ("f3", 1)]
+    state._sidecar_covered_ids = lambda: set()
+    state.sub_index.put("f1", _index_track(forced=True))
+    state.sub_index.put("f2", _index_track(hearing_impaired=True))
+    state.sub_index.put("f3", _index_track())
+    assert state._uncovered_file_ids() == ["f1", "f2"]
+
+
+def test_worklist_and_autoplay_honour_image_flag(client):
+    state = client.app.state.dc
+    state._video_files_for_sweep = lambda: [("img", 1)]
+    state._sidecar_covered_ids = lambda: set()
+    state.sub_index.put("img", _index_track(kind="image"))
+    state.cfg["prefer_embedded_image_subtitles"] = False
+    assert state._uncovered_file_ids() == ["img"]
+    assert state._sub_decision_lookup("img")[1] is None
+    state.cfg["prefer_embedded_image_subtitles"] = True
+    assert state._uncovered_file_ids() == []
+    assert state._sub_decision_lookup("img") == (None, "eng")
+
+
+def test_backfill_attempt_logs_and_flags_a_crash(client, caplog):
+    state = client.app.state.dc
+
+    async def _boom(*a, **k):
+        raise RuntimeError("net down")
+    state.subtitles.resolve = _boom
+    with caplog.at_level("WARNING", logger="drivecast.server"):
+        out = asyncio.run(state._backfill_attempt({"file_id": "x"}))
+    assert out["ok"] is False and out["transient"] is True
+    assert "net down" in caplog.text
+
+
+def test_start_backfill_resets_running_when_setup_raises(client):
+    state = client.app.state.dc
+
+    def _boom():
+        raise OSError("disk")
+    state._refresh_backfill_worklist = _boom
+
+    async def _go():
+        with pytest.raises(OSError):
+            state.start_backfill()
+    asyncio.run(_go())
+    assert not state.subtitle_queue.status.get("running")
+
+
+def test_resolve_bounded_lets_resolve_finish_after_timeout(client):
+    state = client.app.state.dc
+    done = []
+
+    async def _slow(*a, **k):
+        await asyncio.sleep(0.2)
+        done.append(1)
+        return "/x.srt"
+    state.subtitles.resolve = _slow
+
+    async def _go():
+        with pytest.raises(asyncio.TimeoutError):
+            await state._resolve_bounded(0.01, "f")
+        await asyncio.sleep(0.4)
+    asyncio.run(_go())
+    assert done == [1]          # not cancelled by the wait bound
+
+
+def test_api_subtitles_refresh_post_passes_match_hints(client):
+    state = client.app.state.dc
+    seen = {}
+
+    async def _spy(file_id, name, drive_id=None, parent_id=None, **kw):
+        seen.update(kw)
+        return None
+    state.subtitles.resolve = _spy
+    state._os_match_hints = lambda fid, info=None: (123, 77, 2, 5)
+    client.post("/api/subtitles/fileA/refresh")
+    assert (seen["size"], seen["tmdb_id"], seen["season"], seen["episode"]) == (123, 77, 2, 5)
+
+
+def test_resolve_bounded_joins_inflight_resolve_for_same_file(client):
+    state = client.app.state.dc
+    started = []
+
+    async def _slow(file_id, *a, **k):
+        started.append(file_id)
+        await asyncio.sleep(0.1)
+        return "/x.srt"
+    state.subtitles.resolve = _slow
+
+    async def _go():
+        with pytest.raises(asyncio.TimeoutError):
+            await state._resolve_bounded(0.01, "f")
+        again = await state._resolve_bounded(1.0, "f")   # retry joins it
+        other = await state._resolve_bounded(1.0, "g")   # other file: own task
+        return again, other
+    again, other = asyncio.run(_go())
+    assert again == "/x.srt" and other == "/x.srt"
+    assert started == ["f", "g"]
+    assert state._inflight_resolves == {}
+
+
+def test_backfill_attempt_does_not_cancel_resolve_on_timeout(client, monkeypatch):
+    state = client.app.state.dc
+    done = []
+
+    async def _slow(*a, **k):
+        await asyncio.sleep(0.2)
+        done.append(1)
+        return "/x.srt"
+    state.subtitles.resolve = _slow
+    real = state._resolve_bounded
+
+    async def _fast_bound(timeout, *a, **k):
+        return await real(0.01, *a, **k)
+    monkeypatch.setattr(state, "_resolve_bounded", _fast_bound)
+
+    async def _go():
+        res = await state._backfill_attempt({"file_id": "f"})
+        await asyncio.sleep(0.4)
+        return res
+    res = asyncio.run(_go())
+    assert res["transient"] is True and res["ok"] is False
+    assert done == [1]          # the lookup finished detached

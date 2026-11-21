@@ -1251,6 +1251,8 @@ async function openSettings() {
   state.autoplayNext = settings.autoplay_next !== false;
   if ($("autoplayNext")) $("autoplayNext").checked = state.autoplayNext;
   if ($("subtitlesOn")) $("subtitlesOn").checked = settings.subtitles !== false;
+  if ($("preferEmbeddedSubs")) $("preferEmbeddedSubs").checked = settings.prefer_embedded_subtitles !== false;
+  loadSubtitleCoverage();
   if ($("keepAwake")) $("keepAwake").checked = settings.keep_awake !== false;
   if ($("remoteAccess")) {
     $("remoteAccess").checked = !!settings.remote_access;
@@ -1448,6 +1450,7 @@ async function saveSettings() {
       body: JSON.stringify({ selected_drives: selected, drive_sections: driveSections,
         auto_refresh_on_startup: auto, autoplay_next: autoplay,
         subtitles: $("subtitlesOn") ? $("subtitlesOn").checked : true,
+        prefer_embedded_subtitles: $("preferEmbeddedSubs") ? $("preferEmbeddedSubs").checked : true,
         keep_awake: $("keepAwake") ? $("keepAwake").checked : true,
         remote_access: $("remoteAccess") ? $("remoteAccess").checked : false,
         player: ($("playerSelect") || {}).value || "auto" }),
@@ -1887,6 +1890,85 @@ $("settingsBack").addEventListener("click", () => { location.hash = "#/"; });
 $("browseBack").addEventListener("click", () => { location.hash = "#/"; });
 $("refreshBtn").addEventListener("click", triggerRefresh);
 $("saveSettings").addEventListener("click", saveSettings);
+// This is the only place the user ever sees whether "always have subtitles"
+// is actually being kept, so the numbers come straight from the sweep's
+// index and the backfill queue -- never a decorative guess.
+async function loadSubtitleCoverage() {
+  const el = $("subCoverageSummary");
+  if (!el) return;
+  let s;
+  try { s = await api("/api/subs/backfill/status"); }
+  catch (_) { el.textContent = "Could not load subtitle coverage."; return; }
+  const total = s.total_count || 0;
+  const uncovered = s.uncovered_count || 0;
+  // `swept` false means the embedded-track scan has never run, so there is no
+  // coverage data at all. Reporting "0 of 2225 have subtitles" here would be
+  // wrong in the alarming direction — plenty of those files carry their own
+  // English track; the scan is what finds out which.
+  if (!total) {
+    el.textContent = "Run a library refresh to see subtitle coverage.";
+  } else if (s.swept === false) {
+    el.textContent = `Subtitle coverage is unknown for ${total} files. `
+      + "Run the subtitle scan first — it checks each file for a subtitle track "
+      + "it already carries.";
+  } else if (!uncovered) {
+    el.textContent = `All ${total} files have subtitles (embedded or fetched).`;
+  } else {
+    const queued = s.queued_count || 0;
+    const budget = `${s.remaining}/${s.daily_limit} of today's fetch budget left`;
+    const parked = s.parked_count
+      ? ` ${s.parked_count} had no subtitle available and retry weekly.` : "";
+    el.textContent = `${s.covered_count} of ${total} files have subtitles. `
+      + `${uncovered} still need one` + (queued ? ` — ${queued} queued (${budget}).` : ".")
+      + parked;
+  }
+  const btn = $("startBackfill");
+  if (btn) btn.disabled = !!s.running || s.swept === false || uncovered === 0;
+}
+
+if ($("startBackfill")) {
+  $("startBackfill").addEventListener("click", async () => {
+    const btn = $("startBackfill");
+    const msg = $("subCoverageMsg");
+    btn.disabled = true;
+    msg.textContent = "Starting…";
+    try {
+      const res = await api("/api/subs/backfill", { method: "POST" });
+      msg.textContent = res.started
+        ? "Fetching subtitles for today's queue…"
+        : (res.swept === false
+            ? "Run the subtitle scan first, so this only fetches what is really missing."
+            : "A backfill run is already in progress.");
+      setTimeout(loadSubtitleCoverage, 4000);
+    } catch (e) {
+      msg.textContent = "Could not start the backfill.";
+      btn.disabled = false;
+      return;
+    }
+    // loadSubtitleCoverage decides the disabled state (running / unswept / nothing to do).
+    loadSubtitleCoverage();
+  });
+}
+if ($("clearSubCache")) {
+  $("clearSubCache").addEventListener("click", async () => {
+    const btn = $("clearSubCache");
+    const msg = $("clearSubCacheMsg");
+    btn.disabled = true;
+    const previous = msg.textContent;
+    msg.textContent = "Clearing…";
+    try {
+      const res = await api("/api/subtitles/cache", { method: "DELETE" });
+      const n = res.cleared || 0;
+      msg.textContent = n
+        ? `Forgot ${n} failed lookup${n === 1 ? "" : "s"}. They will be retried on the next play.`
+        : "Nothing to forget — no failed lookups are being remembered.";
+    } catch (e) {
+      msg.textContent = previous;
+      toast("Could not clear the subtitle cache.");
+    }
+    btn.disabled = false;
+  });
+}
 if ($("remoteAccess")) $("remoteAccess").addEventListener("change", renderRemoteBlock);
 if ($("newSectionCreate")) $("newSectionCreate").addEventListener("click", submitCreateTab);
 if ($("newSectionCancel")) $("newSectionCancel").addEventListener("click", closeCreateTabForm);

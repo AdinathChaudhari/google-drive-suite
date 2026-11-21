@@ -146,8 +146,22 @@
         </label>
         <label class="toggle">
           <input type="checkbox" id="subtitlesOn">
-          <span>English subtitles when available <span class="muted">(sibling .srt on the drive, or OpenSubtitles with an API key in secrets)</span></span>
+          <span>English subtitles when available <span class="muted">(embedded track in the file first, then a sibling .srt on the drive, then OpenSubtitles with an API key in secrets)</span></span>
         </label>
+        <label class="toggle">
+          <input type="checkbox" id="preferEmbeddedSubs">
+          <span>Prefer the file's own subtitle track <span class="muted">(when mpv/IINA/VLC play a file with an English track already inside it, select that track by language instead of fetching a sidecar — turn off to always fetch a sidecar instead, e.g. if a player's built-in track has ever looked wrong)</span></span>
+        </label>
+        <div class="setting-row">
+          <button id="clearSubCache" class="btn">Retry failed subtitle lookups</button>
+          <p class="muted" id="clearSubCacheMsg">Drivecast remembers which files had no usable subtitle so it stops re-asking on every play. Press this after fixing your connection, or if a subtitle was rejected that should have been kept.</p>
+        </div>
+        <div class="setting-row" id="subCoverageRow">
+          <strong>Subtitle coverage</strong>
+          <p class="muted" id="subCoverageSummary">Loading…</p>
+          <button id="startBackfill" class="btn">Fetch missing subtitles now</button>
+          <p class="muted" id="subCoverageMsg"></p>
+        </div>
         <label class="toggle">
           <input type="checkbox" id="keepAwake">
           <span>Keep Mac awake while streaming <span class="muted">(holds a caffeinate assertion during active streams; works in clamshell)</span></span>

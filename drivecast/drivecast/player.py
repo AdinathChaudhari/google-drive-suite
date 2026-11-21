@@ -85,12 +85,20 @@ def should_advance(position, duration):
     return (duration - position) <= FINISH_TAIL_SECONDS
 
 
-def build_mpv_args(path, sock, resume, name, url, media=None, sub_path=None):
+def build_mpv_args(path, sock, resume, name, url, media=None, sub_path=None,
+                   prefer_lang=None):
     """Construct the mpv command line (IPC + resume + title + cache/hwdec).
 
     Audio-only files need --force-window: mpv runs with --no-terminal, so
     without a window there'd be no UI at all to pause/seek/quit from.
     `sub_path` is a LOCAL subtitle file to preload alongside the stream.
+    `prefer_lang` (e.g. "eng") selects an embedded subtitle track by
+    language via `--slang` instead of loading a sidecar.
+
+    `sub_path` and `prefer_lang` are mutually exclusive, enforced HERE
+    rather than by caller discipline: mpv prioritises an explicit
+    --sub-file over a --slang match, so sending both is a race with no
+    upside -- an explicit sidecar always wins.
     """
     args = [
         path,
@@ -104,12 +112,18 @@ def build_mpv_args(path, sock, resume, name, url, media=None, sub_path=None):
         args.append("--force-window=immediate")
     if sub_path:
         args.append("--sub-file=%s" % sub_path)
+    elif prefer_lang:
+        args.append("--slang=%s" % prefer_lang)
     args.append(url)
     return args
 
 
-def build_iina_args(path, sock, resume, name, url, sub_path=None):
-    """Construct the IINA command line (mpv-prefixed IPC + resume + cache/hwdec)."""
+def build_iina_args(path, sock, resume, name, url, sub_path=None, prefer_lang=None):
+    """Construct the IINA command line (mpv-prefixed IPC + resume + cache/hwdec).
+
+    Same mutual-exclusivity rule as build_mpv_args: a sidecar (--mpv-sub-file)
+    wins over a language preference (--mpv-slang) when both are given.
+    """
     args = [
         path,
         "--mpv-input-ipc-server=%s" % sock,
@@ -119,15 +133,25 @@ def build_iina_args(path, sock, resume, name, url, sub_path=None):
     ]
     if sub_path:
         args.append("--mpv-sub-file=%s" % sub_path)
+    elif prefer_lang:
+        args.append("--mpv-slang=%s" % prefer_lang)
     args.append(url)
     return args
 
 
-def build_vlc_args(path, resume, name, url, http_port, http_password, sub_path=None):
+def build_vlc_args(path, resume, name, url, http_port, http_password, sub_path=None,
+                   prefer_lang=None):
     """Construct the VLC command line with its HTTP interface + resume enabled.
 
     The HTTP interface lets us poll playback position (see parse_vlc_status);
     --start-time resumes and --play-and-exit closes VLC when the file ends.
+
+    `prefer_lang` maps to `--sub-language`, a free-form string VLC matches
+    against a track's declared language -- NOT `--sub-track`, which is an
+    INTEGER INDEX into the subtitle track list (verified against the
+    installed binary via --longhelp --advanced) and has nothing to do with
+    language; feeding it a language code would be wrong. Mutually exclusive
+    with `sub_path`, enforced here: a sidecar always wins.
     """
     args = [
         path,
@@ -141,6 +165,8 @@ def build_vlc_args(path, resume, name, url, http_port, http_password, sub_path=N
     ]
     if sub_path:
         args += ["--sub-file", sub_path]
+    elif prefer_lang:
+        args += ["--sub-language", prefer_lang]
     args.append(url)
     return args
 
@@ -153,6 +179,12 @@ def build_infuse_url(url, resume=0, name=None, sub_url=None):
     `filename` gives Infuse a real name for metadata (our /stream URLs are
     opaque file ids), `sub` is an HTTP URL to a subtitle file. Pure function
     so the encoding is unit-testable.
+
+    CEILING: the `infuse://` x-callback scheme has no language or embedded-
+    track parameter -- only `sub=`, a sidecar URL. There is no equivalent of
+    mpv's `--slang` or VLC's `--sub-language` to invent here; Infuse's
+    embedded-track selection stays whatever the app's own UI does, and this
+    function intentionally takes no `prefer_lang` argument.
     """
     parts = ["infuse://x-callback-url/play?url=%s" % urllib.parse.quote(url, safe="")]
     if resume and int(resume) > 0:
@@ -236,7 +268,16 @@ class PlayerManager:
         self.base_url = base_url.rstrip("/")
         # Optional sync file_id -> cached subtitle path lookup (set by the
         # server) so autoplay-advanced episodes pick up cached subs too.
+        # Superseded by sub_decision_lookup below when the server sets one;
+        # kept as the unset fallback for back-compat.
         self.sub_cache_lookup = None
+        # Optional sync file_id -> (sub_path, prefer_lang) lookup (set by the
+        # server) consulted by _advance instead of sub_cache_lookup when
+        # present. CONTRACT: synchronous, in-memory reads only -- _advance
+        # runs in a poller thread's `finally` block, and a network call
+        # there would stall history writes for however long it takes to
+        # answer.
+        self.sub_decision_lookup = None
         self._session = None  # dict for the currently tracked session
         self._session_lock = threading.Lock()
 
@@ -244,7 +285,7 @@ class PlayerManager:
         return "%s/stream/%s" % (self.base_url, file_id)
 
     def play(self, file_id, name, duration_ms=None, drive_id=None, parent_id=None,
-             queue=None, media=None, sub_path=None):
+             queue=None, media=None, sub_path=None, prefer_lang=None):
         """Launch the configured player at the resume position.
 
         `queue` is an optional ordered list of upcoming items
@@ -252,6 +293,11 @@ class PlayerManager:
         this file finishes, the next queue item launches automatically, chaining
         through the whole queue. If `autoplay_next` config is off the queue is
         ignored and only this item plays.
+
+        `sub_path` (a local sidecar) and `prefer_lang` (an embedded-track
+        language code, e.g. "eng") are mutually exclusive -- see the
+        per-builder docstrings for why sending both is a no-op race rather
+        than "belt and suspenders".
 
         Returns {"player": kind, "resumed_from": seconds}.
         """
@@ -270,58 +316,66 @@ class PlayerManager:
 
         resume = self._launch(kind, path, file_id, name, duration_ms,
                               drive_id, parent_id, list(queue or []), media=media,
-                              sub_path=sub_path)
+                              sub_path=sub_path, prefer_lang=prefer_lang)
         return {"player": kind, "resumed_from": resume}
 
     # ---- launchers ----
 
     def _launch(self, kind, path, file_id, name, duration_ms, drive_id, parent_id, queue,
-                media=None, sub_path=None):
+                media=None, sub_path=None, prefer_lang=None):
         """Resolve resume/url/duration and dispatch to the per-player launcher.
 
         Shared by play() and the autoplay-advance path so both start a session
         identically. Returns the resume position (seconds).
+
+        `prefer_lang` is silently dropped for Infuse: its infuse:// scheme has
+        no language/track parameter (see build_infuse_url's docstring), so
+        there is nothing to pass through.
         """
         resume = self.history.resume_position(file_id)
         url = self.stream_url(file_id)
         duration = (float(duration_ms) / 1000.0) if duration_ms else None
         if kind == "mpv":
             self._launch_mpv(path, file_id, name, url, resume, duration, drive_id,
-                             parent_id, queue, media=media, sub_path=sub_path)
+                             parent_id, queue, media=media, sub_path=sub_path,
+                             prefer_lang=prefer_lang)
         elif kind == "iina":
             self._launch_iina(path, file_id, name, url, resume, duration, drive_id,
-                              parent_id, queue, sub_path=sub_path)
+                              parent_id, queue, sub_path=sub_path,
+                              prefer_lang=prefer_lang)
         elif kind == "vlc":
             self._launch_vlc(path, file_id, name, url, resume, duration, drive_id,
-                             parent_id, queue, sub_path=sub_path)
+                             parent_id, queue, sub_path=sub_path,
+                             prefer_lang=prefer_lang)
         else:  # infuse
             self._launch_infuse(file_id, name, url, resume, duration,
                                 drive_id, parent_id, sub_path=sub_path)
         return resume
 
     def _launch_mpv(self, path, file_id, name, url, resume, duration, drive_id,
-                    parent_id, queue, media=None, sub_path=None):
+                    parent_id, queue, media=None, sub_path=None, prefer_lang=None):
         sock = "/tmp/drivecast-%s.sock" % uuid.uuid4().hex[:12]
         args = build_mpv_args(path, sock, resume, name, url, media=media,
-                              sub_path=sub_path)
+                              sub_path=sub_path, prefer_lang=prefer_lang)
         proc = subprocess.Popen(args)
         self._start_poller("mpv", path, proc, sock, file_id, name, duration,
                            drive_id, parent_id, queue)
 
     def _launch_iina(self, path, file_id, name, url, resume, duration, drive_id,
-                     parent_id, queue, sub_path=None):
+                     parent_id, queue, sub_path=None, prefer_lang=None):
         sock = "/tmp/drivecast-%s.sock" % uuid.uuid4().hex[:12]
-        args = build_iina_args(path, sock, resume, name, url, sub_path=sub_path)
+        args = build_iina_args(path, sock, resume, name, url, sub_path=sub_path,
+                               prefer_lang=prefer_lang)
         proc = subprocess.Popen(args)
         self._start_poller("iina", path, proc, sock, file_id, name, duration,
                            drive_id, parent_id, queue)
 
     def _launch_vlc(self, path, file_id, name, url, resume, duration, drive_id,
-                    parent_id, queue, sub_path=None):
+                    parent_id, queue, sub_path=None, prefer_lang=None):
         http_port = _find_free_port()
         http_password = uuid.uuid4().hex
         args = build_vlc_args(path, resume, name, url, http_port, http_password,
-                              sub_path=sub_path)
+                              sub_path=sub_path, prefer_lang=prefer_lang)
         try:
             proc = subprocess.Popen(args)
         except OSError as exc:
@@ -378,8 +432,16 @@ class PlayerManager:
         if not queue:
             return
         nxt, rest = queue[0], queue[1:]
-        sub_path = None
-        if self.sub_cache_lookup:
+        sub_path, prefer_lang = None, None
+        # sub_decision_lookup (embedded index + cached sidecar, no network)
+        # takes priority; sub_cache_lookup (cached sidecar only) is the
+        # unset fallback for a caller that never wires the newer hook.
+        if self.sub_decision_lookup:
+            try:
+                sub_path, prefer_lang = self.sub_decision_lookup(nxt.get("file_id"))
+            except Exception:  # pragma: no cover - defensive
+                sub_path, prefer_lang = None, None
+        elif self.sub_cache_lookup:
             try:
                 sub_path = self.sub_cache_lookup(nxt.get("file_id"))
             except Exception:  # pragma: no cover - defensive
@@ -388,7 +450,8 @@ class PlayerManager:
             self._launch(kind, path, nxt.get("file_id"),
                          nxt.get("name") or nxt.get("file_id"),
                          nxt.get("duration_ms"), drive_id, parent_id, rest,
-                         media=nxt.get("media"), sub_path=sub_path)
+                         media=nxt.get("media"), sub_path=sub_path,
+                         prefer_lang=prefer_lang)
         except Exception as exc:  # pragma: no cover - defensive
             log.debug("autoplay advance failed: %r", exc)
 

@@ -28,13 +28,72 @@ from .player import PlayerError, PlayerManager, detect_player
 from .rclone_auth import RcloneError, TokenManager
 from .scan_cache import ScanCache
 from . import __version__ as APP_VERSION
-from .subtitles import SubtitleResolver, mime_for
+from .subtitles import SUB_EXTS, SubtitleResolver, mime_for
+from .sub_index import SubIndex
+from . import sub_sweep as sub_sweep_mod
+from .sub_sweep import SubtitleSweeper, is_english
+from .subtitle_queue import SubtitleQueue, classify_priorities
 from .streaming import Streamer
 from .tmdb import TMDB
 
 log = logging.getLogger("drivecast.server")
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def _has_embedded_english_text_track(record):
+    """True if a sub_index probe `record` has an English TEXT track that is
+    usable as "subtitles are already on" without any further fetch.
+
+    Session C's whole short-circuit hinges on this being narrower than the
+    index's own `has_text_en` flag: that flag is True for ANY English text
+    track, forced or hearing-impaired included. A forced track is
+    near-empty (only a few foreign-language lines) and a hearing-impaired
+    (SDH) track is bracketed sound-effect text -- handing either over as
+    the answer to "turn subtitles on" reads as a regression, not a feature,
+    so both are excluded here and the caller falls through to resolve() as
+    if there were no embedded track at all. `und`/missing language tags are
+    likewise never covered (`is_english` already encodes that), because
+    --slang and VLC's language setting both match the DECLARED tag only --
+    an untagged match here would be a false positive nothing downstream
+    ever rechecks. `record` is None (never probed) or `ok: False` (probe
+    failed) both mean "unknown", so both fall through, same as uncovered.
+    """
+    if not record or not record.get("ok"):
+        return False
+    for track in record.get("tracks") or []:
+        if (track.get("kind") == "text"
+                and is_english(track.get("lang"))
+                and not track.get("forced")
+                and not track.get("hearing_impaired")):
+            return True
+    return False
+
+
+def _has_embedded_english_image_track(record):
+    """True if the only English subtitles in `record` are IMAGE tracks
+    (PGS/dvd_subtitle) on a non-forced, non-SDH stream.
+
+    Split from the text predicate on purpose. mpv, IINA and VLC are all
+    documented to render an image track selected by `--slang`/
+    `--sub-language`, which would make these files covered for free -- but
+    that is unverified on this hardware (D-031), and Infuse's `sub=` is a
+    text-sidecar-only consumer, so it can never be true there. A wrong
+    "covered" here is unrecoverable in practice: nothing re-checks it, and
+    the file would be excluded from the backfill worklist forever. So the
+    caller gates this behind `prefer_embedded_image_subtitles`, default
+    False, and the config key is the whole point -- once §6.5 passes per
+    player, turning it on is a settings edit, not a code change.
+    """
+    if not record or not record.get("ok"):
+        return False
+    for track in record.get("tracks") or []:
+        if (track.get("kind") == "image"
+                and is_english(track.get("lang"))
+                and not track.get("forced")
+                and not track.get("hearing_impaired")):
+            return True
+    return False
 
 
 class AppState:
@@ -67,12 +126,36 @@ class AppState:
         port = cfg.get("port", 8737)
         self.player = PlayerManager(cfg, self.history, "http://127.0.0.1:%d" % port)
         self.subtitles = SubtitleResolver(self.api, cfg.get("opensubtitles_api_key"))
-        # Autoplay-advanced episodes reuse already-cached subtitles (sync).
+        # Embedded-subtitle index + the sweep that fills it (session B of the
+        # subtitles plan). Separate store, separate progress meter -- see
+        # sub_index.py / sub_sweep.py module docstrings for why. Created
+        # BEFORE sub_decision_lookup is wired below, since that closure
+        # reads self.sub_index.
+        self.sub_index = SubIndex()
+        self.sub_sweep = SubtitleSweeper(self.sub_index, port=cfg.get("port", 8737))
+        # Session D: the OpenSubtitles backfill queue for the (small) measured
+        # remainder the sweep can't already answer from an embedded track.
+        # daily_limit is a config key (config.py's "subtitle_daily_limit")
+        # specifically so raising it later -- e.g. after logging into a
+        # 20/day account -- is a one-line change, not a code change.
+        self.subtitle_queue = SubtitleQueue(
+            daily_limit=cfg.get("subtitle_daily_limit", 5))
+        self._backfill_task = None
+        self._backfill_timer_task = None
+        # Autoplay-advanced episodes get the same embedded-vs-sidecar
+        # decision /api/play makes (session C) -- NOT just a cached-sidecar
+        # lookup. sub_cache_lookup is left wired too, as the fallback
+        # PlayerManager._advance uses if a future caller never sets
+        # sub_decision_lookup.
         self.player.sub_cache_lookup = self.subtitles.cached
+        self.player.sub_decision_lookup = self._sub_decision_lookup
+        self._sweep_task = None
         self.setup_error = None  # populated by preflight if rclone is unusable
         self._refresh_task = None
         self._pending_scope = set()  # scopes requested while a scan was running
         self._pending_rebuild = False  # a rebuild/scope arrived mid-scan; re-kick on finish
+        self._inflight_resolves = {}  # (file_id, force, allow_os) -> resolve() task
+        self._detached_resolves = set()  # resolve() tasks outliving their wait bound
         self.stream_activity = {}  # file_id -> epoch of last GET /stream request
         # Cached ffprobe facts + the VLC hardware-decode policy (/api/media-info).
         self.media_info = media_info.MediaInfoCache(
@@ -130,7 +213,390 @@ class AppState:
             drive_hints=self.cfg.get("drive_hints") or {},
             drive_sections=self.cfg.get("drive_sections") or {}))
         self._refresh_task.add_done_callback(self._drain_pending_scope)
+        # Scope guard (hard requirement, see sub_sweep.py's module doc): `scope`
+        # here is the FINAL list this call is about to hand to scanner.scan,
+        # after all the collapsing/merging above. `scope == []` is a
+        # cache-only rebuild that walks no Drive bytes and can introduce no
+        # new file_id -- the sweep must never fire for it, because the sweep
+        # itself pulls bytes through /stream, which IS live Drive egress.
+        # A non-empty scope (whether the full `None`-expanded list, a
+        # per-drive partial, or a drained pending scope) did walk Drive, so
+        # it may have introduced ids the index has never seen.
+        if scope:
+            self._refresh_task.add_done_callback(self._after_scan_maybe_sweep)
         return True
+
+    def _after_scan_maybe_sweep(self, task):
+        """Fire the subtitle sweep once a WALKING scan finishes.
+
+        Only ever attached (in start_refresh above) when that scan's scope
+        was non-empty -- never after a scope=[] cache-only rebuild.
+        """
+        if task.cancelled():
+            return
+        if task.exception() is not None:
+            return
+        # Subtitles switched off: no probe sweep (live Drive egress) either.
+        if not self.cfg.get("subtitles", True):
+            return
+        self.start_sweep()
+
+    def _video_files_for_sweep(self):
+        """(file_id, size) for every movie and episode in the CURRENT library.
+
+        Extras and audiobooks are left out on purpose: movies + episodes is
+        the exact file set this plan measures against,
+        and extras/audiobooks were never part of that count.
+        """
+        out = []
+        for rec in self.library.titles_list():
+            if rec.get("type") == "movie" and rec.get("file_id"):
+                out.append((rec["file_id"], rec.get("size") or 0))
+            elif rec.get("type") == "show":
+                for season in rec.get("seasons") or []:
+                    for ep in season.get("episodes") or []:
+                        if ep.get("file_id"):
+                            out.append((ep["file_id"], ep.get("size") or 0))
+        return out
+
+    def start_sweep(self, file_ids_with_size=None):
+        """Fire-and-forget the embedded-subtitle sweep, unless one is already
+        running. `running` is set synchronously (before `create_task`, not
+        inside the coroutine) so two calls made back-to-back -- the
+        post-scan hook and a manual POST landing in the same event-loop
+        tick, say -- can't both pass the check before either's task gets its
+        first chance to run; asyncio never interleaves between here and the
+        `create_task` call below, so this check-then-set is race-free
+        without a lock."""
+        if self.sub_sweep.status.get("running"):
+            return False
+        self.sub_sweep.status["running"] = True
+        try:
+            return self._start_sweep_task(file_ids_with_size)
+        except BaseException:
+            self.sub_sweep.status["running"] = False
+            raise
+
+    def _start_sweep_task(self, file_ids_with_size):
+        # The sweep's probe bytes come through the SAME /stream proxy the
+        # player is reading from, so six parallel probes and a live stream
+        # fight over one uplink for the ~45 min a first full sweep takes.
+        # Drop to serial while something is being watched; the sweep is
+        # never urgent (it self-skips probed ids, so it just resumes).
+        self.sub_sweep.set_concurrency(
+            sub_sweep_mod.STREAMING_CONCURRENCY if self._stream_is_hot()
+            else sub_sweep_mod.DEFAULT_CONCURRENCY)
+        ids = (file_ids_with_size if file_ids_with_size is not None
+              else self._video_files_for_sweep())
+        self._sweep_task = asyncio.create_task(self.sub_sweep.run(ids))
+        # Session D: a bounded automatic backfill once the sweep's fresh
+        # coverage numbers land -- bounded by start_backfill/SubtitleQueue.run
+        # to today's remaining daily budget (5 by default), so "automatic"
+        # never means "unbounded". No separate scope check is needed here:
+        # start_sweep itself never runs for a scope=[] cache-only rebuild
+        # (see start_refresh's scope guard above) or fires only when the user
+        # explicitly asked for it (POST /api/subs/sweep) -- either way there
+        # is no scope left to re-examine by the time a sweep exists to finish.
+        self._sweep_task.add_done_callback(self._after_sweep_maybe_backfill)
+        return True
+
+    def _stream_is_hot(self):
+        """True if any /stream request arrived recently enough that the
+        uplink should be treated as in use. `stream_activity` is
+        {file_id: epoch}, written by the /stream route on every request."""
+        if not self.stream_activity:
+            return False
+        newest = max(self.stream_activity.values())
+        return (time.time() - newest) < sub_sweep_mod.STREAM_HOT_SECONDS
+
+    def _after_sweep_maybe_backfill(self, task):
+        if task.cancelled() or task.exception() is not None:
+            return
+        # Same gate as the periodic timer: subtitles off means no provider calls.
+        if not self.cfg.get("subtitles", True):
+            return
+        self.start_backfill()
+
+    async def _backfill_timer(self):
+        """Run a backfill pass every `subtitle_backfill_interval_hours`.
+
+        Why a timer exists at all: the five-a-day budget is a DAILY budget,
+        but before this the only automatic trigger was a walking scan's
+        sweep finishing. With `auto_refresh_on_startup` defaulting False, an
+        app left running for weeks never scanned, never swept, never
+        backfilled -- the budget simply evaporated unused and the "~six
+        weeks to close the gap" projection never started counting. Every
+        existing guard still applies: `start_backfill` refuses while one is
+        running, and `SubtitleQueue.run` stops at today's remaining budget,
+        so a spurious extra tick costs nothing.
+        """
+        hours = self.cfg.get("subtitle_backfill_interval_hours", 6)
+        try:
+            interval = float(hours)
+        except (TypeError, ValueError):
+            interval = 6.0
+        if interval <= 0:
+            return  # explicitly disabled
+        while True:
+            await asyncio.sleep(interval * 3600.0)
+            try:
+                if not self.cfg.get("subtitles", True):
+                    continue
+                # Before the first sweep there is no real coverage data, so
+                # the worklist is deliberately empty (see
+                # _refresh_backfill_worklist) and there is nothing to do.
+                if not self.sub_index.sweep_complete():
+                    continue
+                if self.subtitle_queue.remaining() <= 0:
+                    continue
+                self._refresh_backfill_worklist()
+                if not self.subtitle_queue.data.get("pending"):
+                    continue
+                self.start_backfill()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - a timer must never die
+                log.exception("Periodic subtitle backfill tick failed")
+
+    def start_backfill_timer(self):
+        """Start the periodic backfill loop, if configured and not running."""
+        if self._backfill_timer_task is not None:
+            return False
+        hours = self.cfg.get("subtitle_backfill_interval_hours", 6)
+        try:
+            if float(hours) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        self._backfill_timer_task = asyncio.create_task(self._backfill_timer())
+        return True
+
+    def _sidecar_covered_ids(self):
+        """file_ids that already have a cached sidecar subtitle on disk.
+
+        ONE listdir of the subs directory, not four os.path.exists calls per
+        file: the caller runs this over every id on each worklist sync and
+        status poll, and four stat calls per id per poll is a real cost for an
+        answer one directory read gives exactly.
+        """
+        out = set()
+        try:
+            entries = os.listdir(self.subtitles.subs_dir)
+        except OSError:
+            return out
+        for entry in entries:
+            stem, ext = os.path.splitext(entry)
+            if ext.lower() in SUB_EXTS:
+                out.add(stem)
+        return out
+
+    def _uncovered_file_ids(self):
+        """The backfill worklist: files with neither a usable embedded English
+        TEXT track nor an already-fetched sidecar.
+
+        The sidecar half is load-bearing, and its absence was measured to
+        make the queue stop making progress. A successfully backfilled file
+        never becomes "covered" in sub_index -- a fetched .srt does not set
+        has_text_en, and only a re-probe of the video could -- so on the
+        index alone every file the queue ever completed came straight back
+        into the worklist, got re-attempted, was instantly satisfied from
+        cache, and still cost one of five daily slots. Over weeks the budget
+        would go almost entirely on re-confirming finished work.
+
+        Image-only files (has_image_en but not has_text_en) are DELIBERATELY
+        still included: nothing text-based can use them, and D-031's "does
+        the device actually render an image track" test hasn't run yet, so
+        excluding them here would risk permanently orphaning a file if that
+        test ever comes back negative. A file never probed (record is None)
+        counts as uncovered too -- "unknown" and "known uncovered" get the
+        same treatment: queue it, the fetch itself is harmless if it later
+        turns out to have had an embedded track all along."""
+        have_sidecar = self._sidecar_covered_ids()
+        return [fid for fid, _size in self._video_files_for_sweep()
+               if fid not in have_sidecar
+               and not self._embedded_covers(self.sub_index.get(fid))]
+
+    def _embedded_covers(self, record):
+        """True if an embedded English track in `record` counts as "subtitles
+        already on". The single coverage predicate shared by /api/play, the
+        autoplay lookup and the backfill worklist: a usable text track, or --
+        only when `prefer_embedded_image_subtitles` is on -- an image track.
+        (The player-kind check stays in /api/play: it needs the live player.)"""
+        if not self.cfg.get("prefer_embedded_subtitles", True):
+            return False
+        if _has_embedded_english_text_track(record):
+            return True
+        return bool(self.cfg.get("prefer_embedded_image_subtitles", False)
+                    and _has_embedded_english_image_track(record))
+
+    async def _resolve_bounded(self, timeout, *args, **kw):
+        """resolve() with a wait bound that does NOT cancel it: on timeout
+        the lookup finishes detached, so an OpenSubtitles slot already spent
+        still lands a cached sidecar instead of being thrown away."""
+        # One in-flight resolve per (file, force, allow_opensubtitles): a
+        # retry made while a detached lookup is still running joins it
+        # instead of starting a second one that would spend another slot.
+        key = (args[0] if args else kw.get("file_id"), bool(kw.get("force")),
+               kw.get("allow_opensubtitles", True))
+        task = self._inflight_resolves.get(key)
+        if task is None or task.done():
+            task = asyncio.ensure_future(self.subtitles.resolve(*args, **kw))
+            self._inflight_resolves[key] = task
+            self._detached_resolves.add(task)
+
+            def _finished(t, key=key):
+                self._detached_resolves.discard(t)
+                if self._inflight_resolves.get(key) is t:
+                    del self._inflight_resolves[key]
+                t.cancelled() or t.exception()
+            task.add_done_callback(_finished)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+
+    def swept(self):
+        """Has the embedded-track sweep ever produced a result?
+
+        Everything downstream is meaningless before it has. With an empty
+        index every file reads as uncovered, which built a
+        whole-library pending list (rewritten on every later spend), told the
+        Settings panel "0 of 2225 files have subtitles", and pointed the
+        Fetch-now button at five files that are likely to have had an
+        embedded English track all along.
+        """
+        return self.sub_index.sweep_complete()
+
+    def _refresh_backfill_worklist(self):
+        """Sync subtitle_queue.pending against the CURRENT uncovered set and
+        priority tiers. Cheap and in-memory (classify_priorities does no
+        I/O); called before every backfill run/status read so stale
+        priorities (a show that just entered "in progress") never linger.
+
+        A no-op until the sweep has run at least once (see `swept`): there is
+        no coverage data yet, so there is no worklist to build -- only a
+        library-sized list of guesses."""
+        if not self.swept():
+            return
+        uncovered = self._uncovered_file_ids()
+        continue_ids = {it.get("file_id") for it in self.history.continue_watching()}
+        watched_map = self.history.progress_map()
+        priorities = classify_priorities(self.library.titles_list(), uncovered,
+                                         continue_ids, watched_map)
+        self.subtitle_queue.sync_pending(priorities)
+
+    def _os_match_hints(self, file_id, info=None):
+        """(size, tmdb_id, season, episode) for SubtitleResolver.resolve.
+
+        These feed OpenSubtitles' precise fallback chain -- moviehash first
+        (an exact byte-content match), then tmdb_id+season+episode, then the
+        weak title-text query. Gathered here rather than inline at each call
+        site because the backfill path had them and the two interactive
+        paths (/api/play, the TV's /api/subtitles probe) did not, which left
+        the whole precision chain as dead code for every subtitle a person
+        actually waits on: a play-time lookup could miss a file the queue
+        would later match exactly by hash.
+        """
+        info = info if info is not None else (self.library.file_info(file_id) or {})
+        title_rec = self.library.title_for_file(file_id) or {}
+        season = episode = None
+        if title_rec.get("type") == "show":
+            for s in title_rec.get("seasons") or []:
+                for ep in s.get("episodes") or []:
+                    if ep.get("file_id") == file_id:
+                        season, episode = s.get("season"), ep.get("episode")
+        return (info.get("size"), title_rec.get("tmdb_id"), season, episode)
+
+    async def _backfill_attempt(self, item):
+        """The real fetch subtitle_queue.run() calls per queued item.
+
+        Reuses SubtitleResolver.resolve() end-to-end (sibling-on-drive first,
+        THEN OpenSubtitles' moviehash/tmdb/text fallback chain) rather than
+        re-implementing any of it -- resolve() is the single write point
+        (_accept) already, and calling it here is what makes a sibling hit
+        cost zero OpenSubtitles quota even for a queued item.
+        """
+        fid = item["file_id"]
+        info = self.library.file_info(fid) or {}
+        size, tmdb_id, season, episode = self._os_match_hints(fid, info)
+        self.subtitles.last_os_remaining = None
+        self.subtitles.last_os_glitch = None
+        self.subtitles.last_os_reset_utc = None
+        # Snapshot the provider call counter: the queue charges its daily
+        # budget from a REAL /download, not from "an attempt happened".
+        # resolve() returns a cached file or a free Drive sibling without
+        # ever reaching OpenSubtitles, and charging those was what made the
+        # queue re-spend its budget on already-finished files every cycle.
+        before = self.subtitles.os_download_calls
+        transient = False
+        try:
+            # Bounded but not cancelled: a download already charged still
+            # lands its sidecar after the wait gives up.
+            path = await self._resolve_bounded(
+                25.0, fid, info.get("name") or fid, info.get("drive_id"),
+                info.get("parent_id"), size=size,
+                tmdb_id=tmdb_id, season=season, episode=episode)
+        except Exception as e:
+            # A timeout or crash is not a "not found": say so in the log and
+            # flag it so the queue can tell it apart from a genuine miss.
+            transient = True
+            log.warning("Subtitle backfill lookup failed for %s: %r", fid, e)
+            path = None
+        return {"ok": bool(path), "transient": transient,
+                "remaining": self.subtitles.last_os_remaining,
+                "spent": self.subtitles.os_download_calls > before,
+                # A malformed 200 from the provider: the slot is gone and the
+                # next item would almost certainly meet the same answer, so
+                # the queue stops the run instead of feeding it the rest of
+                # today's budget (this cost a whole day's budget once).
+                "glitch": self.subtitles.last_os_glitch,
+                "reset_utc": self.subtitles.last_os_reset_utc}
+
+    def start_backfill(self, limit=None):
+        """Fire-and-forget one backfill pass, unless one is already running.
+        Same race-free check-then-set shape as start_sweep (see its
+        docstring): `running` flips synchronously before `create_task`."""
+        if self.subtitle_queue.status.get("running"):
+            return False
+        self.subtitle_queue.status["running"] = True
+        try:
+            self._refresh_backfill_worklist()
+            self._backfill_task = asyncio.create_task(
+                self.subtitle_queue.run(self._backfill_attempt, limit=limit,
+                                        is_blocked=self._backfill_blocked))
+        except BaseException:
+            # No task exists to reset the flag, so reset it here.
+            self.subtitle_queue.status["running"] = False
+            raise
+        return True
+
+    def _backfill_blocked(self, file_id):
+        """Free pre-check the queue uses to skip an item instead of spending
+        a slot on it. A file inside its OpenSubtitles negative-cache TTL
+        would have resolve() return None with no network call at all, and
+        that no-op used to be charged as a full download -- which let a
+        handful of genuinely-missing files hold the head of the queue and
+        starve everything behind them. An already-cached sidecar is skipped
+        for the same reason (the worklist normally excludes those, but a
+        sync can lag a fetch that just landed)."""
+        if self.subtitles.cached(file_id):
+            return True
+        return bool(self.subtitles.negative.blocked(file_id, "opensubtitles"))
+
+    def _sub_decision_lookup(self, file_id):
+        """(sub_path, prefer_lang) for PlayerManager._advance (autoplay-next).
+
+        Mirrors /api/play's embedded-first decision, but is a strictly
+        SYNCHRONOUS, in-memory-only read -- unlike /api/play it must NEVER
+        call `subtitles.resolve()` (which fetches over the network): this
+        runs inside a poller thread's `finally` block, and blocking there
+        on OpenSubtitles would stall that thread's own history writes for
+        as long as the fetch takes. An uncovered file simply reuses
+        whatever sidecar is already cached from an earlier resolve() (the
+        same fallback `sub_cache_lookup` always offered), or nothing.
+        """
+        if not self.cfg.get("subtitles", True):
+            return None, None
+        if self._embedded_covers(self.sub_index.get(file_id)):
+            return None, "eng"
+        return self.subtitles.cached(file_id), None
 
     def _drain_pending_scope(self, _task):
         """After a scan finishes, run any refresh that was requested meanwhile."""
@@ -254,6 +720,9 @@ def create_app(cfg=None):
         app.state.dc = state
         await state.preflight()
         state.maybe_autorefresh()
+        # The five-a-day subtitle budget is a DAILY budget; nothing else
+        # schedules a daily run (see AppState._backfill_timer).
+        state.start_backfill_timer()
         yield
         await state.aclose()
 
@@ -499,6 +968,7 @@ def create_app(cfg=None):
             "auto_refresh_on_startup": bool(state.cfg.get("auto_refresh_on_startup", False)),
             "autoplay_next": bool(state.cfg.get("autoplay_next", True)),
             "subtitles": bool(state.cfg.get("subtitles", True)),
+            "prefer_embedded_subtitles": bool(state.cfg.get("prefer_embedded_subtitles", True)),
             "keep_awake": bool(state.cfg.get("keep_awake", True)),
             "player": state.cfg.get("player", "auto"),
             "available_players": available,
@@ -625,6 +1095,8 @@ def create_app(cfg=None):
             state.cfg["autoplay_next"] = bool(body.get("autoplay_next"))
         if "subtitles" in body:
             state.cfg["subtitles"] = bool(body.get("subtitles"))
+        if "prefer_embedded_subtitles" in body:
+            state.cfg["prefer_embedded_subtitles"] = bool(body.get("prefer_embedded_subtitles"))
         if "keep_awake" in body:
             state.cfg["keep_awake"] = bool(body.get("keep_awake"))
         if "player" in body:
@@ -690,6 +1162,7 @@ def create_app(cfg=None):
             "auto_refresh_on_startup": bool(state.cfg.get("auto_refresh_on_startup", False)),
             "autoplay_next": bool(state.cfg.get("autoplay_next", True)),
             "subtitles": bool(state.cfg.get("subtitles", True)),
+            "prefer_embedded_subtitles": bool(state.cfg.get("prefer_embedded_subtitles", True)),
             "keep_awake": bool(state.cfg.get("keep_awake", True)),
             "remote_access": bool(state.cfg.get("remote_access", False)),
             "restart_required": restart_required,
@@ -797,24 +1270,62 @@ def create_app(cfg=None):
             # Clear the saved resume position so the player starts at 0.
             state.history.update(file_id, name=name, drive_id=drive_id,
                                  parent_id=parent_id, position=0.0, force=True)
-        # English subtitles (cached / sibling .srt / OpenSubtitles) — bounded
-        # so a slow lookup can only delay playback, never block it.
+        # English subtitles: embedded track first (session C), else cached /
+        # sibling .srt / OpenSubtitles (session A) — bounded so a slow
+        # lookup can only delay playback, never block it.
         sub_path = None
+        prefer_lang = None
         if state.cfg.get("subtitles", True) and media != "audio":
-            try:
-                sub_path = await asyncio.wait_for(
-                    state.subtitles.resolve(file_id, name, drive_id, parent_id),
-                    timeout=10.0)
-            except Exception:
-                sub_path = None
+            record = state.sub_index.get(file_id)
+            # Which player will actually receive this decides whether an
+            # embedded track is usable at all. Infuse's infuse:// scheme has
+            # no language or track parameter -- only `sub=` -- so a
+            # prefer_lang hint is silently dropped at launch. Short-
+            # circuiting resolve() for Infuse would therefore hand it
+            # NEITHER a sidecar (which it used to get) nor a language hint,
+            # and then report subtitles=True: strictly worse than before this
+            # feature existed. Resolve the player kind up front and let
+            # Infuse fall through to the sidecar path it can actually use.
+            player_kind, _player_path = detect_player(state.cfg.get("player", "auto"))
+            embedded_usable = player_kind in ("mpv", "iina", "vlc")
+            covered = (embedded_usable
+                       and state.cfg.get("prefer_embedded_subtitles", True)
+                       and _has_embedded_english_text_track(record))
+            if (not covered and embedded_usable
+                    and state.cfg.get("prefer_embedded_subtitles", True)
+                    and state.cfg.get("prefer_embedded_image_subtitles", False)
+                    and _has_embedded_english_image_track(record)):
+                # Image-only English (PGS/dvd_subtitle): the same --slang /
+                # --sub-language flag selects it, and these players are
+                # documented to render it. Off by default until D-031's
+                # device test confirms it paints pixels on this hardware.
+                covered = True
+            if covered:
+                # Covered by an embedded track: tell the player which
+                # language to select and skip resolve() entirely -- no
+                # sidecar fetch, no quota spent, no 10s bound needed. A
+                # forced-only or hearing-impaired-only English track does
+                # NOT reach here (see _has_embedded_english_text_track's
+                # docstring); it falls through to resolve() below exactly
+                # as if the index had never seen an embedded track.
+                prefer_lang = "eng"
+            else:
+                size, tmdb_id, season, episode = state._os_match_hints(file_id)
+                try:
+                    sub_path = await state._resolve_bounded(
+                        10.0, file_id, name, drive_id, parent_id,
+                        size=size, tmdb_id=tmdb_id,
+                        season=season, episode=episode)
+                except Exception:
+                    sub_path = None
         try:
             result = state.player.play(
                 file_id, name, duration_ms=duration_ms,
                 drive_id=drive_id, parent_id=parent_id, queue=queue,
                 media="audio" if media == "audio" else None,
-                sub_path=sub_path,
+                sub_path=sub_path, prefer_lang=prefer_lang,
             )
-            result["subtitles"] = bool(sub_path)
+            result["subtitles"] = bool(sub_path) or bool(prefer_lang)
             return result
         except PlayerError as e:
             return JSONResponse({"error": "no_player", "message": str(e)}, status_code=501)
@@ -862,14 +1373,31 @@ def create_app(cfg=None):
 
     @app.api_route("/api/subtitles/{file_id}", methods=["GET", "HEAD"])
     async def api_subtitles(file_id: str, name: str = None,
-                            drive_id: str = None, parent_id: str = None):
+                            drive_id: str = None, parent_id: str = None,
+                            refresh: bool = False):
         """Resolve (and cache) an English subtitle for a video and serve it.
 
         Remote players (the web player can't use these yet, but TV/phone apps
         can) probe with HEAD before playback and stream the same URL as a
         subtitle track. Query overrides support files outside the library
         index (browse-only playback). Same bounded-resolution philosophy as
-        /api/play: a slow lookup 404s rather than blocking."""
+        /api/play: a slow lookup 404s rather than blocking.
+
+        `refresh=1` forgets this file's remembered dead ends and re-fetches,
+        for the case where the quality gate rejected a subtitle it should have
+        kept.
+
+        The OpenSubtitles step is skipped when the index already shows a
+        usable embedded English text track. This endpoint is the TV client's
+        only subtitle mechanism, and it HEAD-probes before every playback --
+        so on the files that carry their own English track it was
+        spending scarce anonymous-tier downloads fetching a redundant
+        sidecar, invisibly draining the same five-a-day the backfill queue
+        is budgeted against. The free sources (cache, Drive sibling) still
+        run: if a sidecar is already there, or sits next to the video, the
+        TV gets it and renders it without depending on VLC-Android's own
+        track selection. `refresh=1` always allows the paid step -- that
+        request is a person explicitly asking for it."""
         state = app.state.dc
         if not state.cfg.get("subtitles", True):
             return JSONResponse({"error": "subtitles_disabled"}, status_code=404)
@@ -877,16 +1405,116 @@ def create_app(cfg=None):
         name = name or info.get("name") or file_id
         drive_id = drive_id or info.get("drive_id")
         parent_id = parent_id or info.get("parent_id")
+        embedded_covered = (
+            state.cfg.get("prefer_embedded_subtitles", True)
+            and _has_embedded_english_text_track(state.sub_index.get(file_id)))
+        size, tmdb_id, season, episode = state._os_match_hints(file_id, info)
         try:
-            sub_path = await asyncio.wait_for(
-                state.subtitles.resolve(file_id, name, drive_id, parent_id),
-                timeout=15.0)
+            sub_path = await state._resolve_bounded(
+                15.0, file_id, name, drive_id, parent_id, force=bool(refresh),
+                size=size, tmdb_id=tmdb_id, season=season, episode=episode,
+                allow_opensubtitles=bool(refresh) or not embedded_covered)
         except Exception:
             sub_path = None
         media_type = mime_for(sub_path) if sub_path else None
         if not media_type:
             return JSONResponse({"error": "no_subtitles"}, status_code=404)
         return FileResponse(sub_path, media_type=media_type)
+
+    @app.post("/api/subtitles/{file_id}/refresh")
+    async def api_subtitles_refresh(file_id: str):
+        """Re-fetch one file's subtitle, ignoring cache and remembered misses.
+
+        The UI-facing twin of `?refresh=1`: it returns a small JSON verdict
+        instead of the file, so a Settings/detail button can report "found" or
+        "still nothing" without downloading the track."""
+        state = app.state.dc
+        if not state.cfg.get("subtitles", True):
+            return JSONResponse({"error": "subtitles_disabled"}, status_code=404)
+        info = state.library.file_info(file_id) or {}
+        name = info.get("name") or file_id
+        size, tmdb_id, season, episode = state._os_match_hints(file_id, info)
+        try:
+            sub_path = await state._resolve_bounded(
+                20.0, file_id, name, info.get("drive_id"),
+                info.get("parent_id"), force=True,
+                size=size, tmdb_id=tmdb_id, season=season, episode=episode)
+        except Exception:
+            sub_path = None
+        return {"ok": True, "file_id": file_id, "subtitles": bool(sub_path)}
+
+    @app.delete("/api/subtitles/cache")
+    async def api_subtitles_clear_cache():
+        """Forget every remembered subtitle dead end.
+
+        Deletes no cached subtitle — only the negative cache, so the next play
+        of every uncovered title retries its sources. This is the remedy after
+        a mistuned gate threshold or a spell of ISP interference, and the
+        Settings row that calls it is the reason neither needs hand-written
+        curl."""
+        state = app.state.dc
+        cleared = state.subtitles.negative.clear()
+        return {"ok": True, "cleared": cleared}
+
+    @app.post("/api/subs/sweep")
+    async def api_subs_sweep_start():
+        """Start the embedded-subtitle-track sweep on demand, so the user can
+        run it without a rescan. A sweep already in flight is reported, not
+        restarted -- same contract as /api/refresh when a scan is already
+        running."""
+        state = app.state.dc
+        if state.sub_sweep.status.get("running"):
+            return {"started": False, "running": True}
+        started = state.start_sweep()
+        return {"started": started, "running": True}
+
+    @app.get("/api/subs/sweep/status")
+    async def api_subs_sweep_status():
+        return app.state.dc.sub_sweep.status
+
+    @app.post("/api/subs/backfill")
+    async def api_subs_backfill_start():
+        """Work the OpenSubtitles backfill queue on demand, within today's
+        remaining daily budget. A run already in flight is reported, not
+        restarted -- same contract as /api/subs/sweep."""
+        state = app.state.dc
+        if state.subtitle_queue.status.get("running"):
+            return {"started": False, "running": True}
+        if not state.swept():
+            # Nothing to work on yet, and pressing on would spend the day's
+            # five slots on files that are likely to already carry an
+            # embedded English track.
+            return {"started": False, "running": False, "swept": False}
+        started = state.start_backfill()
+        return {"started": started, "running": True}
+
+    @app.get("/api/subs/backfill/status")
+    async def api_subs_backfill_status():
+        """Everything the Settings "Subtitle coverage" block shows: how many
+        files are covered/uncovered per the sweep's index, how many are
+        queued, and today's backfill run/budget state. Re-syncs the worklist
+        first so a poll during/after a scan reflects the library's current
+        shape, not a stale one."""
+        state = app.state.dc
+        state._refresh_backfill_worklist()
+        total = len(state._video_files_for_sweep())
+        snap = state.subtitle_queue.snapshot()
+        snap["total_count"] = total
+        # Before the first sweep there is NO coverage data. Reporting
+        # "0 of 2225 covered" then is not a cautious estimate, it is wrong
+        # in the alarming direction -- roughly 40% of those files
+        # carry their own text track (30-file sample). The UI shows "run the scan first"
+        # off this flag instead of a fabricated number.
+        snap["swept"] = state.swept()
+        if snap["swept"]:
+            uncovered = len(state._uncovered_file_ids())
+            snap["covered_count"] = total - uncovered
+            snap["uncovered_count"] = uncovered
+        else:
+            snap["covered_count"] = None
+            snap["uncovered_count"] = None
+        snap["queued_count"] = snap["pending_count"]
+        return snap
 
     @app.post("/api/enrich")
     async def api_enrich(request: Request):
