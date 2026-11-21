@@ -154,6 +154,7 @@ class AppState:
         self._refresh_task = None
         self._pending_scope = set()  # scopes requested while a scan was running
         self._pending_rebuild = False  # a rebuild/scope arrived mid-scan; re-kick on finish
+        self._detached_resolves = set()  # resolve() tasks outliving their wait bound
         self.stream_activity = {}  # file_id -> epoch of last GET /stream request
         # Cached ffprobe facts + the VLC hardware-decode policy (/api/media-info).
         self.media_info = media_info.MediaInfoCache(
@@ -234,6 +235,9 @@ class AppState:
             return
         if task.exception() is not None:
             return
+        # Subtitles switched off: no probe sweep (live Drive egress) either.
+        if not self.cfg.get("subtitles", True):
+            return
         self.start_sweep()
 
     def _video_files_for_sweep(self):
@@ -266,6 +270,13 @@ class AppState:
         if self.sub_sweep.status.get("running"):
             return False
         self.sub_sweep.status["running"] = True
+        try:
+            return self._start_sweep_task(file_ids_with_size)
+        except BaseException:
+            self.sub_sweep.status["running"] = False
+            raise
+
+    def _start_sweep_task(self, file_ids_with_size):
         # The sweep's probe bytes come through the SAME /stream proxy the
         # player is reading from, so six parallel probes and a live stream
         # fight over one uplink for the ~45 min a first full sweep takes.
@@ -300,6 +311,9 @@ class AppState:
     def _after_sweep_maybe_backfill(self, task):
         if task.cancelled() or task.exception() is not None:
             return
+        # Same gate as the periodic timer: subtitles off means no provider calls.
+        if not self.cfg.get("subtitles", True):
+            return
         self.start_backfill()
 
     async def _backfill_timer(self):
@@ -330,7 +344,7 @@ class AppState:
                 # Before the first sweep there is no real coverage data, so
                 # the worklist is deliberately empty (see
                 # _refresh_backfill_worklist) and there is nothing to do.
-                if not self.sub_index.probed_count():
+                if not self.sub_index.sweep_complete():
                     continue
                 if self.subtitle_queue.remaining() <= 0:
                     continue
@@ -399,7 +413,30 @@ class AppState:
         have_sidecar = self._sidecar_covered_ids()
         return [fid for fid, _size in self._video_files_for_sweep()
                if fid not in have_sidecar
-               and not ((self.sub_index.get(fid) or {}).get("has_text_en"))]
+               and not self._embedded_covers(self.sub_index.get(fid))]
+
+    def _embedded_covers(self, record):
+        """True if an embedded English track in `record` counts as "subtitles
+        already on". The single coverage predicate shared by /api/play, the
+        autoplay lookup and the backfill worklist: a usable text track, or --
+        only when `prefer_embedded_image_subtitles` is on -- an image track.
+        (The player-kind check stays in /api/play: it needs the live player.)"""
+        if not self.cfg.get("prefer_embedded_subtitles", True):
+            return False
+        if _has_embedded_english_text_track(record):
+            return True
+        return bool(self.cfg.get("prefer_embedded_image_subtitles", False)
+                    and _has_embedded_english_image_track(record))
+
+    async def _resolve_bounded(self, timeout, *args, **kw):
+        """resolve() with a wait bound that does NOT cancel it: on timeout
+        the lookup finishes detached, so an OpenSubtitles slot already spent
+        still lands a cached sidecar instead of being thrown away."""
+        task = asyncio.ensure_future(self.subtitles.resolve(*args, **kw))
+        self._detached_resolves.add(task)
+        task.add_done_callback(self._detached_resolves.discard)
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
     def swept(self):
         """Has the embedded-track sweep ever produced a result?
@@ -408,10 +445,10 @@ class AppState:
         index every file reads as uncovered, which built a
         whole-library pending list (rewritten on every later spend), told the
         Settings panel "0 of 2225 files have subtitles", and pointed the
-        Fetch-now button at five files that are ~90% likely to have had an
+        Fetch-now button at five files that are likely to have had an
         embedded English track all along.
         """
-        return self.sub_index.probed_count() > 0
+        return self.sub_index.sweep_complete()
 
     def _refresh_backfill_worklist(self):
         """Sync subtitle_queue.pending against the CURRENT uncovered set and
@@ -474,6 +511,7 @@ class AppState:
         # ever reaching OpenSubtitles, and charging those was what made the
         # queue re-spend its budget on already-finished files every cycle.
         before = self.subtitles.os_download_calls
+        transient = False
         try:
             path = await asyncio.wait_for(
                 self.subtitles.resolve(
@@ -481,9 +519,14 @@ class AppState:
                     info.get("parent_id"), size=size,
                     tmdb_id=tmdb_id, season=season, episode=episode),
                 timeout=25.0)
-        except Exception:
+        except Exception as e:
+            # A timeout or crash is not a "not found": say so in the log and
+            # flag it so the queue can tell it apart from a genuine miss.
+            transient = True
+            log.warning("Subtitle backfill lookup failed for %s: %r", fid, e)
             path = None
-        return {"ok": bool(path), "remaining": self.subtitles.last_os_remaining,
+        return {"ok": bool(path), "transient": transient,
+                "remaining": self.subtitles.last_os_remaining,
                 "spent": self.subtitles.os_download_calls > before,
                 # A malformed 200 from the provider: the slot is gone and the
                 # next item would almost certainly meet the same answer, so
@@ -499,10 +542,15 @@ class AppState:
         if self.subtitle_queue.status.get("running"):
             return False
         self.subtitle_queue.status["running"] = True
-        self._refresh_backfill_worklist()
-        self._backfill_task = asyncio.create_task(
-            self.subtitle_queue.run(self._backfill_attempt, limit=limit,
-                                    is_blocked=self._backfill_blocked))
+        try:
+            self._refresh_backfill_worklist()
+            self._backfill_task = asyncio.create_task(
+                self.subtitle_queue.run(self._backfill_attempt, limit=limit,
+                                        is_blocked=self._backfill_blocked))
+        except BaseException:
+            # No task exists to reset the flag, so reset it here.
+            self.subtitle_queue.status["running"] = False
+            raise
         return True
 
     def _backfill_blocked(self, file_id):
@@ -532,10 +580,8 @@ class AppState:
         """
         if not self.cfg.get("subtitles", True):
             return None, None
-        if self.cfg.get("prefer_embedded_subtitles", True):
-            record = self.sub_index.get(file_id)
-            if _has_embedded_english_text_track(record):
-                return None, "eng"
+        if self._embedded_covers(self.sub_index.get(file_id)):
+            return None, "eng"
         return self.subtitles.cached(file_id), None
 
     def _drain_pending_scope(self, _task):
@@ -1252,11 +1298,10 @@ def create_app(cfg=None):
             else:
                 size, tmdb_id, season, episode = state._os_match_hints(file_id)
                 try:
-                    sub_path = await asyncio.wait_for(
-                        state.subtitles.resolve(file_id, name, drive_id, parent_id,
-                                                size=size, tmdb_id=tmdb_id,
-                                                season=season, episode=episode),
-                        timeout=10.0)
+                    sub_path = await state._resolve_bounded(
+                        10.0, file_id, name, drive_id, parent_id,
+                        size=size, tmdb_id=tmdb_id,
+                        season=season, episode=episode)
                 except Exception:
                     sub_path = None
         try:
@@ -1331,7 +1376,7 @@ def create_app(cfg=None):
         The OpenSubtitles step is skipped when the index already shows a
         usable embedded English text track. This endpoint is the TV client's
         only subtitle mechanism, and it HEAD-probes before every playback --
-        so on the ~90% of files that carry their own English track it was
+        so on the files that carry their own English track it was
         spending scarce anonymous-tier downloads fetching a redundant
         sidecar, invisibly draining the same five-a-day the backfill queue
         is budgeted against. The free sources (cache, Drive sibling) still
@@ -1351,12 +1396,10 @@ def create_app(cfg=None):
             and _has_embedded_english_text_track(state.sub_index.get(file_id)))
         size, tmdb_id, season, episode = state._os_match_hints(file_id, info)
         try:
-            sub_path = await asyncio.wait_for(
-                state.subtitles.resolve(
-                    file_id, name, drive_id, parent_id, force=bool(refresh),
-                    size=size, tmdb_id=tmdb_id, season=season, episode=episode,
-                    allow_opensubtitles=bool(refresh) or not embedded_covered),
-                timeout=15.0)
+            sub_path = await state._resolve_bounded(
+                15.0, file_id, name, drive_id, parent_id, force=bool(refresh),
+                size=size, tmdb_id=tmdb_id, season=season, episode=episode,
+                allow_opensubtitles=bool(refresh) or not embedded_covered)
         except Exception:
             sub_path = None
         media_type = mime_for(sub_path) if sub_path else None
@@ -1376,11 +1419,12 @@ def create_app(cfg=None):
             return JSONResponse({"error": "subtitles_disabled"}, status_code=404)
         info = state.library.file_info(file_id) or {}
         name = info.get("name") or file_id
+        size, tmdb_id, season, episode = state._os_match_hints(file_id, info)
         try:
-            sub_path = await asyncio.wait_for(
-                state.subtitles.resolve(file_id, name, info.get("drive_id"),
-                                        info.get("parent_id"), force=True),
-                timeout=20.0)
+            sub_path = await state._resolve_bounded(
+                20.0, file_id, name, info.get("drive_id"),
+                info.get("parent_id"), force=True,
+                size=size, tmdb_id=tmdb_id, season=season, episode=episode)
         except Exception:
             sub_path = None
         return {"ok": True, "file_id": file_id, "subtitles": bool(sub_path)}
@@ -1424,7 +1468,7 @@ def create_app(cfg=None):
             return {"started": False, "running": True}
         if not state.swept():
             # Nothing to work on yet, and pressing on would spend the day's
-            # five slots on files that are ~90% likely to already carry an
+            # five slots on files that are likely to already carry an
             # embedded English track.
             return {"started": False, "running": False, "swept": False}
         started = state.start_backfill()
@@ -1444,8 +1488,8 @@ def create_app(cfg=None):
         snap["total_count"] = total
         # Before the first sweep there is NO coverage data. Reporting
         # "0 of 2225 covered" then is not a cautious estimate, it is wrong
-        # in the alarming direction -- roughly nine in ten of those files
-        # carry their own English track. The UI shows "run the scan first"
+        # in the alarming direction -- roughly 40% of those files
+        # carry their own text track (30-file sample). The UI shows "run the scan first"
         # off this flag instead of a fabricated number.
         snap["swept"] = state.swept()
         if snap["swept"]:

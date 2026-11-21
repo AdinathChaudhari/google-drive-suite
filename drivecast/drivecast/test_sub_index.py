@@ -163,8 +163,9 @@ def test_classifies_pgs_as_image_kind():
 # ---------------------------------------------------------------- test 4 --
 
 def test_captures_forced_and_hearing_impaired():
-    tracks, has_text_en, has_image_en = classify_probe_json(FORCED_AND_HI)
-    assert has_text_en is True
+    tracks, has_text_en, _has_image_en = classify_probe_json(FORCED_AND_HI)
+    # Forced/SDH-only English is NOT coverage (matches the player predicate).
+    assert has_text_en is False
     by_title = {t["title"]: t for t in tracks}
     assert by_title["Forced"]["forced"] is True
     assert by_title["Forced"]["hearing_impaired"] is False
@@ -288,3 +289,110 @@ def test_run_finish_flush_persists_below_threshold(tmp_path):
     reloaded = SubIndex(path=path)
     assert reloaded.get("a") is not None and reloaded.get("a")["size"] == 10
     assert reloaded.get("b") is not None and reloaded.get("b")["size"] == 20
+
+
+# ------------------------------------------- preflight-review follow-ups --
+
+def test_forced_plus_normal_track_counts_as_text_en():
+    both = _probe_json(json.loads(FORCED_AND_HI)["streams"]
+                       + json.loads(SUBRIP_EN)["streams"])
+    assert classify_probe_json(both)[1] is True
+
+
+def _raising_exec(*cmd, **kw):
+    async def _boom(*a, **k):
+        raise FileNotFoundError("ffprobe")
+    return _boom(*cmd, **kw)
+
+
+def test_missing_ffprobe_stores_nothing_and_sets_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _raising_exec)
+    index = SubIndex(path=str(tmp_path / "sub_index.json"))
+    sweeper = SubtitleSweeper(index, port=8737)
+    asyncio.run(sweeper.run([("a", 1), ("b", 2)]))
+    assert index.probed_count() == 0
+    assert index.get("a") is None and index.get("b") is None
+    assert "ffprobe" in sweeper.status["error"]
+    assert index.sweep_complete() is False
+    assert sweeper.status["running"] is False
+
+
+def test_failed_probe_is_retried_and_not_counted(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec_factory("", calls, returncode=1))
+    index = SubIndex(path=str(tmp_path / "sub_index.json"))
+    sweeper = SubtitleSweeper(index, port=8737)
+    asyncio.run(sweeper.run([("a", 5)]))
+    assert index.get("a")["ok"] is False
+    assert index.probed_count() == 0
+    assert index.needs_probe("a", 5) is True
+    # Recovers on the next sweep once ffprobe answers.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec_factory(SUBRIP_EN, calls))
+    asyncio.run(sweeper.run([("a", 5)]))
+    assert index.get("a")["ok"] is True
+    assert index.probed_count() == 1
+
+
+def test_sweep_complete_only_after_run_finishes(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec_factory(SUBRIP_EN, calls))
+    index = SubIndex(path=str(tmp_path / "sub_index.json"))
+    sweeper = SubtitleSweeper(index, port=8737)
+    asyncio.run(sweeper._probe_and_store("a", 1))
+    assert index.probed_count() == 1
+    assert index.sweep_complete() is False  # mid-sweep state
+    asyncio.run(sweeper.run([("a", 1)]))
+    assert index.sweep_complete() is True
+    assert SubIndex(path=index.path).sweep_complete() is True
+
+
+def test_flush_failure_does_not_wedge_running(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec",
+                        _fake_exec_factory(SUBRIP_EN, calls))
+    index = SubIndex(path=str(tmp_path / "sub_index.json"))
+
+    def _bad_flush():
+        raise OSError("disk full")
+    monkeypatch.setattr(index, "flush", _bad_flush)
+    sweeper = SubtitleSweeper(index, port=8737)
+    asyncio.run(sweeper.run([("a", 1)]))
+    assert sweeper.status["running"] is False
+    assert "flush" in sweeper.status["error"]
+
+
+def test_filtered_empty_request_does_not_sweep(monkeypatch):
+    state = _appstate(monkeypatch)
+    sweep_calls = []
+    monkeypatch.setattr(state, "start_sweep",
+                        lambda *a, **kw: sweep_calls.append(1))
+
+    async def go():
+        # Non-empty request naming only an unselected drive filters to [].
+        assert state.start_refresh(scope=["not-selected"]) is False
+        await asyncio.sleep(0)
+    asyncio.run(go())
+    assert sweep_calls == []
+
+
+def test_drained_pending_scope_escalates_to_sweep(monkeypatch):
+    state = _appstate(monkeypatch)
+    sweep_calls = []
+    monkeypatch.setattr(state, "start_sweep",
+                        lambda *a, **kw: sweep_calls.append(1))
+
+    async def go():
+        state.scanner.status["running"] = True  # scanner busy
+        assert state.start_refresh(scope=["drv1"]) is False  # queued
+        state.scanner.status["running"] = False
+        # Drain-style cache-only request: merged with the pending scope the
+        # FINAL scope is non-empty, so the sweep must fire.
+        assert state.start_refresh(scope=[]) is True
+        await state._refresh_task
+        await asyncio.sleep(0)
+    asyncio.run(go())
+    assert state.scanner.calls == [["drv1"]]
+    assert sweep_calls == [1]

@@ -149,7 +149,7 @@ Shared rules:
 | Sort/group per canonical vocabulary | yes | yes | n/a | §2–3 | |
 | VLC / external player handoff | yes | yes | — | `app.js` § `launch` (`res.player === "vlc"`); `PlayerScreen.kt` § `VlcPlayerHost` (`ACTION_VIEW` + `VLC_PACKAGE`) | |
 | Keep-awake prompt | yes | yes | — | `app.js` § `awakeWatch`/`pollAwake` (`api/awake/*`); `KeepAwakeController.kt` § `poll()`/`extend()`/`release()` | |
-| Sidecar subtitle fetch + serve | yes (desktop launch) | yes | — | `server.py` § `api_subtitles` (`GET|HEAD /api/subtitles/{file_id}`); `ExternalPlayerViewModel.kt` § `probeSubtitle`/`authorizedSubtitleUrl`, `PlayerScreen.kt` § the `subtitles_location` extra | Both consume the same endpoint. Every byte is gated by `subtitles.py` § `sanitize_subtitle_bytes` at `SubtitleResolver._accept`, so a poisoned file cannot be cached on either client |
+| Sidecar subtitle fetch + serve | yes (desktop launch) | yes | — | `server.py` § `api_subtitles` (`GET|HEAD /api/subtitles/{file_id}`); `LibraryRepository.kt` § `probeSubtitle`/`authorizedSubtitleUrl` (called from `ExternalPlayerViewModel.kt`), `PlayerScreen.kt` § the `subtitles_location` extra | Both consume the same endpoint. Every byte is gated by `subtitles.py` § `sanitize_subtitle_bytes` at `SubtitleResolver._accept`, so a poisoned file cannot be cached on either client |
 | Embedded-track **selection** (tell the player "English") | yes | **no** | — | `player.py` § `build_mpv_args` (`--slang`), `build_iina_args` (`--mpv-slang`), `build_vlc_args` (`--sub-language`); no TV equivalent exists | §5.8. The single biggest parity gap in subtitles |
 | Embedded-track index / coverage numbers | yes | no | — | `server.py` § `api_subs_sweep_status`, `api_subs_backfill_status`; `app.js` § `loadSubtitleCoverage` | Server-side data; the TV never asks for it |
 | Subtitle backfill queue + budget | yes (Settings) | no | — | `server.py` § `api_subs_backfill_start`; `app.js` § `loadSubtitleCoverage` / the `startBackfill` handler; `subtitle_queue.py` § `SubtitleQueue.run` (`subtitle_daily_limit`, default `5`) | Runs server-side for both clients' benefit; only web can see or trigger it |
@@ -261,7 +261,7 @@ VLC's documented intent extras are `from_start`, `position`, `title`,
 `extra_duration`, `subtitles_location` — one *external file*, no track or
 language selector (`PlayerScreen.kt` § the `subtitles_location` extra). The TV's
 only subtitle mechanism is a HEAD probe of `/api/subtitles/{file_id}`
-(`ExternalPlayerViewModel.kt` § `probeSubtitle`), which serves a sidecar or
+(`LibraryRepository.kt` § `probeSubtitle`), which serves a sidecar or
 404s. Three consequences, all deliberate:
 
 1. **On the TV, embedded subtitles are a device setting.** VLC → Settings →

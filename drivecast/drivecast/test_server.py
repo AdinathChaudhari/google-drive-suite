@@ -1607,7 +1607,7 @@ def test_api_play_passes_the_precise_match_hints_to_resolve(client):
 
 def test_api_subtitles_skips_opensubtitles_when_embedded_covered(client):
     """The Fire TV's only subtitle mechanism is this endpoint, and it
-    HEAD-probes before every playback. On the ~90% of files that carry
+    HEAD-probes before every playback. On the files that carry
     their own English track it was spending scarce anonymous-tier
     downloads on a redundant sidecar -- draining the very five-a-day the
     backfill queue is budgeted against, invisibly to the queue's own
@@ -1656,8 +1656,8 @@ def test_api_subtitles_refresh_always_allows_opensubtitles(client):
 
 def test_backfill_status_reports_unknown_coverage_before_the_sweep(client):
     """"0 of 2225 files have subtitles" is not a cautious estimate before
-    the sweep, it is wrong in the alarming direction -- roughly nine in ten
-    of those files carry their own English track."""
+    the sweep, it is wrong in the alarming direction -- roughly 40% of
+    those files carry their own text track (30-file sample)."""
     r = client.get("/api/subs/backfill/status")
     assert r.status_code == 200
     body = r.json()
@@ -1670,9 +1670,116 @@ def test_backfill_status_reports_unknown_coverage_before_the_sweep(client):
     r = client.post("/api/subs/backfill")
     assert r.json() == {"started": False, "running": False, "swept": False}
 
-    # One probe result and the numbers become real.
+    # A completed sweep and the numbers become real.
     client.app.state.dc.sub_index.put("fileA", _index_track())
+    body = client.get("/api/subs/backfill/status").json()
+    assert body["swept"] is False            # mid-sweep: probes, no completion
+    client.app.state.dc.sub_index.mark_complete()
     body = client.get("/api/subs/backfill/status").json()
     assert body["swept"] is True
     assert body["covered_count"] == 1        # fileA has its own English track
     assert body["uncovered_count"] == body["total_count"] - 1
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: subtitles gate, coverage predicate, bounded resolve, hints
+# ---------------------------------------------------------------------------
+
+def test_sweep_and_backfill_callbacks_respect_subtitles_off(client):
+    state = client.app.state.dc
+    calls = []
+    state.start_sweep = lambda *a, **k: calls.append("sweep")
+    state.start_backfill = lambda *a, **k: calls.append("backfill")
+
+    class _Done:
+        def cancelled(self): return False
+        def exception(self): return None
+
+    state.cfg["subtitles"] = False
+    state._after_scan_maybe_sweep(_Done())
+    state._after_sweep_maybe_backfill(_Done())
+    assert calls == []
+    state.cfg["subtitles"] = True
+    state._after_scan_maybe_sweep(_Done())
+    state._after_sweep_maybe_backfill(_Done())
+    assert calls == ["sweep", "backfill"]
+
+
+def test_worklist_ignores_forced_and_sdh_english_text(client):
+    state = client.app.state.dc
+    state._video_files_for_sweep = lambda: [("f1", 1), ("f2", 1), ("f3", 1)]
+    state._sidecar_covered_ids = lambda: set()
+    state.sub_index.put("f1", _index_track(forced=True))
+    state.sub_index.put("f2", _index_track(hearing_impaired=True))
+    state.sub_index.put("f3", _index_track())
+    assert state._uncovered_file_ids() == ["f1", "f2"]
+
+
+def test_worklist_and_autoplay_honour_image_flag(client):
+    state = client.app.state.dc
+    state._video_files_for_sweep = lambda: [("img", 1)]
+    state._sidecar_covered_ids = lambda: set()
+    state.sub_index.put("img", _index_track(kind="image"))
+    state.cfg["prefer_embedded_image_subtitles"] = False
+    assert state._uncovered_file_ids() == ["img"]
+    assert state._sub_decision_lookup("img")[1] is None
+    state.cfg["prefer_embedded_image_subtitles"] = True
+    assert state._uncovered_file_ids() == []
+    assert state._sub_decision_lookup("img") == (None, "eng")
+
+
+def test_backfill_attempt_logs_and_flags_a_crash(client, caplog):
+    state = client.app.state.dc
+
+    async def _boom(*a, **k):
+        raise RuntimeError("net down")
+    state.subtitles.resolve = _boom
+    with caplog.at_level("WARNING", logger="drivecast.server"):
+        out = asyncio.run(state._backfill_attempt({"file_id": "x"}))
+    assert out["ok"] is False and out["transient"] is True
+    assert "net down" in caplog.text
+
+
+def test_start_backfill_resets_running_when_setup_raises(client):
+    state = client.app.state.dc
+
+    def _boom():
+        raise OSError("disk")
+    state._refresh_backfill_worklist = _boom
+
+    async def _go():
+        with pytest.raises(OSError):
+            state.start_backfill()
+    asyncio.run(_go())
+    assert not state.subtitle_queue.status.get("running")
+
+
+def test_resolve_bounded_lets_resolve_finish_after_timeout(client):
+    state = client.app.state.dc
+    done = []
+
+    async def _slow(*a, **k):
+        await asyncio.sleep(0.2)
+        done.append(1)
+        return "/x.srt"
+    state.subtitles.resolve = _slow
+
+    async def _go():
+        with pytest.raises(asyncio.TimeoutError):
+            await state._resolve_bounded(0.01, "f")
+        await asyncio.sleep(0.4)
+    asyncio.run(_go())
+    assert done == [1]          # not cancelled by the wait bound
+
+
+def test_api_subtitles_refresh_post_passes_match_hints(client):
+    state = client.app.state.dc
+    seen = {}
+
+    async def _spy(file_id, name, drive_id=None, parent_id=None, **kw):
+        seen.update(kw)
+        return None
+    state.subtitles.resolve = _spy
+    state._os_match_hints = lambda fid, info=None: (123, 77, 2, 5)
+    client.post("/api/subtitles/fileA/refresh")
+    assert (seen["size"], seen["tmdb_id"], seen["season"], seen["episode"]) == (123, 77, 2, 5)

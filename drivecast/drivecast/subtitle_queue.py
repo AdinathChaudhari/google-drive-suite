@@ -269,15 +269,21 @@ class SubtitleQueue:
                 "remaining_hint": {}, "pending": [], "failed_today": []}
 
     def _save(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path),
-                                   prefix=".subq-", suffix=".tmp")
+        tmp = None
         try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path),
+                                       prefix=".subq-", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=1, sort_keys=True)
             os.replace(tmp, self.path)
         except OSError:
             log.warning("Could not persist the subtitle backfill queue")
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def _roll_day_if_needed(self):
         """Local-midnight day boundary (see module docstring). Resets `spent`
@@ -304,8 +310,15 @@ class SubtitleQueue:
         # the queue a fresh budget it did not have, which it then spent
         # discovering the wall again one slot at a time.
         until = self.data.get("quota_reset_utc", {}).get(provider)
-        if until is not None and time.time() < float(until):
-            return 0
+        if until is not None:
+            if time.time() < float(until):
+                return 0
+            # The wall has passed: the hint recorded against it (usually 0)
+            # is stale and would otherwise hold the queue idle until local
+            # midnight. Drop both and fall back to the normal budget.
+            self.data["remaining_hint"].pop(provider, None)
+            self.data["quota_reset_utc"].pop(provider, None)
+            self._save()
         hint = self.data["remaining_hint"].get(provider)
         if hint is not None:
             return max(int(hint), 0)
@@ -493,16 +506,21 @@ class SubtitleQueue:
                 quota_stop = (not ok and spent and remaining is not None
                               and int(remaining) <= 0)
                 glitch = outcome.get("glitch")
+                # A transient failure (e.g. a 25 s timeout) says nothing
+                # about the file: no failed_today entry, no parking attempt.
+                transient = bool(outcome.get("transient"))
                 if outcome.get("reset_utc") is not None:
                     self.note_quota_reset(outcome["reset_utc"])
                 self.record_spend(item["file_id"], ok, remaining=remaining,
                                   spend=spent,
-                                  mark_failed=not (quota_stop or glitch))
+                                  mark_failed=not (quota_stop or glitch or transient))
                 if ok:
                     self._remove_pending(item["file_id"])
                     self.status["ok"] += 1
                 else:
-                    if spent:
+                    if spent and not (quota_stop or glitch or transient):
+                        # Provider faults (quota wall, malformed answer) are
+                        # not evidence the subtitle does not exist.
                         self._note_attempt(item)
                     self.status["failed"] += 1
                 self.status["worked"] += 1
@@ -526,8 +544,10 @@ class SubtitleQueue:
             self.status["error"] = str(e)
             log.exception("Subtitle backfill run failed")
         finally:
-            self._save()
-            self.status["running"] = False
+            try:
+                self._save()
+            finally:
+                self.status["running"] = False
         return dict(self.status)
 
     # ---- reporting ----

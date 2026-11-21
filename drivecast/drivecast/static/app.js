@@ -1903,14 +1903,14 @@ async function loadSubtitleCoverage() {
   const uncovered = s.uncovered_count || 0;
   // `swept` false means the embedded-track scan has never run, so there is no
   // coverage data at all. Reporting "0 of 2225 have subtitles" here would be
-  // wrong in the alarming direction — roughly nine in ten of those files carry
-  // their own English track; the scan is what finds out which.
+  // wrong in the alarming direction — plenty of those files carry their own
+  // English track; the scan is what finds out which.
   if (!total) {
     el.textContent = "Run a library refresh to see subtitle coverage.";
   } else if (s.swept === false) {
     el.textContent = `Subtitle coverage is unknown for ${total} files. `
       + "Run the subtitle scan first — it checks each file for a subtitle track "
-      + "it already carries, and most of them do.";
+      + "it already carries.";
   } else if (!uncovered) {
     el.textContent = `All ${total} files have subtitles (embedded or fetched).`;
   } else {
@@ -1942,8 +1942,11 @@ if ($("startBackfill")) {
       setTimeout(loadSubtitleCoverage, 4000);
     } catch (e) {
       msg.textContent = "Could not start the backfill.";
+      btn.disabled = false;
+      return;
     }
-    btn.disabled = false;
+    // loadSubtitleCoverage decides the disabled state (running / unswept / nothing to do).
+    loadSubtitleCoverage();
   });
 }
 if ($("clearSubCache")) {

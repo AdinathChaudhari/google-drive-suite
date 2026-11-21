@@ -16,6 +16,7 @@ is built around), `state.subtitles.resolve` is a stub coroutine, and no
 test touches the network, ffprobe, or the developer's data.
 """
 import asyncio
+import os
 
 import pytest
 
@@ -74,6 +75,13 @@ def _state(monkeypatch, cfg_overrides=None, titles=None, files=None):
     cfg = dict(config_mod.DEFAULTS)
     cfg["selected_drives"] = ["drv1"]
     cfg.update(cfg_overrides or {})
+    # History() binds HISTORY_PATH at import time; keep it off the real data.
+    import tempfile
+    from drivecast.history import History
+    hist_path = os.path.join(tempfile.mkdtemp(prefix="wiring-hist-"),
+                             "history.json")
+    monkeypatch.setattr(server_mod, "History",
+                        lambda: History(path=hist_path))
     state = server_mod.AppState(cfg)
     state.library = _FakeLibrary(
         titles if titles is not None else [MOVIE, SHOW],
@@ -187,7 +195,7 @@ def test_no_worklist_before_the_first_sweep(monkeypatch):
     """With an empty index every file reads as uncovered. Building a
     worklist from that meant a whole-library pending list persisted on the
     first Settings visit, a panel reporting "0 of 2225 have subtitles", and
-    a Fetch-now button aimed at five files that are ~90% likely to already
+    a Fetch-now button aimed at five files that are likely to already
     carry an English track."""
     state = _state(monkeypatch)
     assert state.swept() is False
@@ -195,8 +203,15 @@ def test_no_worklist_before_the_first_sweep(monkeypatch):
     state._refresh_backfill_worklist()
     assert state.subtitle_queue.data["pending"] == []
 
-    # One probe result is enough to make the numbers real.
+    # A mid-sweep index (probes landed, sweep not finished) is still unswept.
     state.sub_index.put("movie1", _no_subs_record(111))
+    assert state.sub_index.probed_count() == 1
+    assert state.swept() is False
+    state._refresh_backfill_worklist()
+    assert state.subtitle_queue.data["pending"] == []
+
+    # Only a completed sweep makes the numbers real.
+    state.sub_index.mark_complete()
     assert state.swept() is True
     state._refresh_backfill_worklist()
     assert {it["file_id"] for it in state.subtitle_queue.data["pending"]} == {
@@ -284,6 +299,7 @@ def test_periodic_backfill_runs_a_pass(monkeypatch):
     spent none of its budget and the projected completion never arrived."""
     state = _state(monkeypatch, {"subtitle_backfill_interval_hours": 1})
     state.sub_index.put("movie1", _no_subs_record(111))
+    state.sub_index.mark_complete()
     calls = []
     monkeypatch.setattr(state, "start_backfill", lambda *a, **kw: calls.append(1))
 
@@ -360,7 +376,7 @@ def test_periodic_backfill_ignores_a_pending_list_left_from_before_the_sweep(mon
     first sweep produced a library-sized `pending` list in
     subtitle_queue.json. Without this guard the timer would then find that
     list non-empty and spend the day's five slots working through files that
-    are ~90% likely to already carry an embedded English track.
+    are likely to already carry an embedded English track.
     """
     state = _state(monkeypatch, {"subtitle_backfill_interval_hours": 1})
     # A stale worklist persisted by an earlier build, with no sweep results.
@@ -391,3 +407,31 @@ def test_periodic_backfill_ignores_a_pending_list_left_from_before_the_sweep(mon
     assert calls == []                       # the stale list is NOT worked
     # And it is still there, untouched, for the sweep to reconcile properly.
     assert len(state.subtitle_queue.data["pending"]) == 2
+
+
+def test_periodic_backfill_waits_for_a_completed_sweep_not_the_first_probe(monkeypatch):
+    """Mid-sweep, probed_count() is already > 0 but coverage is partial; the
+    timer must gate on sweep_complete() or it spends slots on guesses."""
+    state = _state(monkeypatch, {"subtitle_backfill_interval_hours": 1})
+    state.sub_index.put("movie1", _no_subs_record(111))   # mid-sweep
+    assert state.sub_index.probed_count() == 1
+    state.subtitle_queue.data["pending"] = [
+        {"file_id": "ep1", "priority": 3, "reason": "other",
+         "queued_at": "2026-08-20T10:00:01"}]
+    calls = []
+    monkeypatch.setattr(state, "start_backfill", lambda *a, **kw: calls.append(1))
+    slept = []
+
+    async def _no_sleep(seconds):
+        slept.append(seconds)
+        if len(slept) > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    async def _drive():
+        with pytest.raises(asyncio.CancelledError):
+            await state._backfill_timer()
+
+    asyncio.run(_drive())
+    assert calls == []

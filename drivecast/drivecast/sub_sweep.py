@@ -102,7 +102,10 @@ def classify_probe_json(raw):
         if is_english(lang):
             if kind == "image":
                 has_image_en = True
-            else:
+            elif not track["forced"] and not track["hearing_impaired"]:
+                # Forced/SDH tracks are not coverage (same rule as the
+                # player predicate in server.py), so they must not set the
+                # flag the backfill worklist keys on.
                 has_text_en = True
     return tracks, has_text_en, has_image_en
 
@@ -117,6 +120,7 @@ class SubtitleSweeper:
         self.sem = asyncio.Semaphore(concurrency)
         # Its own meter -- never merged into Scanner.status (see module doc).
         self.status = {"running": False, "probed": 0, "total": 0, "error": None}
+        self._aborted = False
 
     def set_concurrency(self, concurrency):
         """Replace the semaphore before a run starts.
@@ -178,9 +182,19 @@ class SubtitleSweeper:
                 "has_image_en": has_image_en, "error": None}
 
     async def _probe_and_store(self, file_id, size):
+        if self._aborted:
+            return
         try:
             async with self.sem:
                 result = await self._probe_one(file_id)
+        except OSError as e:
+            # Spawn failure (ffprobe missing / not executable): an
+            # environment fault, not a fact about this file. Store nothing
+            # and stop the sweep so no false "no subtitles" data is written.
+            self._aborted = True
+            self.status["error"] = "ffprobe unavailable: %s" % e
+            log.error("Subtitle sweep aborted: %s", e)
+            return
         except Exception as e:  # pragma: no cover - defensive, mirrors resolve()
             log.exception("Subtitle probe crashed for %s", file_id)
             result = {"ok": False, "tracks": [], "has_text_en": False,
@@ -201,16 +215,27 @@ class SubtitleSweeper:
         """
         pending = [(fid, size) for fid, size in file_ids_with_size
                   if self.index.needs_probe(fid, size)]
+        self._aborted = False
         self.status.update(running=True, probed=0, total=len(pending), error=None)
         try:
             await asyncio.gather(*(self._probe_and_store(fid, size)
                                    for fid, size in pending))
+            if not self._aborted:
+                # Explicit completion marker (see SubIndex.sweep_complete):
+                # a partial/interrupted sweep never sets it.
+                self.index.mark_complete()
         except Exception as e:  # pragma: no cover - defensive
             self.status["error"] = str(e)
             log.exception("Subtitle sweep failed")
         finally:
+            # Reset first: a flush I/O error must not wedge the sweep at
+            # running=True (start_sweep refuses to start while it is set).
+            self.status["running"] = False
             # Unconditional flush: guarantees the tail since the last
             # periodic flush is never lost on a clean finish.
-            self.index.flush()
-            self.status["running"] = False
+            try:
+                self.index.flush()
+            except Exception as e:
+                self.status["error"] = "index flush failed: %s" % e
+                log.exception("Subtitle index flush failed")
         return self.status

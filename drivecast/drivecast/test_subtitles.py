@@ -4,7 +4,7 @@ import datetime
 
 import pytest
 
-from drivecast.subtitles import (NegativeCache, SubtitleResolver,
+from drivecast.subtitles import (NegativeCache, SubtitleResolver, count_cues,
                                  pick_sibling_sub, sanitize_subtitle_bytes)
 
 
@@ -242,7 +242,7 @@ def test_resolver_prefers_tmdb_id_over_text_query_when_size_missing(tmp_path):
             if url.endswith("/subtitles"):
                 self.search_params.append(dict(params))
                 assert "moviehash" not in params
-                assert "tmdb_id" in params, "text query ran despite a tmdb_id hit"
+                assert "parent_tmdb_id" in params, "text query ran despite a tmdb_id hit"
                 return _OSResp(200, {"data": [
                     {"attributes": {"language": "en", "files": [{"file_id": 9}]}},
                 ]})
@@ -262,7 +262,7 @@ def test_resolver_prefers_tmdb_id_over_text_query_when_size_missing(tmp_path):
     assert path and b"TMDB dialogue" in open(path, "rb").read()
     # Exactly one search call: the tmdb_id hit, no fallthrough to text query.
     assert r._client.search_params == [{
-        "tmdb_id": "1234", "season_number": "1", "episode_number": "2",
+        "parent_tmdb_id": "1234", "season_number": "1", "episode_number": "2",
         "languages": "en",
     }]
 
@@ -365,7 +365,10 @@ def test_sanitize_does_not_misdecode_bomless_utf16_lookalike():
 
 
 def test_sanitize_normalises_latin1_to_utf8_crlf():
-    raw = _srt(6, "caf\xe9 na\xefve").replace(b"\n", b"\r\n")
+    raw = _srt(6, "PLACEHOLDER").replace(b"\n", b"\r\n")
+    raw = raw.replace(b"PLACEHOLDER", "caf\xe9 na\xefve".encode("latin-1"))
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
     out, reason = sanitize_subtitle_bytes(raw)
     assert reason == "ok"
     assert out.decode("utf-8").count("\r\n") and "café naïve" in out.decode("utf-8")
@@ -606,3 +609,30 @@ def test_download_406_records_remaining_and_utc_reset(tmp_path):
     expected = datetime.datetime(2026, 8, 24, 23, 59, 59,
                                  tzinfo=datetime.timezone.utc).timestamp()
     assert r.last_os_reset_utc == pytest.approx(expected, abs=1)
+
+
+def test_count_cues_accepts_hourless_vtt_and_microdvd():
+    vtt = "WEBVTT\n\n00:01.000 --> 00:04.000\nHello there\n"
+    assert count_cues(vtt) == 1
+    assert count_cues("{1}{50}Hello there\n{60}{90}Again\n") == 2
+
+
+def test_negative_cache_save_cleans_temp_on_failure(tmp_path, monkeypatch):
+    import os
+    nc = NegativeCache(str(tmp_path / "neg.json"))
+    nc.record("f1", "sibling", "zero_cue")
+    def boom(a, b):
+        raise OSError("disk full")
+    monkeypatch.setattr(os, "replace", boom)
+    nc._save()
+    assert [n for n in os.listdir(tmp_path) if n.endswith(".tmp")] == []
+
+
+def test_accept_removes_stale_other_extension(tmp_path):
+    import os
+    r = SubtitleResolver(None, opensubtitles_key="k", subs_dir=str(tmp_path))
+    (tmp_path / "vidx.srt").write_bytes(b"old")
+    dest = r._accept("vidx", "sibling", _srt(12), ".vtt")
+    assert dest and dest.endswith(".vtt")
+    assert not os.path.exists(str(tmp_path / "vidx.srt"))
+    assert r.cached("vidx") == dest

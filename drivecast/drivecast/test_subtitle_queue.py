@@ -4,8 +4,6 @@ asserted on call counts, the same "spy and count calls" convention
 test_subtitles.py already uses for browse_calls."""
 import asyncio
 
-import pytest
-
 from drivecast.subtitle_queue import (
     PARK_AFTER_ATTEMPTS,
     PRIORITY_CONTINUE_WATCHING,
@@ -448,3 +446,59 @@ def test_glitch_stops_the_run_without_blaming_the_item(tmp_path):
     assert q.data["failed_today"] == []
     assert [i["file_id"] for i in q.data["pending"]] == ["a", "b", "c"]
     assert q.status.get("glitch") == "non_json_200"
+
+
+def test_stale_zero_hint_is_dropped_after_the_reset_instant(tmp_path):
+    import time as _time
+    q = SubtitleQueue(path=str(tmp_path / "q.json"), daily_limit=5)
+    q.record_spend("f1", False, remaining=0, spend=False)
+    q.note_quota_reset(_time.time() - 5)
+    assert q.remaining() == 5
+    assert "quota_reset_utc" not in q.data or not q.data["quota_reset_utc"]
+
+
+def test_quota_stop_and_glitch_do_not_count_toward_parking(tmp_path):
+    for outcome in ({"ok": False, "spent": True, "remaining": 0},
+                    {"ok": False, "spent": True, "glitch": "non_json_200"}):
+        q = _queue(tmp_path, daily_limit=5, today="2026-08-22")
+        q.data["pending"] = [
+            {"file_id": "f1", "priority": PRIORITY_OTHER, "reason": "other",
+             "queued_at": "2026-08-22T09:00:00"}]
+
+        async def attempt(item, outcome=outcome):
+            return dict(outcome)
+
+        _run(q.run(attempt))
+        assert not q.data["pending"][0].get("attempts")
+
+
+def test_transient_failure_is_not_blamed_on_the_item(tmp_path):
+    q = _queue(tmp_path, daily_limit=5, today="2026-08-22")
+    q.data["pending"] = [
+        {"file_id": "f1", "priority": PRIORITY_OTHER, "reason": "other",
+         "queued_at": "2026-08-22T09:00:00"}]
+
+    async def attempt(item):
+        return {"ok": False, "spent": True, "transient": True}
+
+    _run(q.run(attempt))
+    assert q.data["failed_today"] == []
+    assert not q.data["pending"][0].get("attempts")
+    assert [i["file_id"] for i in q.data["pending"]] == ["f1"]
+
+
+def test_save_failure_cleans_temp_and_clears_running(tmp_path, monkeypatch):
+    q = _queue(tmp_path, daily_limit=5)
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr("drivecast.subtitle_queue.os.replace", boom)
+    q._save()
+    assert [p for p in tmp_path.iterdir() if p.name.startswith(".subq-")] == []
+
+    def mkboom(*a, **k):
+        raise PermissionError("nope")
+    monkeypatch.setattr("drivecast.subtitle_queue.tempfile.mkstemp", mkboom)
+    async def attempt(item):
+        return {"ok": True}
+    _run(q.run(attempt))
+    assert q.status["running"] is False

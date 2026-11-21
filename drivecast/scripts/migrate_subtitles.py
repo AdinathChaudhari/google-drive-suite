@@ -25,8 +25,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from drivecast import config                      # noqa: E402
-from drivecast import subtitles                   # noqa: E402
+from drivecast import config
+from drivecast import subtitles
 
 QUARANTINE_DIRNAME = ".quarantine"
 
@@ -49,7 +49,7 @@ def main():
                    if os.path.isfile(os.path.join(subs_dir, n))
                    and not n.startswith("."))
 
-    kept = rewritten = rejected = 0
+    kept = rewritten = rejected = failed = 0
     for name in names:
         path = os.path.join(subs_dir, name)
         file_id, ext = os.path.splitext(name)
@@ -58,6 +58,7 @@ def main():
                 raw = f.read()
         except OSError as e:
             print("  !! unreadable  %-46s %s" % (name, e))
+            failed += 1
             continue
         clean, reason = subtitles.sanitize_subtitle_bytes(raw, ext.lower())
         if clean is None:
@@ -70,9 +71,14 @@ def main():
             continue
         kept += 1
         if clean != raw:
-            rewritten += 1
             if args.apply:
-                subtitles._atomic_write(path, clean)
+                if subtitles._atomic_write(path, clean):
+                    rewritten += 1
+                else:
+                    failed += 1
+                    print("  !! write failed %-46s" % name)
+            else:
+                rewritten += 1
 
     print("\n%d files: %d kept (%d re-encoded), %d rejected%s"
           % (len(names), kept, rewritten, rejected,
@@ -80,6 +86,9 @@ def main():
     if rejected and args.apply:
         print("Quarantined into %s — delete that directory once you trust the run."
               % quarantine)
+    if failed:
+        print("%d file(s) could not be read or rewritten -- see '!!' lines above." % failed)
+        return 1
     return 0
 
 

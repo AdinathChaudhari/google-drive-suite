@@ -17,6 +17,7 @@ migrate away from would be speculative.
 import json
 import os
 import tempfile
+import time
 
 from . import config
 
@@ -90,14 +91,26 @@ class SubIndex:
         library (every entry) plus a Settings panel confidently reporting
         0% coverage. See server.py's `_refresh_backfill_worklist`.
         """
-        return len(self.data["probed"])
+        return sum(1 for r in self.data["probed"].values() if r.get("ok"))
+
+    def sweep_complete(self):
+        """True once a sweep has run to the end (not merely started).
+
+        `probed_count() > 0` is true as soon as the first put lands, i.e.
+        mid-sweep; gates that must wait for full coverage data should use
+        this instead.
+        """
+        return bool(self.data.get("completed_at"))
+
+    def mark_complete(self):
+        self.data["completed_at"] = time.time()
 
     def needs_probe(self, file_id, size):
         """True if this file has never been probed, or was probed at a
         different size (the file's bytes changed since the last sweep)."""
         entry = self.data["probed"].get(file_id)
-        if entry is None:
-            return True
+        if entry is None or not entry.get("ok"):
+            return True  # failed probes are retried, not cached forever
         return entry.get("size") != size
 
     def put(self, file_id, record):

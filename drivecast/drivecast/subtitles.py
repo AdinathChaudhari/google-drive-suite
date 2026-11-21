@@ -144,8 +144,10 @@ _AD_MARKERS = (
 )
 _HTML_MARKERS = ("<html", "<!doctype", "<iframe", "<script", "<meta ", "<body",
                  "<div", "<span style", "<head>")
-# SRT/VTT cue arrow, both comma and dot fractions.
-_CUE_RE = re.compile(r"\d{1,3}:\d{2}:\d{2}[,.]\d{1,3}\s*-->")
+# SRT/VTT cue arrow, both comma and dot fractions; WebVTT allows no hours field.
+_CUE_RE = re.compile(r"(?:\d{1,3}:)?\d{2}:\d{2}[,.]\d{1,3}\s*-->")
+# MicroDVD (.sub) cues: {start}{end}text, frame based, no arrow.
+_MICRODVD_CUE_RE = re.compile(r"^\s*\{\d+\}\{\d+\}", re.M)
 # SubStation dialogue lines carry no arrow.
 _ASS_CUE_RE = re.compile(r"^\s*Dialogue\s*:", re.M)
 # Encodings tried in order once no BOM has settled it. UTF-16 is deliberately
@@ -185,7 +187,9 @@ def _decode_text(raw):
 
 def count_cues(text):
     """Number of timed cues in a subtitle body (SRT/VTT arrows, ASS dialogue)."""
-    return len(_CUE_RE.findall(text or "")) or len(_ASS_CUE_RE.findall(text or ""))
+    text = text or ""
+    return (len(_CUE_RE.findall(text)) or len(_ASS_CUE_RE.findall(text))
+            or len(_MICRODVD_CUE_RE.findall(text)))
 
 
 def _cue_texts(text):
@@ -195,7 +199,7 @@ def _cue_texts(text):
         s = line.strip()
         if not s or s.isdigit() or "-->" in s:
             continue
-        if s.startswith("WEBVTT") or s.startswith("[") and s.endswith("]"):
+        if s.startswith("WEBVTT") or (s.startswith("[") and s.endswith("]")):
             continue
         if s.lower().startswith("dialogue:"):
             s = s.split(",", 9)[-1]
@@ -293,6 +297,7 @@ class NegativeCache:
 
     def _save(self):
         data = self._data if self._data is not None else {}
+        tmp = None
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path),
@@ -301,7 +306,13 @@ class NegativeCache:
                 json.dump(data, f, indent=1, sort_keys=True)
             os.replace(tmp, self.path)
         except OSError:
-            log.warning("Could not persist the subtitle negative cache")
+            log.warning("Could not persist the subtitle negative cache",
+                        exc_info=True)
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     @staticmethod
     def _key(file_id, source):
@@ -482,6 +493,15 @@ class SubtitleResolver:
         dest = self.cache_path(file_id, ext if ext in SUB_EXTS else ".srt")
         if not _atomic_write(dest, clean):
             return None
+        # cached() returns the first extension in SUB_EXTS order, so a stale
+        # file of another extension would shadow this fresh one forever.
+        for other in SUB_EXTS:
+            stale = self.cache_path(file_id, other)
+            if stale != dest and os.path.exists(stale):
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    log.warning("Could not remove stale subtitle %s", stale)
         return dest
 
     # ---- source 2: sibling file on the drive ----
@@ -560,10 +580,13 @@ class SubtitleResolver:
 
         if not results and tmdb_id:
             try:
-                params = {"tmdb_id": str(tmdb_id)}
                 if season is not None and episode is not None:
+                    # The id is the SHOW's: OpenSubtitles wants it as the parent.
+                    params = {"parent_tmdb_id": str(tmdb_id)}
                     params["season_number"] = str(season)
                     params["episode_number"] = str(episode)
+                else:
+                    params = {"tmdb_id": str(tmdb_id)}
                 results = await self._search_os(params)
                 searched_ok = True
             except Exception:

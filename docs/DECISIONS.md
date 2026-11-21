@@ -818,7 +818,7 @@ than no entry.
   gaps>2s=N end=complete|client_abort|upstream_error`) and a WARNING for any
   gap over 5 s between upstream chunks, so a real Drive stall would show up.
 - **Where** — `drivecast/drivecast/media_info.py:84` (`vlc_policy`,
-  thresholds at `:31`); `drivecast/drivecast/server.py:722`;
+  thresholds at `:31`); `drivecast/drivecast/server.py:1181` (`api_media_info`, which serves `vlc_policy`);
   `drivecast/drivecast/streaming.py:213` (log line), `:32` (stall threshold);
   `drivecast/drivecast/logging_setup.py`;
   `drivecast-app/app/src/main/java/com/drivecast/tv/ui/player/PlayerScreen.kt:153`,
@@ -871,12 +871,12 @@ than no entry.
   fires automatically after a *walking* scan and never after a `scope=[]`
   cache-only rebuild, which walks no Drive bytes by definition.
 - **Where** — `drivecast/drivecast/sub_index.py:31` (the store),
-  `drivecast/drivecast/sub_index.py:28` (`FLUSH_EVERY = 25`, the resume
-  granularity); `drivecast/drivecast/sub_sweep.py:107` (`SubtitleSweeper`),
-  `:58` (`is_english`, why `und` is not English);
-  `drivecast/drivecast/server.py:43` (`_has_embedded_english_text_track`),
-  `:218` (the scope guard that keeps the sweep off a cache-only rebuild),
-  `:252` (`start_sweep`); `drivecast/drivecast/scan_cache.py:64` (the `put`
+  `drivecast/drivecast/sub_index.py:29` (`FLUSH_EVERY = 25`, the resume
+  granularity); `drivecast/drivecast/sub_sweep.py:113` (`SubtitleSweeper`),
+  `:61` (`is_english`, why `und` is not English);
+  `drivecast/drivecast/server.py:44` (`_has_embedded_english_text_track`),
+  `:215` (the scope guard that keeps the sweep off a cache-only rebuild),
+  `:261` (`start_sweep`); `drivecast/drivecast/scan_cache.py:64` (the `put`
   behaviour this store avoids).
 - **Revisit when** — the full sweep finishes. These are 30 sampled files; the
   real figure is what the sweep prints. If it lands near 40% text coverage, the
@@ -906,9 +906,9 @@ than no entry.
   writing ASS bytes under `.srt` would mislabel them for `mime_for`. UTF-16 is
   deliberately absent from the decode list: a BOM-less UTF-16 attempt destroyed
   a real, full-length subtitle.
-- **Where** — `drivecast/drivecast/subtitles.py:210`
-  (`sanitize_subtitle_bytes`), `:462` (`_accept`, the single write point),
-  `:253` (`NEG_TTL`), `:407` (`cached`, the existence-trust this bounds);
+- **Where** — `drivecast/drivecast/subtitles.py:215`
+  (`sanitize_subtitle_bytes`), `:480` (`_accept`, the single write point),
+  `:258` (`NEG_TTL`), `:425` (`cached`, the existence-trust this bounds);
   `drivecast/scripts/migrate_subtitles.py` (dry-run by default, quarantines
   rather than deletes).
 - **Revisit when** — the migration prints a reject you believe is good. Verified
@@ -934,7 +934,7 @@ than no entry.
 - **Where** —
   `drivecast-app/app/src/main/java/com/drivecast/tv/ui/player/ExternalPlayerViewModel.kt`
   (the playlist branch and its comment, and the single-item branch that does
-  this correctly); `drivecast/drivecast/server.py:792` (`api_playlist_m3u`, the
+  this correctly); `drivecast/drivecast/server.py:851` (`api_playlist_m3u`, the
   m3u route, which cannot carry a per-item subtitle).
 - **Revisit when** — the test runs; or VLC auto-updates on the Stick (the Play
   Store updates it independently of the app release, so re-run and record the
@@ -962,11 +962,11 @@ than no entry.
   **default False**, so turning it on after the device test is a settings edit
   and not a code change. Until then image-only files stay in the backfill
   worklist.
-- **Where** — `drivecast/drivecast/server.py:72`
-  (`_has_embedded_english_image_track`), `:1140` (`api_play`, where the config
-  key gates it), `:373` (`_uncovered_file_ids`, which deliberately keeps these
-  files queued); `drivecast/drivecast/config.py:65`
-  (`prefer_embedded_image_subtitles`); `drivecast/drivecast/sub_sweep.py:51`
+- **Where** — `drivecast/drivecast/server.py:73`
+  (`_has_embedded_english_image_track`), `:1208` (`api_play`, where the config
+  key gates it), `:392` (`_uncovered_file_ids`, which deliberately keeps these
+  files queued); `drivecast/drivecast/config.py:66`
+  (`prefer_embedded_image_subtitles`); `drivecast/drivecast/sub_sweep.py:54`
   (`_IMAGE_CODECS`); `drivecast/drivecast/player.py:174`
   (`build_infuse_url`, the text-only consumer).
 - **Revisit when** — someone plays a PGS-only file and confirms text appears **on
@@ -998,11 +998,11 @@ than no entry.
   ABC: an interface with one implementation is speculation, and extracting one
   later from a working provider is mechanical. subdl.com was declined — same
   block-page-substituting ISP, no moviehash search, self-reported limits.
-- **Where** — `drivecast/drivecast/config.py:57` (`subtitle_daily_limit: 5`),
-  `:51` (`prefer_embedded_subtitles: True`);
-  `drivecast/drivecast/subtitle_queue.py:111` (`DEFAULT_DAILY_LIMIT`);
-  `drivecast/drivecast/subtitles.py:415` (`resolve`'s match-hint kwargs),
-  `:663` (`_download_os_file`, where `remaining` is read);
+- **Where** — `drivecast/drivecast/config.py:58` (`subtitle_daily_limit: 5`),
+  `:52` (`prefer_embedded_subtitles: True`);
+  `drivecast/drivecast/subtitle_queue.py:112` (`DEFAULT_DAILY_LIMIT`);
+  `drivecast/drivecast/subtitles.py:433` (`resolve`'s match-hint kwargs),
+  `:720` (`_download_os_file`, where `remaining` is read);
   `drivecast/drivecast/moviehash.py` (the OSDb hash).
 - **Revisit when** — the full sweep prints the real worklist size. If it
   confirms a worklist near 60% and D-022 fails, the login is the cheaper of the two
@@ -1038,13 +1038,13 @@ than no entry.
   item's fault, so it is not added to `failed_today` — in IST the local calendar
   day rolls 5.5 h before OpenSubtitles' UTC quota does, and blacklisting there
   would waste the rest of the real day.
-- **Where** — `drivecast/drivecast/subtitle_queue.py:414` (`run`, the accounting),
-  `:305` (`record_spend`'s `spend`/`mark_failed` flags), `:372` (`_is_parked`),
-  `:119` (`PARK_AFTER_ATTEMPTS = 3`, `PARK_RETRY_DAYS = 7`);
-  `drivecast/drivecast/server.py:373` (`_uncovered_file_ids`), `:354`
-  (`_sidecar_covered_ids`, the one-listdir read), `:451` (`_backfill_attempt`,
-  which reports `spent`), `:495` (`_backfill_blocked`);
-  `drivecast/drivecast/subtitles.py:399` (`os_download_calls`).
+- **Where** — `drivecast/drivecast/subtitle_queue.py:444` (`run`, the accounting),
+  `:335` (`record_spend`'s `spend`/`mark_failed` flags), `:402` (`_is_parked`),
+  `:120` (`PARK_AFTER_ATTEMPTS = 3`, `PARK_RETRY_DAYS = 7`);
+  `drivecast/drivecast/server.py:392` (`_uncovered_file_ids`), `:373`
+  (`_sidecar_covered_ids`, the one-listdir read), `:493` (`_backfill_attempt`,
+  which reports `spent`), `:556` (`_backfill_blocked`);
+  `drivecast/drivecast/subtitles.py:411` (`os_download_calls`).
 - **Revisit when** — a week of real running. `data/subtitle_queue.json`'s
   `spent` should track actual downloads, and `pending` should shrink
   monotonically rather than oscillate.
@@ -1065,7 +1065,7 @@ than no entry.
   falls through to `resolve()` exactly as it did before, and the reported
   `subtitles` flag then describes what it actually received. `detect_player`
   never auto-picks Infuse, so this only affects an explicit `player: infuse`.
-- **Where** — `drivecast/drivecast/server.py:1140` (`api_play`, the
+- **Where** — `drivecast/drivecast/server.py:1208` (`api_play`, the
   `embedded_usable` gate); `drivecast/drivecast/player.py:174`
   (`build_infuse_url`, whose docstring states the ceiling), `:324` (`_launch`,
   where `prefer_lang` is dropped for Infuse).
@@ -1104,9 +1104,9 @@ than no entry.
   **Settings → Subtitles → Preferred subtitle language = English**, which is a
   two-minute device setting and the single highest-value action in this whole
   effort.
-- **Where** — `drivecast/drivecast/server.py:1294` (`api_subtitles`, the
-  skip); `drivecast/drivecast/subtitles.py:415` (`resolve`'s
-  `allow_opensubtitles` flag), `:462` (`_accept`, the gate any future
+- **Where** — `drivecast/drivecast/server.py:1361` (`api_subtitles`, the
+  skip); `drivecast/drivecast/subtitles.py:433` (`resolve`'s
+  `allow_opensubtitles` flag), `:480` (`_accept`, the gate any future
   extraction source would still have to write through);
   `docs/FEATURE-PARITY.md` § 4 (the subtitle rows and the TV's gap).
 - **Revisit when** — extraction becomes cheap for a *specific* case worth the
