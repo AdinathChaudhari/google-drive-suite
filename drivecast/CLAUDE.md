@@ -125,7 +125,7 @@ run, so an app left running simply never spent it.
 
 **Coverage numbers are unknown until the sweep has run.** With an empty index
 every file reads as uncovered, so `swept()` gates the worklist and the
-Settings panel says "run the subtitle scan first" rather than "0 of 2225 have
+Settings panel says "run the subtitle scan first" rather than "0 of N have
 subtitles". Do not remove that gate: a stale `pending` list on disk from
 before a sweep is exactly the case it also guards.
 

@@ -1655,7 +1655,7 @@ def test_api_subtitles_refresh_always_allows_opensubtitles(client):
 
 
 def test_backfill_status_reports_unknown_coverage_before_the_sweep(client):
-    """"0 of 2225 files have subtitles" is not a cautious estimate before
+    """"0 of N files have subtitles" is not a cautious estimate before
     the sweep, it is wrong in the alarming direction -- roughly 40% of
     those files carry their own text track (30-file sample)."""
     r = client.get("/api/subs/backfill/status")

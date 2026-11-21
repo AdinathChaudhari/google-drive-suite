@@ -458,7 +458,7 @@ class AppState:
         Everything downstream is meaningless before it has. With an empty
         index every file reads as uncovered, which built a
         whole-library pending list (rewritten on every later spend), told the
-        Settings panel "0 of 2225 files have subtitles", and pointed the
+        Settings panel "0 of N files have subtitles", and pointed the
         Fetch-now button at five files that are likely to have had an
         embedded English track all along.
         """
@@ -1501,7 +1501,7 @@ def create_app(cfg=None):
         snap = state.subtitle_queue.snapshot()
         snap["total_count"] = total
         # Before the first sweep there is NO coverage data. Reporting
-        # "0 of 2225 covered" then is not a cautious estimate, it is wrong
+        # "0 of N covered" then is not a cautious estimate, it is wrong
         # in the alarming direction -- roughly 40% of those files
         # carry their own text track (30-file sample). The UI shows "run the scan first"
         # off this flag instead of a fabricated number.
