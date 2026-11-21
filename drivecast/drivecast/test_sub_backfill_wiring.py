@@ -194,7 +194,7 @@ def test_uncovered_excludes_files_that_already_have_a_sidecar(monkeypatch, tmp_p
 def test_no_worklist_before_the_first_sweep(monkeypatch):
     """With an empty index every file reads as uncovered. Building a
     worklist from that meant a whole-library pending list persisted on the
-    first Settings visit, a panel reporting "0 of 2225 have subtitles", and
+    first Settings visit, a panel reporting "0 of N have subtitles", and
     a Fetch-now button aimed at five files that are likely to already
     carry an English track."""
     state = _state(monkeypatch)

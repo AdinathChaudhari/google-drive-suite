@@ -1902,7 +1902,7 @@ async function loadSubtitleCoverage() {
   const total = s.total_count || 0;
   const uncovered = s.uncovered_count || 0;
   // `swept` false means the embedded-track scan has never run, so there is no
-  // coverage data at all. Reporting "0 of 2225 have subtitles" here would be
+  // coverage data at all. Reporting "0 of N have subtitles" here would be
   // wrong in the alarming direction — plenty of those files carry their own
   // English track; the scan is what finds out which.
   if (!total) {
